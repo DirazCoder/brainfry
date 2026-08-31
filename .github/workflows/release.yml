@@ -1,0 +1,93 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive_name: linux-x86_64
+
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-26.04-arm
+            archive_name: linux-arm64
+
+          - target: x86_64-apple-darwin
+            os: macos-26-intel
+            archive_name: macos-x86_64
+
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            archive_name: macos-arm64
+
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            archive_name: windows-x86_64
+
+          - target: aarch64-pc-windows-msvc
+            os: windows-11-arm
+            archive_name: windows-arm64
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: build
+        shell: bash
+        run: |
+          cargo build --release --target ${{ matrix.target }} -p bfc -p bfrun -p bfnative
+
+      - name: package (unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          staging="brainfry-${{ matrix.archive_name }}"
+          mkdir "$staging"
+          cp target/${{ matrix.target }}/release/bfc "$staging/"
+          cp target/${{ matrix.target }}/release/bfrun "$staging/"
+          cp target/${{ matrix.target }}/release/bfnative "$staging/"
+          cp README.md "$staging/"
+          zip -r "Brainfry-0.1.0-${{ matrix.archive_name }}.zip" "$staging"
+
+      - name: package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $staging = "brainfry-${{ matrix.archive_name }}"
+          New-Item -ItemType Directory -Path $staging
+          Copy-Item "target/${{ matrix.target }}/release/bfc.exe" $staging/
+          Copy-Item "target/${{ matrix.target }}/release/bfrun.exe" $staging/
+          Copy-Item "target/${{ matrix.target }}/release/bfnative.exe" $staging/
+          Copy-Item README.md $staging/
+          Compress-Archive -Path $staging -DestinationPath "Brainfry-0.1.0-${{ matrix.archive_name }}.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Brainfry-0.1.0-${{ matrix.archive_name }}
+          path: Brainfry-0.1.0-${{ matrix.archive_name }}.zip
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*.zip

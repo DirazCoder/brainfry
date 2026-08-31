@@ -1,0 +1,8 @@
+[package]
+name = "bfnative"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bfformat = { path = "../bfformat" }
+bfc = { path = "../bfc" }

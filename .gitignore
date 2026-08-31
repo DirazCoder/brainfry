@@ -1,0 +1,11 @@
+/target/
+
+# bfnative leaves the assembly behind when the linker step fails
+*.exe.s
+
+.DS_Store
+Thumbs.db
+
+.vscode/
+.idea/
+*.swp
