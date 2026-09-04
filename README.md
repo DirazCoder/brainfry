@@ -5,7 +5,16 @@ Brainfuck has no standard bytecode, no packaging format, nothing beyond raw
 project treats it like a real language instead: a compiler, a bytecode
 format, a bytecode runtime, and — if you don't want an interpreter in the
 loop at all — a backend that emits actual x86-64/ARM64 machine code and
-links it straight into a native executable.
+links it straight into a native executable. I wrote it in rust, cuz why not, i like rust, its safer than C which i was gonna write its compiler in but i had a brain which told my guts not to think about it, sorry C i am not managing memory and way too hard to code. and also i am not a C or C++ whatever expert, that thing fucked up my teenhood when trying to learn it like 15 lines just to say print hello world which i just write in rust 
+
+```
+fn main() {
+    println!("Hello, World!");
+}
+```
+
+see you get the drill i need to shut up, sorry for wasting your time.
+
 
 Three ways to run a `.bf` file, in increasing order of "how far do you want
 to get from an interpreter":
