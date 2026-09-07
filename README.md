@@ -16,21 +16,30 @@ fn main() {
 see you get the drill i need to shut up, sorry for wasting your time.
 
 
-Three ways to run a `.bf` file, in increasing order of "how far do you want
+Four ways to run a `.bf` file, in increasing order of "how far do you want
 to get from an interpreter":
 
-1. **`bfc` + `bfrun`** — compile to `.bfry` bytecode, run it on a small VM.
+1. **`bfinterp`** — walk the source directly, no bytecode, no compile step,
+   no optimizer by default. The simplest and slowest path, and the one the
+   other three are checked against.
+2. **`bfc` + `bfrun`** — compile to `.bfry` bytecode, run it on a small VM.
    The javac/java split. Fast to build, portable, no toolchain needed.
-2. **`bfnative`** — skip the bytecode entirely and compile straight to a
+3. **`bfjit`** — same codegen as `bfnative`, but instead of writing an
+   executable file it maps executable memory at runtime and jumps straight
+   into the generated code. No file touches disk; only runs on the host
+   you're already on.
+4. **`bfnative`** — skip the bytecode entirely and compile straight to a
    native binary for Linux, macOS, or Windows, x86-64 or ARM64. No
    interpreter at runtime, and no toolchain at build time either: the
    machine code and the ELF/Mach-O/PE container around it are emitted
    byte-by-byte by `bfnative` itself, in-process, with zero external
    commands and zero object-file crates.
 
-Pick based on what you're doing: iterating on a program, `bfc`/`bfrun` is
-zero-friction. Shipping something you want to hand someone as a standalone
-`.exe`, `bfnative` is the one you want.
+Pick based on what you're doing: checking whether a bug is in your program
+or in one of the other three, `bfinterp` is the ground truth. Iterating on
+a program, `bfc`/`bfrun` is zero-friction. Want near-native speed without
+managing a build artifact, `bfjit`. Shipping something you want to hand
+someone as a standalone `.exe`, `bfnative` is the one you want.
 
 ## Layout
 
@@ -76,8 +85,18 @@ compiler, no linker, no platform SDK, for any of the six targets.
 cargo build --release
 ```
 
-Lands `bfc`, `bfrun`, and `bfnative` in `target/release/` — all three are
-workspace members and build by default.
+**⚠ Unverified against this specific build: confirm which crates this
+command actually produces before relying on it.** In the pre-`bfinterp`/
+`bfjit` version of this workspace, `cargo build --release` only built
+`bfc`, `bfrun`, and `bfnative` by default — all three were workspace
+members, but `bfnative` specifically needed `cargo build --release -p
+bfnative` to build explicitly in some earlier states of this repo. Check
+`Cargo.toml`'s `[workspace] members` list to see whether `bfinterp` and
+`bfjit` were added there (default build covers all five) or left out
+(each needs `cargo build --release -p bfinterp` / `-p bfjit` explicitly).
+Whoever finishes this README should run the plain `cargo build --release`
+command once, list what actually landed in `target/release/`, and replace
+this note with a real answer instead of an assumption.
 
 ## Usage: bfc / bfrun
 
