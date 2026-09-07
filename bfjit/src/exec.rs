@@ -129,7 +129,6 @@ impl JitRegion {
                 "mov sp, x16",
                 "br {0}",
                 in(reg) entry,
-                out("x16") _,
                 options(noreturn),
             )
         }
