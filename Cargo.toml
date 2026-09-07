@@ -3,6 +3,9 @@ resolver = "2"
 members = ["bfformat", "bfc", "bfrun", "bfnative"]
 
 [profile.release]
-lto = true
+opt-level = 3
+lto = "fat"
 codegen-units = 1
+strip = "symbols"
 panic = "abort"
+overflow-checks = false
