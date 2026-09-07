@@ -48,7 +48,7 @@ jobs:
       - name: build
         shell: bash
         run: |
-          cargo build --release --target ${{ matrix.target }} -p bfc -p bfrun -p bfnative
+          cargo build --release --target ${{ matrix.target }} -p bfc -p bfrun -p bfnative -p bfinterp -p bfjit
 
       - name: package (unix)
         if: runner.os != 'Windows'
@@ -59,6 +59,8 @@ jobs:
           cp target/${{ matrix.target }}/release/bfc "$staging/"
           cp target/${{ matrix.target }}/release/bfrun "$staging/"
           cp target/${{ matrix.target }}/release/bfnative "$staging/"
+          cp target/${{ matrix.target }}/release/bfinterp "$staging/"
+          cp target/${{ matrix.target }}/release/bfjit "$staging/"
           cp README.md "$staging/"
           zip -r "Brainfry-0.1.0-${{ matrix.archive_name }}.zip" "$staging"
 
@@ -71,6 +73,8 @@ jobs:
           Copy-Item "target/${{ matrix.target }}/release/bfc.exe" $staging/
           Copy-Item "target/${{ matrix.target }}/release/bfrun.exe" $staging/
           Copy-Item "target/${{ matrix.target }}/release/bfnative.exe" $staging/
+          Copy-Item "target/${{ matrix.target }}/release/bfinterp.exe" $staging/
+          Copy-Item "target/${{ matrix.target }}/release/bfjit.exe" $staging/
           Copy-Item README.md $staging/
           Compress-Archive -Path $staging -DestinationPath "Brainfry-0.1.0-${{ matrix.archive_name }}.zip"
 
