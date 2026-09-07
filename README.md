@@ -85,18 +85,11 @@ compiler, no linker, no platform SDK, for any of the six targets.
 cargo build --release
 ```
 
-**⚠ Unverified against this specific build: confirm which crates this
-command actually produces before relying on it.** In the pre-`bfinterp`/
-`bfjit` version of this workspace, `cargo build --release` only built
-`bfc`, `bfrun`, and `bfnative` by default — all three were workspace
-members, but `bfnative` specifically needed `cargo build --release -p
-bfnative` to build explicitly in some earlier states of this repo. Check
-`Cargo.toml`'s `[workspace] members` list to see whether `bfinterp` and
-`bfjit` were added there (default build covers all five) or left out
-(each needs `cargo build --release -p bfinterp` / `-p bfjit` explicitly).
-Whoever finishes this README should run the plain `cargo build --release`
-command once, list what actually landed in `target/release/`, and replace
-this note with a real answer instead of an assumption.
+This builds all five binaries — `bfc`, `bfrun`, `bfnative`, `bfinterp`,
+and `bfjit` — in one shot. `bfinterp` and `bfjit` are both listed in
+`Cargo.toml`'s `[workspace] members`, same as the other three, so there's
+no special-casing needed like earlier states of this repo required for
+`bfnative`.
 
 ## Usage: bfc / bfrun
 
