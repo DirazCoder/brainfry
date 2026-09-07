@@ -34,7 +34,10 @@ impl std::fmt::Display for FormatError {
             FormatError::Io(err) => write!(f, "I/O error: {err}"),
             FormatError::BadMagic => write!(f, "not a bfry bytecode file"),
             FormatError::UnsupportedVersion(v) => {
-                write!(f, "bytecode format version {v} is not supported by this runtime")
+                write!(
+                    f,
+                    "bytecode format version {v} is not supported by this runtime"
+                )
             }
             FormatError::Truncated => write!(f, "bytecode file is truncated or corrupt"),
             FormatError::UnknownOpTag(t) => write!(f, "unknown instruction tag {t} in bytecode"),
@@ -75,19 +78,25 @@ impl Program {
 
     pub fn read_from<R: Read>(mut input: R) -> Result<Self, FormatError> {
         let mut magic = [0u8; 4];
-        input.read_exact(&mut magic).map_err(|_| FormatError::Truncated)?;
+        input
+            .read_exact(&mut magic)
+            .map_err(|_| FormatError::Truncated)?;
         if magic != MAGIC {
             return Err(FormatError::BadMagic);
         }
 
         let mut version = [0u8; 1];
-        input.read_exact(&mut version).map_err(|_| FormatError::Truncated)?;
+        input
+            .read_exact(&mut version)
+            .map_err(|_| FormatError::Truncated)?;
         if version[0] != FORMAT_VERSION {
             return Err(FormatError::UnsupportedVersion(version[0]));
         }
 
         let mut count_bytes = [0u8; 4];
-        input.read_exact(&mut count_bytes).map_err(|_| FormatError::Truncated)?;
+        input
+            .read_exact(&mut count_bytes)
+            .map_err(|_| FormatError::Truncated)?;
         let count = u32::from_le_bytes(count_bytes) as usize;
 
         let mut ops = Vec::with_capacity(count);
@@ -101,7 +110,9 @@ impl Program {
 
 fn read_op<R: Read>(input: &mut R) -> Result<Op, FormatError> {
     let mut tag = [0u8; 1];
-    input.read_exact(&mut tag).map_err(|_| FormatError::Truncated)?;
+    input
+        .read_exact(&mut tag)
+        .map_err(|_| FormatError::Truncated)?;
 
     let op = match tag[0] {
         0 => Op::Add(read_u8(input)?),
@@ -110,8 +121,12 @@ fn read_op<R: Read>(input: &mut R) -> Result<Op, FormatError> {
         3 => Op::MoveLeft(read_u32(input)?),
         4 => Op::Output,
         5 => Op::Input,
-        6 => Op::JumpIfZero { target: read_u32(input)? },
-        7 => Op::JumpIfNonZero { target: read_u32(input)? },
+        6 => Op::JumpIfZero {
+            target: read_u32(input)?,
+        },
+        7 => Op::JumpIfNonZero {
+            target: read_u32(input)?,
+        },
         8 => Op::Zero,
         other => return Err(FormatError::UnknownOpTag(other)),
     };
@@ -121,13 +136,17 @@ fn read_op<R: Read>(input: &mut R) -> Result<Op, FormatError> {
 
 fn read_u8<R: Read>(input: &mut R) -> Result<u8, FormatError> {
     let mut buf = [0u8; 1];
-    input.read_exact(&mut buf).map_err(|_| FormatError::Truncated)?;
+    input
+        .read_exact(&mut buf)
+        .map_err(|_| FormatError::Truncated)?;
     Ok(buf[0])
 }
 
 fn read_u32<R: Read>(input: &mut R) -> Result<u32, FormatError> {
     let mut buf = [0u8; 4];
-    input.read_exact(&mut buf).map_err(|_| FormatError::Truncated)?;
+    input
+        .read_exact(&mut buf)
+        .map_err(|_| FormatError::Truncated)?;
     Ok(u32::from_le_bytes(buf))
 }
 

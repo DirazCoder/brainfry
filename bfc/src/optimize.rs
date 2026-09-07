@@ -68,7 +68,11 @@ fn push_add_sub(out: &mut Vec<Op>, total: u32, is_add: bool) {
     let mut remaining = total;
     while remaining > 0 {
         let chunk = remaining.min(255) as u8;
-        out.push(if is_add { Op::Add(chunk) } else { Op::Sub(chunk) });
+        out.push(if is_add {
+            Op::Add(chunk)
+        } else {
+            Op::Sub(chunk)
+        });
         remaining -= chunk as u32;
     }
 }
@@ -113,9 +117,13 @@ fn resolve_jumps(ops: Vec<Op>) -> Vec<Op> {
             Op::JumpIfNonZero { .. } => {
                 // Parser already guaranteed brackets balance, so this always
                 // has a match.
-                let open_index = open_brackets.pop().expect("unbalanced brackets survived parsing");
+                let open_index = open_brackets
+                    .pop()
+                    .expect("unbalanced brackets survived parsing");
                 resolved[open_index] = Op::JumpIfZero { target: i as u32 };
-                resolved[i] = Op::JumpIfNonZero { target: open_index as u32 };
+                resolved[i] = Op::JumpIfNonZero {
+                    target: open_index as u32,
+                };
             }
             _ => {}
         }

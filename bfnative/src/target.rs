@@ -133,62 +133,6 @@ impl fmt::Display for Target {
     }
 }
 
-/// Default assembler/linker driver command for a target, host-aware where
-/// that matters. Cross-compiling setups will usually want to override with
-/// `--cc`; these are starting points, not requirements.
-pub fn default_driver(target: Target) -> String {
-    let host = Target::host();
-
-    match target.os {
-        // macOS executables can realistically only be produced on a mac,
-        // where cc (clang) builds either architecture with -arch — including
-        // x86_64 binaries on Apple Silicon and back.
-        Os::Macos => format!("cc -arch {}", target.arch.name()),
-
-        Os::Linux => {
-            if target == host {
-                "cc".to_string()
-            } else {
-                // Names of the usual cross-compiler packages
-                // (gcc-aarch64-linux-gnu and friends). `clang
-                // --target=<triple> -fuse-ld=lld` works too — pass --cc.
-                match target.arch {
-                    Arch::Aarch64 => "aarch64-linux-gnu-gcc".to_string(),
-                    Arch::X86_64 => "x86_64-linux-gnu-gcc".to_string(),
-                }
-            }
-        }
-
-        // Windows targets need a MinGW-family driver (Debian/Ubuntu cross
-        // packages, MSYS2, or llvm-mingw). MSVC's cl can't consume
-        // GNU-syntax assembly, so it's not a supported driver at all.
-        Os::Windows => match target.arch {
-            // Present in distro packages and in MSYS2's mingw-w64 toolchain.
-            Arch::X86_64 => "x86_64-w64-mingw32-gcc".to_string(),
-            // aarch64 mingw isn't packaged by distros; llvm-mingw is the
-            // usual source.
-            Arch::Aarch64 => "aarch64-w64-mingw32-gcc".to_string(),
-        },
-    }
-}
-
-/// Driver flags appended after the assembly file on the command line. They
-/// encode each OS's idea of what "standalone" means:
-///
-/// - Linux: freestanding (raw syscalls, our own `_start`) and fully static,
-///   so the result has zero dependencies of any kind.
-/// - macOS: an ordinary cc link — `main` and libSystem's `read`/`write`.
-///   A static/no-libc executable isn't a thing macOS offers.
-/// - Windows: freestanding again (Win32 API for I/O, our own entry symbol
-///   wired up with -e), linking nothing but kernel32.
-pub fn driver_flags(target: Target) -> &'static [&'static str] {
-    match target.os {
-        Os::Linux => &["-nostdlib", "-static"],
-        Os::Macos => &[],
-        Os::Windows => &["-nostdlib", "-lkernel32", "-Wl,-e,bf_start"],
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -205,15 +149,5 @@ mod tests {
         let err = Target::from_name("linux-arm64").unwrap_err();
         assert!(err.contains("linux-aarch64"));
         assert!(err.contains("windows-aarch64"));
-    }
-
-    #[test]
-    fn windows_entry_flag_is_wired_to_our_symbol() {
-        assert!(
-            driver_flags(Target::from_name("windows-x86_64").unwrap()).contains(&"-Wl,-e,bf_start")
-        );
-        assert!(
-            !driver_flags(Target::from_name("linux-x86_64").unwrap()).contains(&"-Wl,-e,bf_start")
-        );
     }
 }

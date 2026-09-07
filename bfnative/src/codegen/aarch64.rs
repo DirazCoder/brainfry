@@ -1,0 +1,1022 @@
+//! ARM64 machine code backend.
+//!
+//! One instruction selector, three OS runtimes (Linux syscalls, macOS
+//! libSystem through the GOT, Windows kernel32 through the IAT). Register
+//! roles and the tape-growth protocol mirror `x86_64.rs`; see
+//! `codegen/mod.rs` for the shared budget:
+//!
+//! - `x19` = cell pointer, `x20` = tape base, `x21` = tape end. Windows
+//!   additionally parks the std handles in `x22`/`x23`. All of these are
+//!   callee-saved in every ABI used here, so they survive libSystem /
+//!   kernel32 calls; the Linux kernel preserves them across `svc`.
+//! - `x18` is never touched (Windows reserves it for the TEB; other OSes
+//!   reserve it for shadow-call-stacks, so avoiding it is free insurance).
+//! - `x24` is a temporary inside the grow routine (callee-saved, so it
+//!   survives the mprotect / VirtualAlloc call; unused elsewhere).
+//! - `x16` (the architectural intra-call scratch IP1) carries function
+//!   addresses for GOT/IAT calls: `adrp x16; ldr x16, [x16, #off]; blr x16`.
+//!
+//! **Branch strategy.** ARM64 conditional branches and cbz/cbnz only reach
+//! ±1 MiB, but a single Brainfuck loop body can legitimately compile to
+//! more than that, so two rules keep every branch in range regardless of
+//! program size:
+//!
+//! 1. Any conditional whose *failure* path is far is inverted: branch
+//!    locally on the good condition, then fall into an unconditional `b`
+//!    (±128 MiB) to the error/exit handler.
+//! 2. Bracket jumps (`JumpIfZero`/`JumpIfNonZero`) need the *taken* path to
+//!    reach far, so each one emits a tiny trampoline: `cbz → STUB` (+8
+//!    bytes), `STUB: b target` (far unconditional). Loop back-edges cost
+//!    two branches; correctness never depends on loop-body size.
+
+use bfformat::Op;
+
+use crate::codegen::{
+    ArmAdrpPair, Emitter, GOT_EXIT, GOT_MMAP, GOT_MPROTECT, GOT_READ, GOT_WRITE, MSG_ALLOC,
+    MSG_CAP, MSG_GROW, MSG_IO, MSG_UNDERFLOW, PatchTarget, TAPE_GRAN, TAPE_INITIAL, TAPE_RESERVE,
+};
+use crate::target::{Os, Target};
+
+// Register numbers.
+const X0: u32 = 0;
+const X1: u32 = 1;
+const X2: u32 = 2;
+const X3: u32 = 3;
+const X4: u32 = 4;
+const X5: u32 = 5;
+const X6: u32 = 6;
+const X8: u32 = 8; // Linux syscall number register
+const X9: u32 = 9; // scratch
+const X10: u32 = 10; // constant scratch
+const X16: u32 = 16; // call-address scratch (IP1)
+const CELL: u32 = 19; // x19
+const BASE: u32 = 20; // x20
+const END: u32 = 21; // x21
+const X22: u32 = 22; // Windows: stdout handle
+const X23: u32 = 23; // Windows: stdin handle
+const X24: u32 = 24; // grow: newcap
+
+// IAT slot indices on Windows (same order as external_symbols()).
+const IAT_GETSTDHANDLE: u32 = 0;
+const IAT_WRITEFILE: u32 = 1;
+const IAT_READFILE: u32 = 2;
+const IAT_EXITPROCESS: u32 = 3;
+const IAT_VIRTUALALLOC: u32 = 4;
+
+/// Linux syscall numbers (aarch64 unified table).
+const SYS_READ: u32 = 63;
+const SYS_WRITE: u32 = 64;
+const SYS_MMAP: u32 = 222;
+const SYS_MPROTECT: u32 = 226;
+const SYS_EXIT_GROUP: u32 = 94;
+
+const MAP_PRIVATE_ANON_LINUX: u32 = 0x02 | 0x20;
+const MAP_PRIVATE_ANON_MACOS: u32 = 0x02 | 0x1000;
+const PROT_READ_WRITE: u32 = 3;
+
+/// -errno value of EINTR for read/write retries.
+const EINTR: u32 = 4;
+
+const MEM_COMMIT: u32 = 0x1000;
+const MEM_RESERVE: u32 = 0x2000;
+const PAGE_NOACCESS: u32 = 1;
+const PAGE_READWRITE: u32 = 4;
+
+// Condition codes.
+const EQ: u32 = 0;
+const NE: u32 = 1;
+const HS: u32 = 2; // unsigned >= (carry set)
+const LO: u32 = 3; // unsigned <
+
+struct Rt {
+    grow: u32,
+    err_underflow: u32,
+    err_io: u32,
+    err_cap: u32,
+    err_grow: u32,
+    err_alloc: u32,
+}
+
+pub fn emit(e: &mut Emitter, ops: &[Op], target: Target) {
+    let rt = Rt {
+        grow: e.internal_label(),
+        err_underflow: e.internal_label(),
+        err_io: e.internal_label(),
+        err_cap: e.internal_label(),
+        err_grow: e.internal_label(),
+        err_alloc: e.internal_label(),
+    };
+
+    match target.os {
+        Os::Linux => {
+            emit_entry_linux(e, &rt);
+            emit_body(e, ops, Os::Linux, &rt);
+            emit_exit_ok_linux(e);
+            emit_grow(e, &rt, Os::Linux);
+            emit_errors_linux(e, &rt);
+        }
+        Os::Macos => {
+            emit_entry_macos(e, &rt);
+            emit_body(e, ops, Os::Macos, &rt);
+            emit_exit_ok_macos(e);
+            emit_grow(e, &rt, Os::Macos);
+            emit_errors_macos(e, &rt);
+        }
+        Os::Windows => {
+            emit_entry_windows(e, &rt);
+            emit_body(e, ops, Os::Windows, &rt);
+            emit_exit_ok_windows(e);
+            emit_grow(e, &rt, Os::Windows);
+            emit_errors_windows(e, &rt);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// body
+// ---------------------------------------------------------------------------
+
+fn emit_body(e: &mut Emitter, ops: &[Op], os: Os, rt: &Rt) {
+    for (i, op) in ops.iter().enumerate() {
+        e.bind_here(i as u32);
+        match *op {
+            Op::Output => match os {
+                Os::Linux => emit_output_linux(e, rt),
+                Os::Macos => emit_output_macos(e, rt),
+                Os::Windows => emit_output_windows(e, rt),
+            },
+            Op::Input => match os {
+                Os::Linux => emit_input_linux(e, rt),
+                Os::Macos => emit_input_macos(e, rt),
+                Os::Windows => emit_input_windows(e, rt),
+            },
+            op => emit_op(e, &op, i, rt),
+        }
+    }
+    e.bind_here(ops.len() as u32);
+}
+
+fn emit_op(e: &mut Emitter, op: &Op, i: usize, rt: &Rt) {
+    match *op {
+        Op::Add(n) => {
+            e.span(format!("op {i}: Add({n}) — ldrb/add/strb w9"));
+            ldrb_w(e, X9, CELL);
+            add_w_imm(e, X9, X9, n as u32);
+            strb_w(e, X9, CELL);
+        }
+        Op::Sub(n) => {
+            e.span(format!("op {i}: Sub({n}) — ldrb/sub/strb w9"));
+            ldrb_w(e, X9, CELL);
+            sub_w_imm(e, X9, X9, n as u32);
+            strb_w(e, X9, CELL);
+        }
+        Op::Zero => {
+            e.span(format!("op {i}: Zero — strb wzr, [x19]"));
+            strb_wzr(e, CELL);
+        }
+        Op::MoveRight(n) => {
+            e.span(format!("op {i}: MoveRight({n}) — bounds check + grow"));
+            // x0 = cell + n; if x0 >= end (unsigned) call grow, which
+            // preserves x0, so a single `mov x19, x0` updates the pointer
+            // on both paths. Inverted condition: the local branch skips
+            // the bl on the in-bounds path; the grow path falls into bl
+            // directly (bl reaches ±128 MiB, so no trampoline is needed).
+            if n <= 4095 {
+                add_imm(e, X0, CELL, n);
+            } else {
+                mov_imm32(e, X10, n);
+                add_reg(e, X0, CELL, X10);
+            }
+            cmp_reg(e, X0, END);
+            let update = e.internal_label();
+            bcond(e, LO, update); // x0 < end → skip grow
+            bl(e, rt.grow);
+            e.bind_here(update);
+            e.span("  mov x19, x0");
+            mov_reg(e, CELL, X0);
+        }
+        Op::MoveLeft(n) => {
+            e.span(format!("op {i}: MoveLeft({n}) — underflow check"));
+            // x9 = cell - base (never wraps: x19 >= x20 invariant);
+            // underflow iff x9 < n. Inverted branch keeps the error path's
+            // far jump unconditional.
+            sub_reg(e, X9, CELL, BASE);
+            if n <= 4095 {
+                cmp_imm(e, X9, n);
+                let ok = e.internal_label();
+                bcond(e, HS, ok);
+                b_label(e, rt.err_underflow);
+                e.bind_here(ok);
+                sub_imm(e, CELL, CELL, n);
+            } else {
+                mov_imm32(e, X10, n);
+                cmp_reg(e, X9, X10);
+                let ok = e.internal_label();
+                bcond(e, HS, ok);
+                b_label(e, rt.err_underflow);
+                e.bind_here(ok);
+                sub_reg(e, CELL, CELL, X10);
+            }
+        }
+        // bfrun executes op `target + 1` after a taken jump, so the branch
+        // aims one past the paired bracket op; `target + 1 == ops.len()`
+        // lands on the exit label. The taken path may be arbitrarily far,
+        // so it goes through the STUB trampoline; the fall-through path
+        // uses one local `b` to hop over the stub.
+        Op::JumpIfZero { target } => {
+            e.span(format!(
+                "op {i}: JumpIfZero -> op {} — ldrb; cbz w9, stub; b stub(far)",
+                target as usize + 1
+            ));
+            emit_bracket_jump(e, false, target + 1);
+        }
+        Op::JumpIfNonZero { target } => {
+            e.span(format!(
+                "op {i}: JumpIfNonZero -> op {} — ldrb; cbnz w9, stub; b stub(far)",
+                target as usize + 1
+            ));
+            emit_bracket_jump(e, true, target + 1);
+        }
+        Op::Output | Op::Input => unreachable!("dispatched by emit_body"),
+    }
+}
+
+/// The bracket-jump trampoline. Layout (label `i` is already bound by the
+/// caller at the first instruction):
+///
+/// ```text
+/// TEST:  ldrb w9, [x19]
+///        cbz/cbnz w9, STUB    ; +8, local
+///        b   NEXT             ; +8, local: skip the stub when not taken
+/// STUB:  b   target           ; far unconditional
+/// NEXT:  ...                  ; the next op's code starts here
+/// ```
+fn emit_bracket_jump(e: &mut Emitter, is_nonzero: bool, target: u32) {
+    ldrb_w(e, X9, CELL);
+    let stub = e.internal_label();
+    let next = e.internal_label();
+    cbz32(e, is_nonzero, X9, stub);
+    b_label(e, next);
+    e.bind_here(stub);
+    e.span("  stub: b (far)");
+    b_label(e, target);
+    e.bind_here(next);
+}
+
+// ---------------------------------------------------------------------------
+// Linux runtime
+// ---------------------------------------------------------------------------
+
+fn emit_entry_linux(e: &mut Emitter, rt: &Rt) {
+    e.span("entry _start (linux-aarch64): mmap tape reservation, mprotect first 64 KiB");
+    // mmap(NULL, RESERVE, PROT_NONE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0)
+    mov_zr(e, X0);
+    movz_lsl16(e, X1, (TAPE_RESERVE >> 16) as u32);
+    mov_zr(e, X2);
+    movz(e, X3, MAP_PRIVATE_ANON_LINUX);
+    movn(e, X4, 0); // fd = -1
+    mov_zr(e, X5);
+    movz(e, X8, SYS_MMAP);
+    svc(e);
+    // x0 in [-4095, -1] ⇔ cmn x0, #4095 sets carry.
+    cmn_imm(e, X0, 4095);
+    let ok = e.internal_label();
+    bcond(e, LO, ok); // carry clear → fine
+    b_label(e, rt.err_alloc);
+    e.bind_here(ok);
+    mov_reg(e, BASE, X0);
+
+    // mprotect(base, TAPE_GRAN, PROT_READ|PROT_WRITE)
+    mov_reg(e, X0, BASE);
+    movz_lsl16(e, X1, (TAPE_GRAN >> 16) as u32);
+    movz(e, X2, PROT_READ_WRITE);
+    movz(e, X8, SYS_MPROTECT);
+    svc(e);
+    cmn_imm(e, X0, 4095);
+    let ok = e.internal_label();
+    bcond(e, LO, ok);
+    b_label(e, rt.err_alloc);
+    e.bind_here(ok);
+
+    mov_reg(e, CELL, BASE);
+    movz(e, X1, TAPE_INITIAL as u32);
+    add_reg(e, END, BASE, X1);
+}
+
+fn emit_exit_ok_linux(e: &mut Emitter) {
+    e.span("exit_ok: exit_group(0)");
+    mov_zr(e, X0);
+    movz(e, X8, SYS_EXIT_GROUP);
+    svc(e);
+}
+
+fn emit_output_linux(e: &mut Emitter, rt: &Rt) {
+    e.span("Output: write(1, cell, 1), retry on EINTR");
+    let retry = e.internal_label();
+    e.bind_here(retry);
+    movz(e, X8, SYS_WRITE);
+    movz(e, X0, 1);
+    mov_reg(e, X1, CELL);
+    movz(e, X2, 1);
+    svc(e);
+    cmp_imm(e, X0, 1);
+    let done = e.internal_label();
+    bcond(e, EQ, done);
+    cmn_imm(e, X0, EINTR);
+    bcond(e, EQ, retry);
+    b_label(e, rt.err_io);
+    e.bind_here(done);
+}
+
+fn emit_input_linux(e: &mut Emitter, rt: &Rt) {
+    e.span("Input: read(0, cell, 1); EOF leaves cell unchanged");
+    let retry = e.internal_label();
+    e.bind_here(retry);
+    movz(e, X8, SYS_READ);
+    mov_zr(e, X0);
+    mov_reg(e, X1, CELL);
+    movz(e, X2, 1);
+    svc(e);
+    // The kernel stores the byte straight into the cell, so x0 == 1 is the
+    // whole success story.
+    cmp_imm(e, X0, 1);
+    let done = e.internal_label();
+    bcond(e, EQ, done);
+    cmn_imm(e, X0, EINTR);
+    bcond(e, EQ, retry);
+    // x0 == 0 is EOF: buffer (the cell) untouched = bfrun's convention.
+    cbz64(e, false, X0, done);
+    b_label(e, rt.err_io);
+    e.bind_here(done);
+}
+
+fn emit_errors_linux(e: &mut Emitter, rt: &Rt) {
+    e.span("error tail (linux): write(2, msg), exit_group(1)");
+    let tail = e.internal_label();
+    e.bind_here(tail);
+    // x1 = message, x2 = length (set by each jump site).
+    movz(e, X0, 2);
+    movz(e, X8, SYS_WRITE);
+    svc(e);
+    movz(e, X0, 1);
+    movz(e, X8, SYS_EXIT_GROUP);
+    svc(e);
+    emit_error_jumps(e, rt, &|e, off, len| {
+        adrp_str(e, X1, off);
+        movz(e, X2, len);
+        b_label(e, tail);
+    });
+}
+
+// ---------------------------------------------------------------------------
+// macOS runtime
+// ---------------------------------------------------------------------------
+
+fn emit_entry_macos(e: &mut Emitter, rt: &Rt) {
+    e.span("entry main (macos-aarch64): mmap via libSystem");
+    // dyld calls the LC_MAIN entry with sp 16-byte aligned; nothing in this
+    // program ever pushes, so every blr call site stays aligned.
+    mov_zr(e, X0);
+    movz_lsl16(e, X1, (TAPE_RESERVE >> 16) as u32);
+    mov_zr(e, X2);
+    movz(e, X3, MAP_PRIVATE_ANON_MACOS);
+    movn(e, X4, 0);
+    mov_zr(e, X5);
+    call_got(e, GOT_MMAP);
+    // mmap returns MAP_FAILED ((void*)-1) on error.
+    cmn_imm(e, X0, 1);
+    let ok = e.internal_label();
+    bcond(e, NE, ok); // Z clear ⇔ x0 != -1
+    b_label(e, rt.err_alloc);
+    e.bind_here(ok);
+    mov_reg(e, BASE, X0);
+
+    // mprotect(base, TAPE_GRAN, RW) — BSD return: 0 or -1. Zero = success.
+    mov_reg(e, X0, BASE);
+    movz_lsl16(e, X1, (TAPE_GRAN >> 16) as u32);
+    movz(e, X2, PROT_READ_WRITE);
+    call_got(e, GOT_MPROTECT);
+    let ok = e.internal_label();
+    cbz32(e, false, X0, ok); // w0 view: int return, 0 = success
+    b_label(e, rt.err_alloc);
+    e.bind_here(ok);
+
+    mov_reg(e, CELL, BASE);
+    movz(e, X1, TAPE_INITIAL as u32);
+    add_reg(e, END, BASE, X1);
+}
+
+fn emit_exit_ok_macos(e: &mut Emitter) {
+    e.span("exit_ok: _exit(0)");
+    mov_zr(e, X0);
+    call_got(e, GOT_EXIT);
+}
+
+fn emit_output_macos(e: &mut Emitter, rt: &Rt) {
+    e.span("Output: write(1, cell, 1) via GOT, retry on EINTR");
+    let retry = e.internal_label();
+    e.bind_here(retry);
+    movz(e, X0, 1);
+    mov_reg(e, X1, CELL);
+    movz(e, X2, 1);
+    call_got(e, GOT_WRITE);
+    cmp_imm(e, X0, 1);
+    let done = e.internal_label();
+    bcond(e, EQ, done);
+    cmn_imm(e, X0, EINTR);
+    bcond(e, EQ, retry);
+    b_label(e, rt.err_io);
+    e.bind_here(done);
+}
+
+fn emit_input_macos(e: &mut Emitter, rt: &Rt) {
+    e.span("Input: read(0, cell, 1) via GOT; EOF leaves cell unchanged");
+    let retry = e.internal_label();
+    e.bind_here(retry);
+    mov_zr(e, X0);
+    mov_reg(e, X1, CELL);
+    movz(e, X2, 1);
+    call_got(e, GOT_READ);
+    cmp_imm(e, X0, 1);
+    let done = e.internal_label();
+    bcond(e, EQ, done);
+    cmn_imm(e, X0, EINTR);
+    bcond(e, EQ, retry);
+    cbz64(e, false, X0, done);
+    b_label(e, rt.err_io);
+    e.bind_here(done);
+}
+
+fn emit_errors_macos(e: &mut Emitter, rt: &Rt) {
+    e.span("error tail (macos): write(2, msg) via GOT, _exit(1)");
+    let tail = e.internal_label();
+    e.bind_here(tail);
+    movz(e, X0, 2);
+    call_got(e, GOT_WRITE);
+    movz(e, X0, 1);
+    call_got(e, GOT_EXIT);
+    emit_error_jumps(e, rt, &|e, off, len| {
+        adrp_str(e, X1, off);
+        movz(e, X2, len);
+        b_label(e, tail);
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Windows runtime
+// ---------------------------------------------------------------------------
+
+fn emit_entry_windows(e: &mut Emitter, rt: &Rt) {
+    e.span("entry (windows-aarch64): align sp, VirtualAlloc tape, std handles");
+    // The loader's entry alignment is a convention, not a contract, so
+    // align defensively, then take a fixed 64-byte frame: [sp+0,16) is the
+    // callee scratch area the Windows ARM64 ABI reserves, [sp+16,64) is
+    // ours (the lpNumberOfBytesWritten qword lives at sp+16). Nothing ever
+    // changes sp again, so every blr call site is 16-byte aligned.
+    mov_sp_to(e, X9);
+    movz(e, X10, 15);
+    and_reg(e, X9, X9, X10);
+    sub_sp_reg(e, X9);
+    sub_imm(e, 31, 31, 64); // sub sp, sp, #64
+
+    // VirtualAlloc(NULL, RESERVE, MEM_RESERVE, PAGE_NOACCESS)
+    mov_zr(e, X0);
+    movz_lsl16(e, X1, (TAPE_RESERVE >> 16) as u32);
+    movz(e, X2, MEM_RESERVE);
+    movz(e, X3, PAGE_NOACCESS);
+    call_got(e, IAT_VIRTUALALLOC);
+    let ok = e.internal_label();
+    cbz64(e, true, X0, ok); // pointer nonzero → ok
+    b_label(e, rt.err_alloc);
+    e.bind_here(ok);
+    mov_reg(e, BASE, X0);
+
+    // VirtualAlloc(base, TAPE_GRAN, MEM_COMMIT, PAGE_READWRITE)
+    mov_reg(e, X0, BASE);
+    movz_lsl16(e, X1, (TAPE_GRAN >> 16) as u32);
+    movz(e, X2, MEM_COMMIT);
+    movz(e, X3, PAGE_READWRITE);
+    call_got(e, IAT_VIRTUALALLOC);
+    let ok = e.internal_label();
+    cbz64(e, true, X0, ok);
+    b_label(e, rt.err_alloc);
+    e.bind_here(ok);
+
+    // x22 = GetStdHandle(STD_OUTPUT_HANDLE), x23 = GetStdHandle(STD_INPUT_HANDLE)
+    movn(e, X0, 10); // ~10 = -11
+    call_got(e, IAT_GETSTDHANDLE);
+    mov_reg(e, X22, X0);
+    movn(e, X0, 9); // ~9 = -10
+    call_got(e, IAT_GETSTDHANDLE);
+    mov_reg(e, X23, X0);
+
+    mov_reg(e, CELL, BASE);
+    movz(e, X1, TAPE_INITIAL as u32);
+    add_reg(e, END, BASE, X1);
+}
+
+fn emit_exit_ok_windows(e: &mut Emitter) {
+    e.span("exit_ok: ExitProcess(0)");
+    mov_zr(e, X0);
+    call_got(e, IAT_EXITPROCESS);
+}
+
+fn emit_output_windows(e: &mut Emitter, rt: &Rt) {
+    e.span("Output: WriteFile(stdout, cell, 1, &n, NULL)");
+    // WriteFile(h, buf, n, &n, lpOverlapped): x0..x3 + x4, all in registers
+    // on AAPCS64 — no shadow space to manage.
+    mov_reg(e, X0, X22);
+    mov_reg(e, X1, CELL);
+    movz(e, X2, 1);
+    add_imm(e, X3, 31, 16); // &written = sp + 16
+    mov_zr(e, X4);
+    call_got(e, IAT_WRITEFILE);
+    let ok = e.internal_label();
+    cbz32(e, true, X0, ok); // w0 view: BOOL, TRUE → check the count
+    b_label(e, rt.err_io);
+    e.bind_here(ok);
+    ldr_imm(e, X9, 16); // ldr x9, [sp, #16]
+    cmp_imm(e, X9, 1);
+    let ok2 = e.internal_label();
+    bcond(e, EQ, ok2);
+    b_label(e, rt.err_io);
+    e.bind_here(ok2);
+}
+
+fn emit_input_windows(e: &mut Emitter, rt: &Rt) {
+    e.span("Input: ReadFile(stdin, cell, 1, &n, NULL); EOF leaves cell unchanged");
+    mov_reg(e, X0, X23);
+    mov_reg(e, X1, CELL);
+    movz(e, X2, 1);
+    add_imm(e, X3, 31, 16);
+    mov_zr(e, X4);
+    call_got(e, IAT_READFILE);
+    let ok = e.internal_label();
+    cbz32(e, true, X0, ok); // w0 view: BOOL, TRUE → ok
+    b_label(e, rt.err_io);
+    e.bind_here(ok);
+    ldr_imm(e, X9, 16);
+    // *n == 1 → byte written into the cell; *n == 0 → EOF, buffer untouched
+    // (bfrun's convention); anything else → error.
+    cmp_imm(e, X9, 1);
+    let done = e.internal_label();
+    bcond(e, EQ, done);
+    cbz64(e, false, X9, done);
+    b_label(e, rt.err_io);
+    e.bind_here(done);
+}
+
+fn emit_errors_windows(e: &mut Emitter, rt: &Rt) {
+    e.span("error tail (windows): GetStdHandle(stderr), WriteFile, ExitProcess(1)");
+    let tail = e.internal_label();
+    e.bind_here(tail);
+    // x1 = message, x2 = length (set by each jump site).
+    movn(e, X0, 11); // ~11 = -12 = STD_ERROR_HANDLE
+    call_got(e, IAT_GETSTDHANDLE);
+    // x0 = handle; x1/x2 already carry buffer/length.
+    add_imm(e, X3, 31, 16); // &written
+    mov_zr(e, X4);
+    call_got(e, IAT_WRITEFILE);
+    movz(e, X0, 1);
+    call_got(e, IAT_EXITPROCESS);
+    emit_error_jumps(e, rt, &|e, off, len| {
+        adrp_str(e, X1, off);
+        movz(e, X2, len);
+        b_label(e, tail);
+    });
+}
+
+// ---------------------------------------------------------------------------
+// shared grow routine
+// ---------------------------------------------------------------------------
+
+/// Contract (identical on every OS): `x0` = desired pointer. Preserves x0,
+/// x19, x20; updates x21 to base + newcap; clobbers x1..x10, x16, x24.
+/// Exits through err_cap / err_grow on failure. Same capacity policy as the
+/// x86-64 backend:
+///
+/// ```text
+/// newcap = min(RESERVE, max(round64k(needed + 1), round64k(2 * cap)))
+/// commit [round64k(cap), newcap)
+/// ```
+fn emit_grow(e: &mut Emitter, rt: &Rt, os: Os) {
+    e.span("bf_grow: extend the tape (x0 = desired, in/out)");
+    e.bind_here(rt.grow);
+    sub_imm(e, 31, 31, 16); // sub sp, sp, #16
+    str_x0_sp(e); // str x0, [sp] — save desired
+
+    // x1 = needed = x0 - x20
+    sub_reg(e, X1, X0, BASE);
+    movz_lsl16(e, X2, (TAPE_RESERVE >> 16) as u32);
+    cmp_reg(e, X1, X2);
+    let ok_cap = e.internal_label();
+    bcond(e, LO, ok_cap);
+    b_label(e, rt.err_cap);
+    e.bind_here(ok_cap);
+
+    // x3 = candidate = round64k(needed + 1) = (needed + 64K) & ~0xFFFF.
+    // The +1 matters — see the x86-64 backend for the analysis.
+    movz_lsl16(e, X9, 1); // x9 = 0x10000
+    movz(e, X10, 0xFFFF); // x10 = mask
+    add_reg(e, X3, X1, X9);
+    bic(e, X3, X3, X10);
+
+    // x4 = doubled = round64k(2 * cap)
+    sub_reg(e, X4, END, BASE); // cap
+    add_reg(e, X4, X4, X4); // 2 * cap
+    add_reg(e, X4, X4, X10); // + 0xFFFF
+    bic(e, X4, X4, X10);
+
+    // x3 = newcap = min(RESERVE, max(candidate, doubled))
+    cmp_reg(e, X3, X4);
+    csel(e, X3, X3, X4, 8); // hi: x3 = x3 > x4 ? x3 : x4
+    cmp_reg(e, X3, X2);
+    csel(e, X3, X3, X2, 9); // ls: x3 = x3 <= RESERVE ? x3 : RESERVE
+
+    // x24 = newcap — callee-saved, survives the mprotect/VirtualAlloc call.
+    mov_reg(e, X24, X3);
+
+    // x5 = committed = round64k(cap); x6 = len = newcap - committed.
+    sub_reg(e, X5, END, BASE);
+    add_reg(e, X5, X5, X10);
+    bic(e, X5, X5, X10);
+    sub_reg(e, X6, X24, X5);
+
+    // len == 0 is a real case (the first growth, 30000 -> 65536, needs no
+    // new pages) and VirtualAlloc rejects zero-sized commits, so skip.
+    let no_commit = e.internal_label();
+    cbz64(e, false, X6, no_commit);
+
+    // Commit args: x0 = addr = base + committed, x1 = len.
+    add_reg(e, X0, BASE, X5);
+    mov_reg(e, X1, X6);
+
+    match os {
+        Os::Linux => {
+            movz(e, X2, PROT_READ_WRITE);
+            movz(e, X8, SYS_MPROTECT);
+            svc(e);
+            // -errno range check, inverted so the far jump is unconditional.
+            cmn_imm(e, X0, 4095);
+            let ok = e.internal_label();
+            bcond(e, LO, ok);
+            b_label(e, rt.err_grow);
+            e.bind_here(ok);
+        }
+        Os::Macos => {
+            movz(e, X2, PROT_READ_WRITE);
+            call_got(e, GOT_MPROTECT);
+            // mprotect: 0 or -1. Zero = success (int return, w0 view).
+            let ok = e.internal_label();
+            cbz32(e, false, X0, ok);
+            b_label(e, rt.err_grow);
+            e.bind_here(ok);
+        }
+        Os::Windows => {
+            movz(e, X2, MEM_COMMIT);
+            movz(e, X3, PAGE_READWRITE);
+            call_got(e, IAT_VIRTUALALLOC);
+            // NULL = failure (pointer check, 64-bit).
+            let ok = e.internal_label();
+            cbz64(e, true, X0, ok);
+            b_label(e, rt.err_grow);
+            e.bind_here(ok);
+        }
+    }
+
+    e.bind_here(no_commit);
+    // x21 = x20 + newcap; restore x0; return.
+    add_reg(e, END, BASE, X24);
+    ldr_x0_sp(e); // ldr x0, [sp]
+    add_imm(e, 31, 31, 16); // add sp, sp, #16
+    ret(e);
+}
+
+// ---------------------------------------------------------------------------
+// error path helpers
+// ---------------------------------------------------------------------------
+
+fn emit_error_jumps(e: &mut Emitter, rt: &Rt, load: &dyn Fn(&mut Emitter, u32, u32)) {
+    let cases = [
+        (
+            rt.err_underflow,
+            MSG_UNDERFLOW,
+            "pointer moved left of cell 0",
+        ),
+        (rt.err_io, MSG_IO, "I/O error"),
+        (rt.err_cap, MSG_CAP, "tape limit exceeded"),
+        (rt.err_grow, MSG_GROW, "failed to grow tape"),
+        (rt.err_alloc, MSG_ALLOC, "failed to reserve tape memory"),
+    ];
+    for (label, msg, note) in cases {
+        e.bind_here(label);
+        e.span(format!("error path: {note}"));
+        let off = e.string(msg);
+        load(e, off, msg.len() as u32);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// low-level encoding helpers (comments give the exact bit layout)
+// ---------------------------------------------------------------------------
+
+/// `ldrb Wt, [Xn]` — 39400000 | Rn<<5 | Rt.
+fn ldrb_w(e: &mut Emitter, rt: u32, rn: u32) {
+    e.u32(0x3940_0000 | (rn << 5) | rt);
+}
+
+/// `strb Wt, [Xn]` — 39000000 | Rn<<5 | Rt.
+fn strb_w(e: &mut Emitter, rt: u32, rn: u32) {
+    e.u32(0x3900_0000 | (rn << 5) | rt);
+}
+
+/// `strb wzr, [Xn]` — 39000000 | Rn<<5 | 31.
+fn strb_wzr(e: &mut Emitter, rn: u32) {
+    e.u32(0x3900_0000 | (rn << 5) | 31);
+}
+
+/// `add Wd, Wn, #imm12` — 11000000 | imm12<<10 | Rn<<5 | Rd. The 32-bit add
+/// plus the byte-wide `strb` give mod-256 wraparound for free.
+fn add_w_imm(e: &mut Emitter, rd: u32, rn: u32, imm: u32) {
+    debug_assert!(imm <= 4095);
+    e.u32(0x1100_0000 | (imm << 10) | (rn << 5) | rd);
+}
+
+/// `sub Wd, Wn, #imm12` — 51000000.
+fn sub_w_imm(e: &mut Emitter, rd: u32, rn: u32, imm: u32) {
+    debug_assert!(imm <= 4095);
+    e.u32(0x5100_0000 | (imm << 10) | (rn << 5) | rd);
+}
+
+/// `add Xd, Xn, #imm12` — 91000000.
+fn add_imm(e: &mut Emitter, rd: u32, rn: u32, imm: u32) {
+    debug_assert!(imm <= 4095);
+    e.u32(0x9100_0000 | (imm << 10) | (rn << 5) | rd);
+}
+
+/// `sub Xd, Xn, #imm12` — D1000000.
+fn sub_imm(e: &mut Emitter, rd: u32, rn: u32, imm: u32) {
+    debug_assert!(imm <= 4095);
+    e.u32(0xD100_0000 | (imm << 10) | (rn << 5) | rd);
+}
+
+/// `add Xd, Xn, Xm` — 8B000000 | Rm<<16 | Rn<<5 | Rd.
+fn add_reg(e: &mut Emitter, rd: u32, rn: u32, rm: u32) {
+    e.u32(0x8B00_0000 | (rm << 16) | (rn << 5) | rd);
+}
+
+/// `sub Xd, Xn, Xm` — CB000000.
+fn sub_reg(e: &mut Emitter, rd: u32, rn: u32, rm: u32) {
+    e.u32(0xCB00_0000 | (rm << 16) | (rn << 5) | rd);
+}
+
+/// `and Xd, Xn, Xm` — 8A000000.
+fn and_reg(e: &mut Emitter, rd: u32, rn: u32, rm: u32) {
+    e.u32(0x8A00_0000 | (rm << 16) | (rn << 5) | rd);
+}
+
+/// `bic Xd, Xn, Xm` (AND NOT) — 8A200000.
+fn bic(e: &mut Emitter, rd: u32, rn: u32, rm: u32) {
+    e.u32(0x8A20_0000 | (rm << 16) | (rn << 5) | rd);
+}
+
+/// `cmp Xn, #imm12` (SUBS xzr) — F1000000.
+fn cmp_imm(e: &mut Emitter, rn: u32, imm: u32) {
+    debug_assert!(imm <= 4095);
+    e.u32(0xF100_0000 | (imm << 10) | (rn << 5) | 31);
+}
+
+/// `cmp Xn, Xm` (SUBS xzr, Xn, Xm) — EB000000.
+fn cmp_reg(e: &mut Emitter, rn: u32, rm: u32) {
+    e.u32(0xEB00_0000 | (rm << 16) | (rn << 5) | 31);
+}
+
+/// `cmn Xn, #imm12` (ADDS xzr) — B1000000. cmn x0, #4095 sets carry exactly
+/// for the Linux -errno range [-4095, -1].
+fn cmn_imm(e: &mut Emitter, rn: u32, imm: u32) {
+    debug_assert!(imm <= 4095);
+    e.u32(0xB100_0000 | (imm << 10) | (rn << 5) | 31);
+}
+
+/// `csel Xd, Xn, Xm, cond` — 9A800000 | Rm<<16 | cond<<12 | Rn<<5 | Rd.
+fn csel(e: &mut Emitter, rd: u32, rn: u32, rm: u32, cond: u32) {
+    e.u32(0x9A80_0000 | (rm << 16) | (cond << 12) | (rn << 5) | rd);
+}
+
+/// `mov Xd, Xm` (ORR Xd, xzr, Xm) — AA000000 | Rm<<16 | 31<<5 | Rd.
+fn mov_reg(e: &mut Emitter, rd: u32, rm: u32) {
+    e.u32(0xAA00_0000 | (rm << 16) | (31 << 5) | rd);
+}
+
+/// `mov Xd, xzr` — AA1F03E0 pattern.
+fn mov_zr(e: &mut Emitter, rd: u32) {
+    e.u32(0xAA1F_03E0 | rd);
+}
+
+/// `movz Xd, #imm16` (hw = 0) — D2800000.
+fn movz(e: &mut Emitter, rd: u32, imm: u32) {
+    debug_assert!(imm <= 0xFFFF);
+    e.u32(0xD280_0000 | (imm << 5) | rd);
+}
+
+/// `movz Xd, #imm16, lsl #16` (hw = 1) — D2A00000.
+fn movz_lsl16(e: &mut Emitter, rd: u32, imm: u32) {
+    debug_assert!(imm <= 0xFFFF);
+    e.u32(0xD2A0_0000 | (imm << 5) | rd);
+}
+
+/// `movn Xd, #imm16` (~imm) — 92800000.
+fn movn(e: &mut Emitter, rd: u32, imm: u32) {
+    debug_assert!(imm <= 0xFFFF);
+    e.u32(0x9280_0000 | (imm << 5) | rd);
+}
+
+/// `movk Xd, #imm16, lsl #hw*16` — F2800000 | hw<<21 | imm<<5 | Rd.
+fn movk(e: &mut Emitter, rd: u32, imm: u32, hw: u32) {
+    debug_assert!(imm <= 0xFFFF && hw <= 3);
+    e.u32(0xF280_0000 | (hw << 21) | (imm << 5) | rd);
+}
+
+/// Materializes any u32 constant: `movz` + optional `movk`.
+fn mov_imm32(e: &mut Emitter, rd: u32, value: u32) {
+    movz(e, rd, value & 0xFFFF);
+    if value > 0xFFFF {
+        movk(e, rd, value >> 16, 1);
+    }
+}
+
+/// `mov Xd, sp` (ADD Xd, sp, #0) — 910003E0 | Rd.
+fn mov_sp_to(e: &mut Emitter, rd: u32) {
+    e.u32(0x9100_03E0 | rd);
+}
+
+/// `sub sp, sp, Xn` — CB000000 | Rm<<16 | 31<<5 | 31.
+fn sub_sp_reg(e: &mut Emitter, rm: u32) {
+    e.u32(0xCB00_0000 | (rm << 16) | (31 << 5) | 31);
+}
+
+/// `str x0, [sp]` — F90003E0.
+fn str_x0_sp(e: &mut Emitter) {
+    e.u32(0xF900_03E0);
+}
+
+/// `ldr x0, [sp]` — F94003E0.
+fn ldr_x0_sp(e: &mut Emitter) {
+    e.u32(0xF940_03E0);
+}
+
+/// `ldr Xt, [sp, #imm]` (imm multiple of 8) — F9400000 | (imm/8)<<10 | 31<<5 | Rt.
+fn ldr_imm(e: &mut Emitter, rt: u32, imm: u32) {
+    debug_assert!(imm.is_multiple_of(8) && imm / 8 < 4096);
+    e.u32(0xF940_0000 | ((imm / 8) << 10) | (31 << 5) | rt);
+}
+
+/// `ret` — D65F03C0.
+fn ret(e: &mut Emitter) {
+    e.u32(0xD65F_03C0);
+}
+
+/// `svc #0` — D4000001. Clobbers x0 (return), x1, x8.
+fn svc(e: &mut Emitter) {
+    e.u32(0xD400_0001);
+}
+
+/// `b label` — 14000000 | imm26 (patched).
+fn b_label(e: &mut Emitter, label: u32) {
+    e.arm_b(false, PatchTarget::Label(label));
+}
+
+/// `bl label` — 94000000 | imm26 (patched).
+fn bl(e: &mut Emitter, label: u32) {
+    e.arm_b(true, PatchTarget::Label(label));
+}
+
+/// `b.cond label` — 54000000 | imm19<<5 | cond (patched).
+fn bcond(e: &mut Emitter, cond: u32, label: u32) {
+    e.arm_cond(0x5400_0000 | cond, PatchTarget::Label(label));
+}
+
+/// `cbz`/`cbnz Wt, label` (32-bit register view) — 34000000/35000000 |
+/// imm19<<5 | Rt (patched). Use for W-register tests (bytes, BOOLs,
+/// 32-bit int returns).
+fn cbz32(e: &mut Emitter, is_nonzero: bool, rt_reg: u32, label: u32) {
+    let base = if is_nonzero { 0x3500_0000 } else { 0x3400_0000 };
+    e.arm_cond(base | rt_reg, PatchTarget::Label(label));
+}
+
+/// `cbz`/`cbnz Xt, label` (64-bit register view) — B4000000/B5000000.
+/// Required for pointer checks: the 32-bit form only tests the low half,
+/// which misreads pointers like 0x1_00000000 as zero.
+fn cbz64(e: &mut Emitter, is_nonzero: bool, rt_reg: u32, label: u32) {
+    let base = if is_nonzero { 0xB500_0000 } else { 0xB400_0000 };
+    e.arm_cond(base | rt_reg, PatchTarget::Label(label));
+}
+
+/// `adrp x16, <GOT/IAT slot>; ldr x16, [x16, #off]; blr x16` — the call
+/// sequence for both libSystem (macOS) and kernel32 (Windows) targets.
+/// x16 is the architectural scratch for indirect calls, so clobbering it is
+/// explicitly allowed by every ABI here.
+fn call_got(e: &mut Emitter, slot: u32) {
+    e.arm_adrp_pair(X16, ArmAdrpPair::Ldr, PatchTarget::Got(slot));
+    e.u32(0xD63F_0200); // blr x16
+}
+
+/// `adrp Xt, <string>; add Xt, Xt, #lo12` — string address materialization.
+fn adrp_str(e: &mut Emitter, rd: u32, str_off: u32) {
+    e.arm_adrp_pair(rd, ArmAdrpPair::Add, PatchTarget::Str(str_off));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn w32(code: &[u8], pos: usize) -> u32 {
+        u32::from_le_bytes(code[pos..pos + 4].try_into().unwrap())
+    }
+
+    #[test]
+    fn known_golden_encodings() {
+        let mut e = Emitter::new(0);
+        ret(&mut e);
+        assert_eq!(w32(&e.code, 0), 0xD65F_03C0);
+        let mut e = Emitter::new(0);
+        svc(&mut e);
+        assert_eq!(w32(&e.code, 0), 0xD400_0001);
+        let mut e = Emitter::new(0);
+        e.u32(0xD63F_0200); // blr x16 (emitted inline by call_got)
+        assert_eq!(w32(&e.code, 0), 0xD63F_0200);
+    }
+
+    #[test]
+    fn mov_and_byte_ops_match_reference_encodings() {
+        let mut e = Emitter::new(0);
+        mov_zr(&mut e, X0); // mov x0, xzr
+        assert_eq!(w32(&e.code, 0), 0xAA1F_03E0);
+
+        let mut e = Emitter::new(0);
+        add_w_imm(&mut e, X0, X0, 1); // add w0, w0, #1
+        assert_eq!(w32(&e.code, 0), 0x1100_0400);
+
+        let mut e = Emitter::new(0);
+        ldrb_w(&mut e, X9, CELL);
+        assert_eq!(w32(&e.code, 0), 0x3940_0269);
+
+        let mut e = Emitter::new(0);
+        strb_wzr(&mut e, CELL);
+        assert_eq!(w32(&e.code, 0), 0x3900_027F);
+
+        let mut e = Emitter::new(0);
+        mov_reg(&mut e, X1, CELL); // mov x1, x19
+        assert_eq!(w32(&e.code, 0), 0xAA13_03E1);
+    }
+
+    #[test]
+    fn movz_movk_build_big_constants() {
+        let mut e = Emitter::new(0);
+        movz_lsl16(&mut e, X1, 0x4000); // 0x4000_0000
+        assert_eq!(w32(&e.code, 0), 0xD2A8_0001);
+        let mut e = Emitter::new(0);
+        mov_imm32(&mut e, X10, 0x1234_5678);
+        assert_eq!(w32(&e.code, 0), 0xD28A_CF0A); // movz x10, #0x5678
+        assert_eq!(w32(&e.code, 4), 0xF2A2_468A); // movk x10, #0x1234, lsl #16
+    }
+
+    #[test]
+    fn grow_call_is_bl_not_b() {
+        // bf_grow returns, so MoveRight must reach it with bl (0x94......),
+        // never a plain b.
+        let ops = [Op::MoveRight(1)];
+        let m = crate::codegen::emit(
+            &ops,
+            crate::target::Target::from_name("linux-aarch64").unwrap(),
+        );
+        assert!(
+            m.code
+                .chunks(4)
+                .any(|w| u32::from_le_bytes(w.try_into().unwrap()) & 0xFC00_0000 == 0x9400_0000)
+        );
+    }
+
+    #[test]
+    fn bracket_jump_emits_trampoline_and_far_branch() {
+        let ops = [Op::Add(1), Op::JumpIfZero { target: 3 }];
+        let m = crate::codegen::emit(
+            &ops,
+            crate::target::Target::from_name("linux-aarch64").unwrap(),
+        );
+        let armbs: Vec<_> = m
+            .fixups
+            .iter()
+            .filter(|f| matches!(f.kind, crate::codegen::PatchKind::ArmB))
+            .collect();
+        assert!(
+            armbs.len() >= 2,
+            "expected a local skip and a far jump, got {armbs:?}"
+        );
+        assert!(
+            armbs
+                .iter()
+                .any(|f| matches!(f.target, PatchTarget::Label(4)))
+        );
+    }
+}

@@ -11,9 +11,13 @@ pub enum Op {
     Output,
     Input,
     /// Jump to `target` (index into the op list) if the current cell is 0.
-    JumpIfZero { target: u32 },
+    JumpIfZero {
+        target: u32,
+    },
     /// Jump to `target` if the current cell is nonzero.
-    JumpIfNonZero { target: u32 },
+    JumpIfNonZero {
+        target: u32,
+    },
     /// Set the current cell to 0. Replaces the extremely common `[-]` and
     /// `[+]` idiom, which would otherwise burn a full loop iteration per
     /// decrement just to clear one cell.

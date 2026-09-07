@@ -23,8 +23,10 @@ to get from an interpreter":
    The javac/java split. Fast to build, portable, no toolchain needed.
 2. **`bfnative`** — skip the bytecode entirely and compile straight to a
    native binary for Linux, macOS, or Windows, x86-64 or ARM64. No
-   interpreter at runtime, but you'll need a C toolchain on your machine to
-   assemble and link the output.
+   interpreter at runtime, and no toolchain at build time either: the
+   machine code and the ELF/Mach-O/PE container around it are emitted
+   byte-by-byte by `bfnative` itself, in-process, with zero external
+   commands and zero object-file crates.
 
 Pick based on what you're doing: iterating on a program, `bfc`/`bfrun` is
 zero-friction. Shipping something you want to hand someone as a standalone
@@ -41,24 +43,22 @@ zero-friction. Shipping something you want to hand someone as a standalone
   just running someone else's compiled program, this is the only binary you
   need.
 - `bfnative/` — a second, independent backend. Reuses `bfc`'s parser and
-  optimizer, then instead of writing bytecode, emits assembly for your
-  target CPU and shells out to a real toolchain (gcc/clang) to turn that
-  into a linked executable.
+  optimizer, then instead of writing bytecode, emits x86-64 or ARM64
+  machine code straight from the optimized IR and wraps it in a hand-built
+  ELF64, Mach-O, or PE32+ executable. Nothing is assembled or linked by an
+  external toolchain — every byte of the output comes out of the compiler.
 
 ## Building
 
-Requires a Rust toolchain (rustc + cargo).
+Requires a Rust toolchain (rustc + cargo). That's the whole list — no C
+compiler, no linker, no platform SDK, for any of the six targets.
 
 ```
 cargo build --release
 ```
 
-Lands `bfc` and `bfrun` in `target/release/`. `bfnative` isn't built by
-default — grab it explicitly:
-
-```
-cargo build --release -p bfnative
-```
+Lands `bfc`, `bfrun`, and `bfnative` in `target/release/` — all three are
+workspace members and build by default.
 
 ## Usage: bfc / bfrun
 
@@ -73,59 +73,70 @@ bfrun program.bfry          # runs it
 ```
 bfnative program.bf                          # compiles for your current OS/CPU
 bfnative --target windows-x86_64 program.bf  # or cross-compile for one of six targets
-bfnative --emit-asm program.bf               # just want the assembly, no linking
+bfnative --emit-asm program.bf               # dump an annotated machine-code listing instead
 ```
+
+`--emit-asm` no longer writes assembly text — there is no assembly and no
+external assembler anymore. It writes a `.lst` listing of the final machine
+code (hex bytes, resolved addresses, per-op annotations) so you can still
+see exactly what got emitted. `--cc` and `--keep-asm` are accepted but
+deprecated no-ops, so old scripts don't break.
 
 Full target list: `linux-x86_64`, `linux-aarch64`, `macos-x86_64`,
 `macos-aarch64`, `windows-x86_64`, `windows-aarch64`. 32-bit x86 and 32-bit
 ARM aren't supported — no plans to add them either, they're not where
 anyone's actually running this.
 
-### You need a real toolchain for this
+### How the executable gets built
 
-`bfnative` writes assembly text, then hands it to `cc`/`gcc`/`clang` to
-assemble and link. It doesn't touch object-file formats or linking itself —
-building ELF/PE/Mach-O by hand would be several times the size of the whole
-backend for zero improvement to the output, so it isn't worth doing.
+No `cc`, no `ld`, no `as`, no object-file crate — the pipeline is three
+stages, all in-process:
 
-What you need depends on the target:
+1. `bfc`'s parser and optimizer produce the shared IR (the same one
+   `bfrun` executes — one optimizer, no drift).
+2. A machine-code emitter (one per CPU architecture, emitting straight
+   into a byte buffer) encodes the IR plus a small runtime: entry
+   prologue, tape-growth routine, I/O helpers, and the error paths.
+   Branch offsets go in as placeholders and get patched in a second pass
+   once sizes are known.
+3. A container writer (one per file format) wraps those bytes into a
+   loadable executable: ELF64 `ET_EXEC` for Linux, Mach-O `MH_EXECUTE`
+   for macOS, PE32+ for Windows. Code references data
+   position-relatively (rip-relative on x86-64, ADRP on ARM64), so the
+   final address layout is patched in before serialization and what hits
+   the disk is final — no relocations, no link step.
 
-- **Linux, compiling on Linux**: whatever `cc` you already have.
-- **macOS, compiling on macOS**: same — `cc` via Xcode command line tools,
-  `-arch` handles both Intel and Apple Silicon.
-- **Windows**: needs a MinGW-family driver specifically —
-  `x86_64-w64-mingw32-gcc` or the aarch64 equivalent. **MSVC's `cl.exe`
-  will not work here, at all** — it expects MASM-syntax assembly, and
-  `bfnative` only emits GNU syntax. Get MinGW-w64 through MSYS2 or grab a
-  prebuilt llvm-mingw release; either gives you a working driver.
-- **Cross-compiling** (e.g. building a Windows binary from Linux): pass
-  `--cc` with whatever cross-driver you've got installed. The tool guesses a
-  reasonable default per target, but cross-toolchain naming is inconsistent
-  enough across distros that you'll often need to override it.
-
-If the linker step fails, `bfnative` leaves the intermediate `.s` file
-sitting next to your output on purpose — that assembly is what you actually
-want to look at when a driver rejects something, and it's a lot easier to
-diagnose with it in hand than without.
+Cross-compiling a Windows binary from Linux is the same code path as a
+native build, which is the point of owning the output end to end.
 
 ### Why the OS split is bigger than the CPU split
 
 The six targets are really two instruction backends (x86-64, ARM64) with
-three thin runtime layers bolted on top, and the runtime layers are where
+three runtime layers bolted on top, and the runtime layers are where
 almost all the platform-specific weirdness lives:
 
-- **Linux** binaries are fully static, freestanding, and hit raw syscalls
-  directly — zero runtime dependencies, nothing to link against.
-- **macOS** doesn't support that. There's no such thing as a static, no-libc
-  Mach-O executable — every macOS binary goes through an ordinary `cc` link
-  against libSystem for I/O.
-- **Windows** binaries are freestanding too, but instead of raw syscalls
-  they call straight into `kernel32.dll` (`GetStdHandle`, `WriteFile`,
-  `ReadFile`, `ExitProcess`) with a custom entry point wired up via
-  `-Wl,-e,bf_start`. The Win32 API was picked over the C runtime
-  specifically because `read`/`write` export names differ across CRT
-  flavors and import libraries — kernel32's exports are the one thing every
-  MinGW-family toolchain agrees on.
+- **Linux** binaries are fully static, freestanding ELF64 executables that
+  hit raw syscalls directly (`mmap`, `mprotect`, `read`, `write`, `exit`) —
+  zero runtime dependencies, nothing to link against.
+- **macOS** doesn't support that. There's no such thing as a static,
+  no-libc Mach-O executable — every macOS binary talks to libSystem. The
+  writer does the minimum dynamic linking dyld accepts: one
+  `LC_LOAD_DYLIB` for libSystem, a `LC_DYLD_INFO_ONLY` bind stream that
+  resolves exactly five symbols (`write`, `read`, `mmap`, `mprotect`,
+  `_exit`) into a five-slot GOT, and `LC_MAIN` for the entry. Apple
+  Silicon also refuses to run unsigned arm64 code, so the writer computes
+  a full ad-hoc code signature itself — a v0x20400 CodeDirectory with
+  SHA-256 page hashes (4 KiB pages on x86-64, 16 KiB on ARM64, matching
+  what the kernel verifies), built with an in-process SHA-256, no
+  `codesign` subprocess.
+- **Windows** binaries are freestanding PE32+ executables that import five
+  functions from `kernel32.dll` (`GetStdHandle`, `WriteFile`, `ReadFile`,
+  `ExitProcess`, `VirtualAlloc`) through a real import address table the
+  loader resolves at startup, with a custom entry point — no CRT, no
+  startup objects. Win32 was picked over the C runtime for the same
+  reason as before: kernel32's exports are the one stable surface on
+  every Windows install, while CRT `read`/`write` export names vary across
+  toolchain flavors.
 
 None of that touches instruction selection. A given CPU architecture emits
 the same arithmetic and branch instructions no matter which of the three OSes
@@ -160,8 +171,29 @@ sane direction to grow in that case. Cells are 8-bit and wrap on overflow,
 matching standard Brainfuck semantics; that part's deliberately unchanged,
 since plenty of existing programs assume wraparound.
 
-`bfnative` matches this behavior at the instruction level — an x86-64 `add
-byte ptr [cell], n` wraps for free because it's an 8-bit store, and the
+`bfrun` grows its tape with plain `Vec` reallocation. The native backends
+can't do that — the tape base is held in a register and moving it would mean
+reloading it after every single op — so they use a reserve-and-commit
+strategy instead: **1 GiB of address space reserved up front as
+inaccessible (`mmap` PROT_NONE on Linux/macOS, `VirtualAlloc` MEM_RESERVE on
+Windows), with the first 64 KiB committed readable/writable for the initial
+30,000 cells.** When the pointer walks past the committed capacity, the
+grow routine commits the next chunk out of the same reservation
+(`mprotect` on Linux/macOS, `VirtualAlloc` MEM_COMMIT on Windows), doubling
+the capacity each time and never moving the base, so the pointer register
+stays valid. All chunk sizes are multiples of 64 KiB so they're page-aligned
+on 4 KiB, 16 KiB, and 64 KiB kernels alike without querying the page size.
+
+The one visible limit: a program that walks past the full 1 GiB gets
+`runtime error: tape limit exceeded (1073741824 bytes)` and exit status 1,
+not a crash — that's the single documented divergence from `bfrun`, whose
+tape is genuinely unbounded. (bfrun would OOM eventually too, it just
+doesn't know how to say so.) Left-of-zero underflow produces `bfrun`'s
+exact message and exit code on every platform, as does EOF-on-input leaving
+the cell untouched.
+
+`bfnative` matches the interpreter at the instruction level too — an x86-64
+`add byte ptr [cell], n` wraps for free because it's an 8-bit store, and the
 ARM64 backend gets the same wraparound from `strb` only keeping the low byte
 of a 32-bit add.
 
@@ -174,15 +206,37 @@ misparsing garbage further in. This only applies to `bfc`/`bfrun` — a
 `bfnative`-compiled binary is a normal executable for its platform, with no
 custom format of its own.
 
+## Verification status
+
+Honesty section — what's actually been run, versus what's been inspected by
+foreign tools and not run:
+
+| Target | Status | How |
+|---|---|---|
+| `linux-x86_64` | **executed** | `cargo test` end-to-end suite, plus a differential harness (`scripts/differential_test.py`) comparing stdout/stderr/exit status against `bfrun` on 25 programs: hello world, six-deep nesting, multiplication loops, tape growth to 200k cells, wraparound, EOF semantics, stdin echo, and every runtime-error path |
+| `linux-aarch64` | **executed under emulation** | same 25-program differential corpus under `qemu-aarch64-static` (user mode, real Linux syscalls) — 50/50 total executions match `bfrun` exactly |
+| `macos-x86_64` | statically validated | load-command table, segment congruence, and bind stream decoded by `llvm-objdump --macho`; ad-hoc signature page hashes re-verified by an independent unit test; entry code disassembled and hand-checked; format cross-checked against real ld64-produced binaries |
+| `macos-aarch64` | statically validated | same, plus 16 KiB-page layout checks. **Not executed** — no macOS hardware or dyld here |
+| `windows-x86_64` | statically validated | full header/import/section parse by GNU `objdump` (`pei-x86-64`), IAT slot layout and entry disassembly verified |
+| `windows-aarch64` | statically validated | headers walked field-by-field by unit tests, machine code disassembled by `llvm-objdump`. **Not executed** — no Windows-on-ARM here |
+
+The signature, bind-opcode, and import-table details were all cross-checked
+against real binaries produced by Apple's `ld64` (that's how a bind-opcode
+encoding bug got caught before it ever reached a Mac). Still: "structurally
+perfect by every tool that will look at it" is not "ran" — the macOS and
+Windows targets have never been executed, and I'd rather say so plainly than
+let the test table imply otherwise.
+
 ## What's not here
 
 - **No copy/multiply loop folding.** The common `[->+<]` idiom and its
   relatives still run as actual loops instead of collapsing into one
   instruction, in either backend. Worth adding once there's a real reason to
   benchmark against — not before.
-- **No hand-rolled object format or linker.** Covered above — `bfnative`
-  deliberately delegates that to your system's toolchain rather than
-  reimplementing ELF/PE/Mach-O and a linker from scratch.
+- **No macOS or Windows execution in the test suite.** The containers are
+  validated structurally (see above), but nothing here has actually booted
+  dyld or the Windows loader. If you're on one of those platforms, running
+  the differential harness locally is the missing experiment.
 - **No CI/build-matrix config for the six `bfnative` targets.** That's a
   packaging concern layered on top of this source, not something baked into
   the crates themselves.
