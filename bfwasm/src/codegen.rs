@@ -305,11 +305,12 @@ struct Body {
 impl Body {
     fn new() -> Self {
         let mut code = Vec::new();
-        // One locals-declaration group: 2 locals, both i32 — local 0 is
+        // One locals-declaration group: 3 locals, all i32 — local 0 is
         // `$ptr` (the current cell's byte offset), local 1 is `$grow_by`,
-        // scratch space for emit_grow_check's page-count computation.
+        // scratch space for emit_grow_check's page-count computation, and
+        // local 2 is `$target`, used by the MulAdd optimization path.
         uleb(&mut code, 1);
-        uleb(&mut code, 2);
+        uleb(&mut code, 3);
         code.push(VALTYPE_I32);
         Body { code }
     }
