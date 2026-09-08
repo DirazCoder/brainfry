@@ -242,7 +242,7 @@ fn emit_op(e: &mut Emitter, op: &Op, i: usize, rt: &Rt) {
         Op::MulAdd { offset, factor } => {
             e.span(format!(
                 "op {i}: MulAdd {{ offset: {offset}, factor: {factor} }} — \
-                 [x19+offset] += [x19] * factor; [x19] = 0"
+                 [x19+offset] += [x19] * factor"
             ));
             emit_mul_add(e, offset, factor, rt);
         }
@@ -342,13 +342,16 @@ fn emit_mul_add(e: &mut Emitter, offset: i32, factor: u8, rt: &Rt) {
     let done = e.internal_label();
     cbz32(e, false, X9, done);
 
-    // x11 = the source value, parked here because the bounds check below
-    // may call bf_grow, which is documented to clobber x1..x10 — x9 would
-    // not survive that call.
-    mov_reg(e, X11, X9);
+    // The bounds check below may call bf_grow, which (through the commit
+    // call it makes on macOS/Windows) clobbers the whole caller-saved set —
+    // x11 included, despite what an older comment here claimed. So the
+    // source value is *reloaded from the cell* after the check, exactly the
+    // way the x86-64 backend reloads al after its bounds check: the cell
+    // itself is the only storage guaranteed to survive the call.
     emit_bounds_checked_offset(e, offset.unsigned_abs(), offset >= 0, rt);
     // x0 now holds the checked target address.
     mov_reg(e, X9, X0); // x9 = target address, freed from x0 for the mul call
+    ldrb_w(e, X11, CELL); // x11 = [x19] again — reloaded, not parked
     ldrb_w(e, X10, X9); // x10 = *target
     movz(e, X12, factor as u32); // x12 = factor
     mul_w(e, X11, X11, X12); // x11 = value * factor (mod 2^32; strb truncates mod 256)
@@ -704,7 +707,7 @@ fn emit_errors_windows(e: &mut Emitter, rt: &Rt) {
 // ---------------------------------------------------------------------------
 
 /// Contract (identical on every OS): `x0` = desired pointer. Preserves x0,
-/// x19, x20; updates x21 to base + newcap; clobbers x1..x10, x16, x24.
+/// x19, x20, x30; updates x21 to base + newcap; clobbers x1..x10, x16, x24.
 /// Exits through err_cap / err_grow on failure. Same capacity policy as the
 /// x86-64 backend:
 ///
@@ -715,8 +718,17 @@ fn emit_errors_windows(e: &mut Emitter, rt: &Rt) {
 fn emit_grow(e: &mut Emitter, rt: &Rt, os: Os) {
     e.span("bf_grow: extend the tape (x0 = desired, in/out)");
     e.bind_here(rt.grow);
-    sub_imm(e, 31, 31, 16); // sub sp, sp, #16
-    str_x0_sp(e); // str x0, [sp] — save desired
+    // 24 bytes (an odd multiple of 8): realigns sp to 16 for the commit
+    // call (grow is entered via `bl`, which leaves sp 8 mod 16), and holds
+    // x30 at [sp] plus the desired pointer at [sp, #8] plus one pad qword.
+    // x30 must be saved because the macOS/Windows commit path makes a real
+    // call (`blr`), and ARM64 `blr` overwrites x30 — the register this
+    // routine's own `ret` jumps through. x86-64 gets this for free (`call`
+    // pushes the return address on the stack; nested calls can't clobber
+    // it); ARM64 requires every non-leaf function to save LR explicitly.
+    sub_imm(e, 31, 31, 24); // sub sp, sp, #24
+    str_x30_sp(e); // str x30, [sp] — save return address
+    str_x0_sp_8(e); // str x0, [sp, #8] — save desired
 
     // x1 = needed = x0 - x20
     sub_reg(e, X1, X0, BASE);
@@ -724,7 +736,7 @@ fn emit_grow(e: &mut Emitter, rt: &Rt, os: Os) {
     cmp_reg(e, X1, X2);
     let ok_cap = e.internal_label();
     bcond(e, LO, ok_cap);
-    b_label(e, rt.err_cap);
+    grow_error_exit(e, rt.err_cap);
     e.bind_here(ok_cap);
 
     // x3 = candidate = round64k(needed + 1) = (needed + 64K) & ~0xFFFF.
@@ -773,7 +785,7 @@ fn emit_grow(e: &mut Emitter, rt: &Rt, os: Os) {
             cmn_imm(e, X0, 4095);
             let ok = e.internal_label();
             bcond(e, LO, ok);
-            b_label(e, rt.err_grow);
+            grow_error_exit(e, rt.err_grow);
             e.bind_here(ok);
         }
         Os::Macos => {
@@ -782,7 +794,7 @@ fn emit_grow(e: &mut Emitter, rt: &Rt, os: Os) {
             // mprotect: 0 or -1. Zero = success (int return, w0 view).
             let ok = e.internal_label();
             cbz32(e, false, X0, ok);
-            b_label(e, rt.err_grow);
+            grow_error_exit(e, rt.err_grow);
             e.bind_here(ok);
         }
         Os::Windows => {
@@ -792,17 +804,27 @@ fn emit_grow(e: &mut Emitter, rt: &Rt, os: Os) {
             // NULL = failure (pointer check, 64-bit).
             let ok = e.internal_label();
             cbz64(e, true, X0, ok);
-            b_label(e, rt.err_grow);
+            grow_error_exit(e, rt.err_grow);
             e.bind_here(ok);
         }
     }
 
     e.bind_here(no_commit);
-    // x21 = x20 + newcap; restore x0; return.
+    // x21 = x20 + newcap; restore x0 and x30; return.
     add_reg(e, END, BASE, X24);
-    ldr_x0_sp(e); // ldr x0, [sp]
-    add_imm(e, 31, 31, 16); // add sp, sp, #16
+    ldr_x0_sp_8(e); // ldr x0, [sp, #8] — restore desired
+    ldr_x30_sp(e); // ldr x30, [sp] — restore return address
+    add_imm(e, 31, 31, 24); // add sp, sp, #24
     ret(e);
+}
+
+/// Error exits reached from inside grow (capacity / commit failure): drop
+/// grow's 24-byte frame before jumping, mirroring the x86-64 backend's
+/// `pop rcx` on the same paths, so the error tail starts from the body's
+/// stack level.
+fn grow_error_exit(e: &mut Emitter, target: u32) {
+    add_imm(e, 31, 31, 24); // add sp, sp, #24 — undo grow's frame
+    b_label(e, target);
 }
 
 // ---------------------------------------------------------------------------
@@ -974,9 +996,22 @@ fn mov_sp_to(e: &mut Emitter, rd: u32) {
     e.u32(0x9100_03E0 | rd);
 }
 
-/// `sub sp, sp, Xn` — CB000000 | Rm<<16 | 31<<5 | 31.
+/// `sub sp, sp, Xn` — SUB (extended register), full 64-bit: the encoding
+/// assemblers emit for this exact mnemonic is
+/// `0xCB2963FF` for Xn = x9, i.e.
+/// `0xCB200000 | Rm<<16 | 0x63FF` (option = UXTX, imm3 = 0, Rn = sp,
+/// Rd = sp).
+///
+/// Why not the plain shifted-register SUB? Because in ADD/SUB (shifted
+/// register), register field 31 in Rd/Rn reads as XZR, never SP — a word
+/// like `0xCB000000 | Rm<<16 | 31<<5 | 31` decodes as `sub xzr, xzr, Xm`,
+/// a no-op that discards its result (this is exactly the bug the
+/// Windows-entry stack alignment used to have: the emitted no-op left sp
+/// 8 mod 16 at every kernel32 call site). SP is only addressable as a
+/// destination through the extended-register form, with option = UXTX
+/// (011) and imm3 = 0 so the full 64-bit register subtracts unchanged.
 fn sub_sp_reg(e: &mut Emitter, rm: u32) {
-    e.u32(0xCB00_0000 | (rm << 16) | (31 << 5) | 31);
+    e.u32(0xCB20_0000 | (rm << 16) | 0x63FF);
 }
 
 /// `str x0, [sp]` — F90003E0.
@@ -987,6 +1022,28 @@ fn str_x0_sp(e: &mut Emitter) {
 /// `ldr x0, [sp]` — F94003E0.
 fn ldr_x0_sp(e: &mut Emitter) {
     e.u32(0xF940_03E0);
+}
+
+/// `str x30, [sp]` — F90003FE. Grow's return-address save: `blr` overwrites
+/// x30, so a routine that calls and then returns must spill LR first.
+fn str_x30_sp(e: &mut Emitter) {
+    e.u32(0xF900_03FE);
+}
+
+/// `ldr x30, [sp]` — F94003FE.
+fn ldr_x30_sp(e: &mut Emitter) {
+    e.u32(0xF940_03FE);
+}
+
+/// `str x0, [sp, #8]` — F9000BE0. Grow parks the desired pointer one slot
+/// past the saved x30.
+fn str_x0_sp_8(e: &mut Emitter) {
+    e.u32(0xF900_07E0);
+}
+
+/// `ldr x0, [sp, #8]` — F9400BE0.
+fn ldr_x0_sp_8(e: &mut Emitter) {
+    e.u32(0xF940_07E0);
 }
 
 /// `ldr Xt, [sp, #imm]` (imm multiple of 8) — F9400000 | (imm/8)<<10 | 31<<5 | Rt.
@@ -1145,6 +1202,45 @@ mod tests {
     }
 
     #[test]
+    fn sub_sp_reg_encodes_the_extended_register_form() {
+        // `sub sp, sp, x9` as assemblers encode it: SUB (extended
+        // register), option UXTX, imm3 0, Rn/Rd = sp. The
+        // shifted-register form cannot target sp at all (31 reads as xzr
+        // there — the emitted word used to be a silent no-op).
+        let mut e = Emitter::new(0);
+        sub_sp_reg(&mut e, X9);
+        assert_eq!(w32(&e.code, 0), 0xCB29_63FF);
+        let mut e = Emitter::new(0);
+        sub_sp_reg(&mut e, X24);
+        assert_eq!(w32(&e.code, 0), 0xCB38_63FF);
+    }
+
+    #[test]
+    fn grow_saves_x30_and_takes_an_aligned_frame() {
+        // Any program that can grow must emit a grow routine that: (a)
+        // saves x30 at [sp] — `blr` inside grow clobbers it, and grow
+        // returns afterwards; (b) uses a 24-byte frame (an odd multiple
+        // of 8) so the commit call sees 16-byte-aligned sp.
+        let ops = [Op::MoveRight(40_000)];
+        let m = crate::codegen::emit(
+            &ops,
+            crate::target::Target::from_name("macos-aarch64").unwrap(),
+        );
+        assert!(m.code.chunks(4).any(|w| {
+            // sub sp, sp, #24
+            u32::from_le_bytes(w.try_into().unwrap()) == 0xD100_63FF
+        }));
+        assert!(m.code.chunks(4).any(|w| {
+            // str x30, [sp]
+            u32::from_le_bytes(w.try_into().unwrap()) == 0xF900_03FE
+        }));
+        assert!(m.code.chunks(4).any(|w| {
+            // ldr x30, [sp]
+            u32::from_le_bytes(w.try_into().unwrap()) == 0xF940_03FE
+        }));
+    }
+
+    #[test]
     fn mul_add_emits_a_multiply() {
         let ops = [Op::MulAdd {
             offset: 1,
@@ -1172,12 +1268,18 @@ mod tests {
             &ops,
             crate::target::Target::from_name("linux-aarch64").unwrap(),
         );
+        // The message lives in the read-only blob, so both buffers are
+        // searched.
         let underflow_msg = b"pointer moved left of cell 0";
-        assert!(
-            m.code
-                .windows(underflow_msg.len())
-                .any(|w| w == underflow_msg)
-        );
+        let in_code = m
+            .code
+            .windows(underflow_msg.len())
+            .any(|w| w == underflow_msg);
+        let in_rodata = m
+            .rodata
+            .windows(underflow_msg.len())
+            .any(|w| w == underflow_msg);
+        assert!(in_code || in_rodata);
     }
 
     #[test]
@@ -1187,10 +1289,19 @@ mod tests {
             &ops,
             crate::target::Target::from_name("linux-aarch64").unwrap(),
         );
+        // emit_scan binds its own internal `top` label at the same code
+        // offset as the op's label, so the check is "some fixup's target
+        // label resolves to the offset of label 0".
+        let op0_offset = m.labels[0];
+        assert_ne!(op0_offset, u32::MAX, "label 0 must be bound");
         assert!(
-            m.fixups
-                .iter()
-                .any(|f| matches!(f.target, PatchTarget::Label(0)))
+            m.fixups.iter().any(|f| match f.target {
+                PatchTarget::Label(i) => {
+                    (i as usize) < m.labels.len() && m.labels[i as usize] == op0_offset
+                }
+                _ => false,
+            }),
+            "no branch targets the scan's own start"
         );
     }
 }

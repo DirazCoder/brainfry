@@ -101,6 +101,11 @@ impl Vm {
                     *self.current_cell() = 0;
                 }
                 Op::MulAdd { offset, factor } => {
+                    // Does NOT zero the source cell: a spread loop folds
+                    // into multiple MulAdds sharing one source cell,
+                    // followed by a single trailing Zero op. Zeroing here
+                    // too would make every MulAdd after the first in a
+                    // group read 0 instead of the real value.
                     let value = *self.current_cell();
                     if value != 0 {
                         let target = self.offset_pointer(offset)?;
@@ -108,7 +113,6 @@ impl Vm {
                         self.tape[target] =
                             self.tape[target].wrapping_add(value.wrapping_mul(factor));
                     }
-                    *self.current_cell() = 0;
                 }
                 Op::Scan { stride } => {
                     while *self.current_cell() != 0 {

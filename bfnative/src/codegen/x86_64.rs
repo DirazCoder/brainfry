@@ -232,7 +232,7 @@ fn emit_op(e: &mut Emitter, op: &Op, i: usize, rt: &Rt) {
         Op::MulAdd { offset, factor } => {
             e.span(format!(
                 "op {i}: MulAdd {{ offset: {offset}, factor: {factor} }} — \
-                 [r12+offset] += [r12] * factor; [r12] = 0"
+                 [r12+offset] += [r12] * factor"
             ));
             emit_mul_add(e, offset, factor, rt);
         }
@@ -296,9 +296,7 @@ fn emit_bounds_checked_offset(e: &mut Emitter, magnitude: u32, is_right: bool, r
 }
 
 /// `MulAdd { offset, factor }`: add `[r12] * factor` into the cell at
-/// `r12 + offset`, wrapping mod 256 like every other cell write, then zero
-/// the source cell — the same two-step effect as the `[->+<]`-style loop
-/// this op replaces, just without paying for the loop.
+/// `r12 + offset`, wrapping mod 256 like every other cell write.
 fn emit_mul_add(e: &mut Emitter, offset: i32, factor: u8, rt: &Rt) {
     // al = value in the source cell. If it's already 0 the loop this
     // replaces would never have run, so skip the write to that cell
@@ -1272,26 +1270,36 @@ mod tests {
     #[test]
     fn mul_add_negative_offset_checks_underflow() {
         // A MulAdd with a negative offset must go through the same
-        // underflow path a MoveLeft would, landing on err_underflow.
+        // underflow path a MoveLeft would, landing on err_underflow. The
+        // message lives in the read-only blob, so both buffers are
+        // searched.
         let ops = [Op::MulAdd {
             offset: -5,
             factor: 1,
         }];
         let m = module(&ops, "linux-x86_64");
         let underflow_msg = b"pointer moved left of cell 0";
-        assert!(find(&m.code, underflow_msg).is_some());
+        assert!(find(&m.code, underflow_msg).is_some() || find(&m.rodata, underflow_msg).is_some());
     }
 
     #[test]
     fn scan_loops_back_to_its_own_start() {
-        // Scan must be a real loop: some branch's fixup target must be the
-        // scan op's own label (label 0, since it's the only op).
+        // Scan must be a real loop: some branch must jump back to the scan
+        // op's own start. emit_scan binds its own internal `top` label at
+        // the same code offset as the op's label, so the check is
+        // "some fixup's target label resolves to the offset of label 0".
         let ops = [Op::Scan { stride: 1 }];
         let m = module(&ops, "linux-x86_64");
+        let op0_offset = m.labels[0];
+        assert_ne!(op0_offset, u32::MAX, "label 0 must be bound");
         assert!(
-            m.fixups
-                .iter()
-                .any(|f| matches!(f.target, PatchTarget::Label(0)))
+            m.fixups.iter().any(|f| match f.target {
+                PatchTarget::Label(i) => {
+                    (i as usize) < m.labels.len() && m.labels[i as usize] == op0_offset
+                }
+                _ => false,
+            }),
+            "no branch targets the scan's own start"
         );
     }
 }

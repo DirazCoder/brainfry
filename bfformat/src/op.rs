@@ -1,66 +1,67 @@
-mod op;
-mod parser;
-mod optimize;
-
-use op::Op;
-
-fn run(ops: &[Op], label: &str) {
-    let mut tape = vec![0u8; 30000];
-    let mut ptr: usize = 15000;
-    let mut out: Vec<u8> = Vec::new();
-    let mut ip: usize = 0;
-    let mut steps: u64 = 0;
-
-    while ip < ops.len() {
-        steps += 1;
-        if steps > 10_000_000 {
-            println!("[{label}] too many steps, aborting");
-            break;
-        }
-        match ops[ip] {
-            Op::Add(n) => { tape[ptr] = tape[ptr].wrapping_add(n); ip += 1; }
-            Op::Sub(n) => { tape[ptr] = tape[ptr].wrapping_sub(n); ip += 1; }
-            Op::MoveRight(n) => { ptr += n as usize; ip += 1; }
-            Op::MoveLeft(n) => { ptr -= n as usize; ip += 1; }
-            Op::Output => { out.push(tape[ptr]); ip += 1; }
-            Op::Input => { ip += 1; }
-            Op::JumpIfZero { target } => {
-                if tape[ptr] == 0 { ip = target as usize + 1; } else { ip += 1; }
-            }
-            Op::JumpIfNonZero { target } => {
-                if tape[ptr] != 0 { ip = target as usize + 1; } else { ip += 1; }
-            }
-            Op::Zero => { tape[ptr] = 0; ip += 1; }
-            Op::MulAdd { offset, factor } => {
-                // fixed: no longer zeroes tape[ptr] -- that's the trailing
-                // Zero op's job, since a group of MulAdds can share one
-                // source cell.
-                let target = (ptr as i64 + offset as i64) as usize;
-                tape[target] = tape[target].wrapping_add(tape[ptr].wrapping_mul(factor));
-                ip += 1;
-            }
-            Op::Scan { stride } => {
-                while tape[ptr] != 0 {
-                    ptr = (ptr as i64 + stride as i64) as usize;
-                }
-                ip += 1;
-            }
-        }
-    }
-
-    println!("[{label}] output: {:?}", String::from_utf8_lossy(&out));
+/// A single bytecode instruction. Repeated runs of `+`, `-`, `>`, `<` in the
+/// source get folded into one op with a count, instead of one op per
+/// character, so the runtime doesn't spend cycles re-dispatching on the same
+/// instruction thousands of times in a row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Op {
+    Add(u8),
+    Sub(u8),
+    MoveRight(u32),
+    MoveLeft(u32),
+    Output,
+    Input,
+    /// Jump to `target` (index into the op list) if the current cell is 0.
+    JumpIfZero {
+        target: u32,
+    },
+    /// Jump to `target` if the current cell is nonzero.
+    JumpIfNonZero {
+        target: u32,
+    },
+    /// Set the current cell to 0. Replaces the extremely common `[-]` and
+    /// `[+]` idiom, which would otherwise burn a full loop iteration per
+    /// decrement just to clear one cell.
+    Zero,
+    /// Add the current cell's value, scaled by `factor`, into the cell at
+    /// `offset` from the current position, then zero the current cell.
+    /// Replaces loops like `[->+<]` or `[->++<]`, which are really just
+    /// "multiply this value and dump it over there" written as a decrement
+    /// loop. `offset` is signed since the target cell can be on either side
+    /// of the tape head; `factor` is a u8 because the loop body can only add
+    /// a bounded amount per iteration before folding would itself change
+    /// behavior (see optimize.rs for the exact conditions).
+    MulAdd {
+        offset: i32,
+        factor: u8,
+    },
+    /// Step the tape head by `stride` cells at a time until landing on a
+    /// zero cell. Replaces loops like `[>]` or `[<<]`, which walk the tape
+    /// looking for a boundary and do nothing else per iteration -- there's
+    /// no reason to pay for a jump-check-jump per cell when the loop body
+    /// is just "move." `stride` is signed: positive scans right, negative
+    /// scans left.
+    Scan {
+        stride: i32,
+    },
 }
 
-fn main() {
-    let src = "++++++++++[>+++++++>++++++++++>+++>+<<<<-]>++.>+.+++++++..+++.>++.<<+++++++++++++++.>.+++.------.--------.>+.>.";
-    let ops = parser::parse(src).unwrap();
-    println!("raw op count: {}", ops.len());
-    run(&ops, "raw (no optimize)");
-
-    let optimized = optimize::optimize(ops.clone());
-    println!("optimized op count: {}", optimized.len());
-    for (i, op) in optimized.iter().enumerate() {
-        println!("{i}: {:?}", op);
+impl Op {
+    /// Numeric tag used in the serialized bytecode. Kept separate from the
+    /// enum's own discriminant so the on-disk format doesn't silently change
+    /// if variants get reordered later.
+    pub fn tag(&self) -> u8 {
+        match self {
+            Op::Add(_) => 0,
+            Op::Sub(_) => 1,
+            Op::MoveRight(_) => 2,
+            Op::MoveLeft(_) => 3,
+            Op::Output => 4,
+            Op::Input => 5,
+            Op::JumpIfZero { .. } => 6,
+            Op::JumpIfNonZero { .. } => 7,
+            Op::Zero => 8,
+            Op::MulAdd { .. } => 9,
+            Op::Scan { .. } => 10,
+        }
     }
-    run(&optimized, "optimized");
 }

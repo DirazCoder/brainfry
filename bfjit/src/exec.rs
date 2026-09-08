@@ -120,6 +120,18 @@ impl JitRegion {
         // AND cannot target sp directly on ARM64, so the alignment goes
         // through a scratch register: mov x16, sp; and x16, x16, #-16;
         // mov sp, x16 (ADD-sp alias); br entry.
+        //
+        // The entry address is pinned to x17 (IP2, the second architectural
+        // call scratch) rather than left to `in(reg)` allocation: the
+        // template clobbers x16 by name, and LLVM does not parse template
+        // text, so a generic `in(reg)` operand *could* be assigned x16 by
+        // some register-allocator decision — after which `mov x16, sp`
+        // would destroy the entry address and `br` would jump to a garbage
+        // (stack) address. x17 is written by nothing in this template, so
+        // `in("x17")` makes the trampoline correct by construction instead
+        // of by allocator luck. (An earlier revision declared the x16
+        // clobber with `out("x16") _`; that declaration was correct and its
+        // removal is what made this fragile.)
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         unsafe {
             let entry = self.base as usize;
@@ -127,8 +139,8 @@ impl JitRegion {
                 "mov x16, sp",
                 "and x16, x16, #-16",
                 "mov sp, x16",
-                "br {0}",
-                in(reg) entry,
+                "br x17",
+                in("x17") entry,
                 options(noreturn),
             )
         }
