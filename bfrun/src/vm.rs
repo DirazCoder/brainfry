@@ -100,6 +100,22 @@ impl Vm {
                 Op::Zero => {
                     *self.current_cell() = 0;
                 }
+                Op::MulAdd { offset, factor } => {
+                    let value = *self.current_cell();
+                    if value != 0 {
+                        let target = self.offset_pointer(offset)?;
+                        self.grow_to_at_least(target);
+                        self.tape[target] =
+                            self.tape[target].wrapping_add(value.wrapping_mul(factor));
+                    }
+                    *self.current_cell() = 0;
+                }
+                Op::Scan { stride } => {
+                    while *self.current_cell() != 0 {
+                        self.pointer = self.offset_pointer(stride)?;
+                        self.grow_if_needed();
+                    }
+                }
             }
             pc += 1;
         }
@@ -115,6 +131,23 @@ impl Vm {
     fn grow_if_needed(&mut self) {
         if self.pointer >= self.tape.len() {
             self.tape.resize(self.pointer + 1, 0);
+        }
+    }
+
+    fn grow_to_at_least(&mut self, index: usize) {
+        if index >= self.tape.len() {
+            self.tape.resize(index + 1, 0);
+        }
+    }
+
+    /// Applies a signed offset to the current pointer, erroring on underflow
+    /// the same way `MoveLeft` does rather than silently wrapping.
+    fn offset_pointer(&self, offset: i32) -> Result<usize, RunError> {
+        let new_pointer = self.pointer as i64 + offset as i64;
+        if new_pointer < 0 {
+            Err(RunError::PointerUnderflow)
+        } else {
+            Ok(new_pointer as usize)
         }
     }
 }
