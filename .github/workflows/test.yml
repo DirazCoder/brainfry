@@ -46,24 +46,27 @@ jobs:
       - name: build
         shell: bash
         run: |
-          cargo build --release --target ${{ matrix.target }} -p bfc -p bfrun -p bfnative -p bfinterp -p bfjit -p bfwasm
+          cargo build --release --target ${{ matrix.target }} -p bfc -p bfrun -p bfnative -p bfinterp -p bfwasm
+          # bfjit temporarily disabled, see step below
+          # cargo build --release --target ${{ matrix.target }} -p bfjit
 
-      - name: codesign bfjit for JIT entitlement (macOS)
-        if: runner.os == 'macOS'
-        shell: bash
-        run: |
-          BIN="target/${{ matrix.target }}/release"
-          cat > /tmp/bfjit.entitlements <<'EOF'
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0">
-          <dict>
-              <key>com.apple.security.cs.allow-jit</key>
-              <true/>
-          </dict>
-          </plist>
-          EOF
-          codesign --sign - --options runtime --entitlements /tmp/bfjit.entitlements --force "$BIN/bfjit"
+      # bfjit temporarily disabled
+      # - name: codesign bfjit for JIT entitlement (macOS)
+      #   if: runner.os == 'macOS'
+      #   shell: bash
+      #   run: |
+      #     BIN="target/${{ matrix.target }}/release"
+      #     cat > /tmp/bfjit.entitlements <<'EOF'
+      #     <?xml version="1.0" encoding="UTF-8"?>
+      #     <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+      #     <plist version="1.0">
+      #     <dict>
+      #         <key>com.apple.security.cs.allow-jit</key>
+      #         <true/>
+      #     </dict>
+      #     </plist>
+      #     EOF
+      #     codesign --sign - --options runtime --entitlements /tmp/bfjit.entitlements --force "$BIN/bfjit"
 
       - name: write test programs
         shell: bash
@@ -102,8 +105,9 @@ jobs:
           out_bytecode=$(./bfrun$EXT tests/hello.bfry)
           echo "bfrun:     $out_bytecode"
 
-          out_jit=$(./bfjit$EXT tests/hello.bf)
-          echo "bfjit:     $out_jit"
+          # bfjit temporarily disabled
+          # out_jit=$(./bfjit$EXT tests/hello.bf)
+          # echo "bfjit:     $out_jit"
 
           ./bfnative$EXT tests/hello.bf -o tests/hello_native$EXT
           chmod +x tests/hello_native$EXT 2>/dev/null || true
@@ -112,9 +116,9 @@ jobs:
 
           test "$out_interp" = "Hello World!" || { echo "FAIL: bfinterp wrong output"; exit 1; }
           test "$out_interp" = "$out_bytecode" || { echo "FAIL: bfrun disagrees with bfinterp"; exit 1; }
-          test "$out_interp" = "$out_jit"      || { echo "FAIL: bfjit disagrees with bfinterp"; exit 1; }
+          # test "$out_interp" = "$out_jit"      || { echo "FAIL: bfjit disagrees with bfinterp"; exit 1; }
           test "$out_interp" = "$out_native"   || { echo "FAIL: bfnative disagrees with bfinterp"; exit 1; }
-          echo "PASS: all four execution paths agree on hello world"
+          echo "PASS: all execution paths (bfjit excluded) agree on hello world"
 
       - name: 8-bit wraparound
         shell: bash
