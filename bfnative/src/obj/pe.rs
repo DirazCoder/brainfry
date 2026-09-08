@@ -22,7 +22,7 @@
 //! ```text
 //! file 0x000   DOS header (MZ + e_lfanew)
 //!      0x040   PE signature, IMAGE_FILE_HEADER, IMAGE_OPTIONAL_HEADER64
-//!      0x148   section table (.text, .idata)
+//!      0x148   section table (.text, .idata, .reloc)
 //!      0x200   .text  RX: entry stub, program body, runtime, strings
 //!      ....    .idata RW: IAT, import descriptors, INT, hint/names, dll name
 //! ```
@@ -45,6 +45,7 @@ const SUBSYSTEM_CUI: u16 = 3;
 const IMAGE_FILE_EXECUTABLE_IMAGE: u16 = 0x0002;
 const IMAGE_FILE_RELOCS_STRIPPED: u16 = 0x0001;
 const IMAGE_FILE_LARGE_ADDRESS_AWARE: u16 = 0x0020;
+const IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE: u16 = 0x0040;
 
 const IMAGE_SCN_CODE: u32 = 0x0000_0020;
 const IMAGE_SCN_INITIALIZED_DATA: u32 = 0x0000_0040;
@@ -54,7 +55,11 @@ const IMAGE_SCN_WRITE: u32 = 0x8000_0000;
 
 // Data directory indices.
 const DIR_IMPORT: usize = 1;
+const DIR_BASERELOC: usize = 5;
 const DIR_IAT: usize = 12;
+
+const IMAGE_SCN_MEM_READ: u32 = 0x4000_0000;
+const IMAGE_SCN_MEM_DISCARDABLE: u32 = 0x0200_0000;
 
 pub fn build(module: &mut Module, arch: Arch) -> (Vec<u8>, Layout) {
     let symbols = external_symbols(crate::target::Os::Windows);
@@ -86,6 +91,18 @@ pub fn build(module: &mut Module, arch: Arch) -> (Vec<u8>, Layout) {
     let idata_raw = align_up(idata_vsize, FILE_ALIGN);
     let idata_fileoff = align_up(text_fileoff + text_raw, FILE_ALIGN);
 
+    // ---- .reloc layout ----
+    // A single relocation block covering .text's page, with one
+    // IMAGE_REL_BASED_ABSOLUTE (type 0) entry -- the standard no-op
+    // padding entry PE emitters use when there's genuinely nothing to
+    // relocate. The table only has to exist and be well-formed; the
+    // loader only walks it if it actually has to rebase.
+    let reloc_rva = idata_rva + align_up(idata_vsize, SECTION_ALIGN);
+    const RELOC_BLOCK_SIZE: u64 = 8 + 2; // header (VirtualAddress, SizeOfBlock) + one u16 entry
+    let reloc_vsize = RELOC_BLOCK_SIZE;
+    let reloc_raw = align_up(reloc_vsize, FILE_ALIGN);
+    let reloc_fileoff = align_up(idata_fileoff + idata_raw, FILE_ALIGN);
+
     // ---- patch code ----
     let layout = Layout {
         code_vaddr: IMAGE_BASE + SECTION_RVA + code_off,
@@ -94,7 +111,7 @@ pub fn build(module: &mut Module, arch: Arch) -> (Vec<u8>, Layout) {
     };
     patch(module, &layout);
 
-    let size_of_image = idata_rva + align_up(idata_vsize, SECTION_ALIGN);
+    let size_of_image = reloc_rva + align_up(reloc_vsize, SECTION_ALIGN);
 
     // ---- serialize ----
     let mut out: Vec<u8> = Vec::new();
@@ -114,16 +131,23 @@ pub fn build(module: &mut Module, arch: Arch) -> (Vec<u8>, Layout) {
         Arch::X86_64 => MACHINE_AMD64,
         Arch::Aarch64 => MACHINE_ARM64,
     };
+    // ARM64 Windows can't disable ASLR (the linker itself rejects
+    // /DYNAMICBASE:NO for ARM64/ARM64EC targets), so an ARM64 image
+    // without IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE and a base
+    // relocation table gets rejected outright by CreateProcess with
+    // "not a valid Win32 application" -- a loader-level refusal to even
+    // start, not a runtime fault. x86_64 has no such requirement and a
+    // fixed-base, no-relocations image loads there just fine.
     let characteristics = match arch {
         Arch::X86_64 => {
             IMAGE_FILE_EXECUTABLE_IMAGE
                 | IMAGE_FILE_RELOCS_STRIPPED
                 | IMAGE_FILE_LARGE_ADDRESS_AWARE
         }
-        Arch::Aarch64 => IMAGE_FILE_EXECUTABLE_IMAGE | IMAGE_FILE_RELOCS_STRIPPED,
+        Arch::Aarch64 => IMAGE_FILE_EXECUTABLE_IMAGE,
     };
     out.extend_from_slice(&machine.to_le_bytes());
-    out.extend_from_slice(&2u16.to_le_bytes()); // NumberOfSections
+    out.extend_from_slice(&3u16.to_le_bytes()); // NumberOfSections
     out.extend_from_slice(&0u32.to_le_bytes()); // TimeDateStamp
     out.extend_from_slice(&0u32.to_le_bytes()); // PointerToSymbolTable
     out.extend_from_slice(&0u32.to_le_bytes()); // NumberOfSymbols
@@ -153,7 +177,16 @@ pub fn build(module: &mut Module, arch: Arch) -> (Vec<u8>, Layout) {
     out.extend_from_slice(&0x200u32.to_le_bytes()); // SizeOfHeaders
     out.extend_from_slice(&0u32.to_le_bytes()); // CheckSum
     out.extend_from_slice(&SUBSYSTEM_CUI.to_le_bytes());
-    out.extend_from_slice(&0u16.to_le_bytes()); // DllCharacteristics: no ASLR
+    let dll_characteristics = match arch {
+        // Every code address in .text is patched PC-relative (see
+        // obj::patch): ADRP/branch displacements, never an absolute VA.
+        // Nothing here actually needs fixing up if the loader rebases,
+        // so DYNAMIC_BASE + an empty .reloc section satisfies the
+        // mandatory-ASLR requirement without any real relocation work.
+        Arch::Aarch64 => IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE,
+        Arch::X86_64 => 0,
+    };
+    out.extend_from_slice(&dll_characteristics.to_le_bytes());
     out.extend_from_slice(&0x0010_0000u64.to_le_bytes()); // SizeOfStackReserve (1 MiB)
     out.extend_from_slice(&0x1000u64.to_le_bytes()); // SizeOfStackCommit
     out.extend_from_slice(&0x0010_0000u64.to_le_bytes()); // SizeOfHeapReserve
@@ -161,10 +194,11 @@ pub fn build(module: &mut Module, arch: Arch) -> (Vec<u8>, Layout) {
     out.extend_from_slice(&0u32.to_le_bytes()); // LoaderFlags
     out.extend_from_slice(&16u32.to_le_bytes()); // NumberOfRvaAndSizes
 
-    // Data directories: imports and IAT only.
+    // Data directories: imports, IAT, and base relocations.
     let mut dirs = [0u64; 16];
     dirs[DIR_IMPORT] = (idata_rva + descriptor_off) | (40 << 32); // 2 descriptors
     dirs[DIR_IAT] = idata_rva | ((8 * (symbols.len() as u64 + 1)) << 32);
+    dirs[DIR_BASERELOC] = reloc_rva | (RELOC_BLOCK_SIZE << 32);
     for dir in dirs {
         out.extend_from_slice(&dir.to_le_bytes());
     }
@@ -189,7 +223,16 @@ pub fn build(module: &mut Module, arch: Arch) -> (Vec<u8>, Layout) {
         idata_fileoff,
         IMAGE_SCN_INITIALIZED_DATA | IMAGE_SCN_READ | IMAGE_SCN_WRITE,
     );
-    debug_assert_eq!(out.len(), 0x198);
+    write_section_header(
+        &mut out,
+        ".reloc",
+        reloc_vsize,
+        reloc_rva,
+        reloc_raw,
+        reloc_fileoff,
+        IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_DISCARDABLE | IMAGE_SCN_INITIALIZED_DATA,
+    );
+    debug_assert_eq!(out.len(), 0x1C0);
 
     // .text contents
     while out.len() < text_fileoff as usize {
@@ -247,6 +290,19 @@ pub fn build(module: &mut Module, arch: Arch) -> (Vec<u8>, Layout) {
     out.extend_from_slice(dll_name);
     out.push(0);
     while (out.len() as u64) < idata_fileoff + idata_raw {
+        out.push(0);
+    }
+
+    // .reloc contents: one block covering .text's page, one
+    // IMAGE_REL_BASED_ABSOLUTE entry. That relocation type is defined to
+    // do nothing when applied -- it exists purely so the table is
+    // non-empty and well-formed, satisfying the loader's mandatory-ASLR
+    // check on ARM64 without actually patching any bytes.
+    debug_assert_eq!(out.len() as u64, reloc_fileoff);
+    out.extend_from_slice(&(SECTION_RVA as u32).to_le_bytes()); // Page RVA
+    out.extend_from_slice(&(RELOC_BLOCK_SIZE as u32).to_le_bytes()); // SizeOfBlock
+    out.extend_from_slice(&0u16.to_le_bytes()); // type 0 (ABSOLUTE) << 12 | offset 0
+    while (out.len() as u64) < reloc_fileoff + reloc_raw {
         out.push(0);
     }
 
@@ -316,7 +372,7 @@ mod tests {
             let (lfanew, m, nsects, entry, base_low, size_of_image) = header_fields(&bytes);
             assert_eq!(lfanew, 0x40);
             assert_eq!(m, machine);
-            assert_eq!(nsects, 2);
+            assert_eq!(nsects, 3);
             assert_eq!(&bytes[0x40..0x44], b"PE\0\0");
             assert_eq!(entry, 0x1000);
             assert_eq!(base_low, 0x4000_0000); // low 32 of 0x140000000
@@ -348,7 +404,7 @@ mod tests {
             assert_eq!(desc_size, 40);
             let to_rva = |rva: u64| -> usize {
                 // Map RVA → file offset using the section table.
-                for i in 0..2 {
+                for i in 0..3 {
                     let h = 0x148 + 40 * i;
                     let vsize = u32::from_le_bytes(bytes[h + 8..h + 12].try_into().unwrap()) as u64;
                     let rva_sec =

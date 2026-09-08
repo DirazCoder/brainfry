@@ -676,7 +676,18 @@ mod tests {
                 u32::from_be_bytes(bytes[sb..sb + 4].try_into().unwrap()),
                 CSMAGIC_EMBEDDED_SIGNATURE
             );
-            let cd_off = sb + 20;
+            // SuperBlob header (12 bytes) + two 8-byte BlobIndex entries
+            // (CodeDirectory, then CMS) precede the CodeDirectory itself.
+            let count = u32::from_be_bytes(bytes[sb + 8..sb + 12].try_into().unwrap());
+            assert_eq!(count, 2, "CodeDirectory + empty CMS blob");
+            let cd_index_off =
+                u32::from_be_bytes(bytes[sb + 16..sb + 20].try_into().unwrap()) as usize;
+            let cms_slot_type = u32::from_be_bytes(bytes[sb + 20..sb + 24].try_into().unwrap());
+            assert_eq!(cms_slot_type, CSSLOT_SIGNATURESLOT, "slot 1 is the CMS signature slot");
+            let cms_index_off =
+                u32::from_be_bytes(bytes[sb + 24..sb + 28].try_into().unwrap()) as usize;
+            let cd_off = sb + cd_index_off;
+            assert_eq!(cd_off, sb + 28, "CodeDirectory starts right after both BlobIndex entries");
             assert_eq!(
                 u32::from_be_bytes(bytes[cd_off..cd_off + 4].try_into().unwrap()),
                 CSMAGIC_CODEDIRECTORY
@@ -710,6 +721,29 @@ mod tests {
                     .unwrap();
                 assert_eq!(expected, actual, "page {slot} hash mismatch");
             }
+
+            // Empty CMS BlobWrapper. Its BlobIndex offset should land
+            // exactly where the CodeDirectory's own length says it ends
+            // (hash_offset + one hash per code slot), and the blob itself
+            // is just an 8-byte header (magic + length) with no payload --
+            // AMFI on macOS 14+ requires the slot to be present even
+            // though CS_ADHOC never carries a real signature.
+            let cd_length = (hash_offset + 32 * n_code_slots) as u32;
+            assert_eq!(
+                cms_index_off,
+                (28 + cd_length) as usize,
+                "CMS BlobIndex offset matches where the CodeDirectory ends"
+            );
+            let cms_off = sb + cms_index_off;
+            assert_eq!(
+                u32::from_be_bytes(bytes[cms_off..cms_off + 4].try_into().unwrap()),
+                CSMAGIC_BLOBWRAPPER
+            );
+            assert_eq!(
+                u32::from_be_bytes(bytes[cms_off + 4..cms_off + 8].try_into().unwrap()),
+                8,
+                "CMS blob is header-only, no payload"
+            );
         }
     }
 
