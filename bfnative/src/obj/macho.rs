@@ -155,8 +155,18 @@ pub fn build(module: &mut Module, arch: Arch, image_name: &str) -> (Vec<u8>, Lay
     let text_vmsize = align_up(text_file_end, page);
     let data_fileoff = align_up(text_file_end, page);
     let data_vmaddr = pagezero + text_vmsize;
-    let linkedit_fileoff = data_fileoff + got_size;
-    let linkedit_vmaddr = data_vmaddr + got_size;
+    // __LINKEDIT must start on its own page: segments are the unit dyld
+    // mmaps and sets protection on (__DATA is RW, __LINKEDIT is R-only),
+    // so a sub-page __DATA.vmsize here used to leave __LINKEDIT starting
+    // mid-page -- caught by scripts/validate_macho.py on real CI hardware
+    // ("__LINKEDIT.vmaddr not aligned to page size", "__DATA ends at X
+    // but __LINKEDIT starts inside that same page"). __DATA's filesize
+    // stays exactly got_size (that's all the real content there is), but
+    // its vmsize and __LINKEDIT's fileoff/vmaddr all round up to the next
+    // page so the two segments don't share one.
+    let data_vmsize = align_up(got_size, page);
+    let linkedit_fileoff = align_up(data_fileoff + got_size, page);
+    let linkedit_vmaddr = data_vmaddr + data_vmsize;
 
     // __LINKEDIT contents: bind stream, symtab, strtab, then the signature.
     let bind_stream = build_bind_stream(symbols);
@@ -225,7 +235,7 @@ pub fn build(module: &mut Module, arch: Arch, image_name: &str) -> (Vec<u8>, Lay
         &mut out,
         "__DATA",
         data_vmaddr,
-        got_size,
+        data_vmsize,
         data_fileoff,
         got_size,
         VM_PROT_READ | VM_PROT_WRITE,
@@ -337,6 +347,13 @@ pub fn build(module: &mut Module, arch: Arch, image_name: &str) -> (Vec<u8>, Lay
     // __DATA contents: the GOT, zero-filled; dyld writes the resolved
     // function pointers here at load time.
     out.extend_from_slice(&vec![0u8; got_size as usize]);
+    // Pad out to linkedit_fileoff: __LINKEDIT starts on its own page (see
+    // the data_vmsize/linkedit_fileoff comment above), so there's a gap
+    // between the GOT's real content and where __LINKEDIT's own bytes
+    // begin on disk.
+    while (out.len() as u64) < linkedit_fileoff {
+        out.push(0);
+    }
 
     // __LINKEDIT contents.
     debug_assert_eq!(out.len() as u64, linkedit_fileoff);
@@ -775,6 +792,53 @@ mod tests {
                 8,
                 "CMS blob is header-only, no payload"
             );
+        }
+    }
+
+    #[test]
+    fn adjacent_segments_do_not_share_a_page() {
+        // Regression test: __DATA's vmsize used to be exactly got_size (40
+        // bytes, unaligned), so __LINKEDIT started immediately after it
+        // mid-page instead of on its own page. dyld congruence
+        // (vmaddr - fileoff being page-aligned) doesn't catch this --
+        // both segments individually satisfied it -- but real hardware
+        // CI did, via scripts/validate_macho.py: "__LINKEDIT.vmaddr not
+        // aligned to page size" / "__DATA ends at X ... but __LINKEDIT
+        // starts inside that same page". __DATA (RW) and __LINKEDIT
+        // (R-only) sharing a physical page with different protection
+        // bits is the kind of thing that's inconsistent across kernel
+        // versions even when it happens to load on some of them.
+        for name in ["macos-x86_64", "macos-aarch64"] {
+            let bytes = build_for(&[bfformat::Op::Output, bfformat::Op::Input], name);
+            let page = page_for(name);
+            let ncmds = u32::from_le_bytes(bytes[16..20].try_into().unwrap());
+            let mut pos = 32usize;
+            let mut segments: Vec<(u64, u64)> = Vec::new(); // (vmaddr, vmsize), non-PAGEZERO
+            for _ in 0..ncmds {
+                let cmd = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
+                let cmdsize =
+                    u32::from_le_bytes(bytes[pos + 4..pos + 8].try_into().unwrap()) as usize;
+                if cmd == LC_SEGMENT_64 {
+                    let seg_name = &bytes[pos + 8..pos + 24];
+                    let vmaddr = u64::from_le_bytes(bytes[pos + 24..pos + 32].try_into().unwrap());
+                    let vmsize = u64::from_le_bytes(bytes[pos + 32..pos + 40].try_into().unwrap());
+                    if &seg_name[..10] != b"__PAGEZERO" {
+                        segments.push((vmaddr, vmsize));
+                    }
+                }
+                pos += cmdsize;
+            }
+            segments.sort();
+            for pair in segments.windows(2) {
+                let (va1, vs1) = pair[0];
+                let (va2, _) = pair[1];
+                let end1_page = (va1 + vs1).div_ceil(page) * page;
+                assert!(
+                    end1_page <= va2,
+                    "segment at {va1:#x} (vmsize {vs1:#x}) page-rounds to {end1_page:#x}, \
+                     which overlaps the next segment starting at {va2:#x}"
+                );
+            }
         }
     }
 

@@ -87,21 +87,51 @@ pub fn build(module: &mut Module, arch: Arch) -> (Vec<u8>, Layout) {
     }
     let dll_name_off = cursor;
     let dll_name = b"kernel32.dll";
-    let idata_vsize = dll_name_off + dll_name.len() as u64 + 1;
+    // One extra 8-byte slot after the DLL name, holding a genuine absolute
+    // VA (IMAGE_BASE + idata_rva). Nothing reads it at runtime -- its only
+    // purpose is to give the base-relocation table a real
+    // IMAGE_REL_BASED_DIR64 target instead of the type-0 ABSOLUTE no-op
+    // this writer used to emit (see .reloc layout comment below for why
+    // that didn't work on real ARM64 Windows hardware).
+    let reloc_target_off = align_up(dll_name_off + dll_name.len() as u64 + 1, 8);
+    let idata_vsize = reloc_target_off + 8;
     let idata_raw = align_up(idata_vsize, FILE_ALIGN);
     let idata_fileoff = align_up(text_fileoff + text_raw, FILE_ALIGN);
 
     // ---- .reloc layout ----
-    // A single relocation block covering .text's page, with one
-    // IMAGE_REL_BASED_ABSOLUTE (type 0) entry -- the standard no-op
-    // padding entry PE emitters use when there's genuinely nothing to
-    // relocate. The table only has to exist and be well-formed; the
-    // loader only walks it if it actually has to rebase.
+    // One relocation block covering the page containing our dedicated
+    // reloc-target slot in .idata, with one real IMAGE_REL_BASED_DIR64
+    // entry fixing up that slot's absolute VA.
+    //
+    // This used to be a single IMAGE_REL_BASED_ABSOLUTE (type 0) entry --
+    // the standard "no-op but well-formed" padding PE emitters use when
+    // there's genuinely nothing to relocate, which is true here: every
+    // address baked into .text is PC-relative (ADRP/branch displacements,
+    // see obj::patch), so nothing in the *code* needs fixing up if the
+    // loader rebases. codesign-equivalent tools (rcodesign, dumpbin
+    // /headers) all accepted this as well-formed, and it loads fine on
+    // x86_64. But on real ARM64 Windows hardware it doesn't: ASLR can't
+    // be disabled for ARM64/ARM64EC (the linker itself rejects
+    // /DYNAMICBASE:NO for these targets -- see the characteristics/
+    // dll_characteristics comments above), and CreateProcess rejected the
+    // image outright with "not a valid Win32 application" -- a
+    // loader-level refusal before any code ever ran, confirmed via a raw
+    // PE-header parse showing the file was otherwise well-formed
+    // (correct machine type, correct PE32+ magic, correct DYNAMIC_BASE
+    // bit). The degenerate all-type-0 table apparently doesn't satisfy
+    // whatever check the real loader performs to confirm an image is
+    // actually relocatable, even though the PE spec doesn't say it has to
+    // reject that. Emitting one real, well-formed DIR64 fixup (even
+    // against a slot nothing reads) exercises the loader's actual
+    // relocation-application path instead of just satisfying a
+    // structural well-formedness check.
     //
     // SizeOfBlock must be a multiple of 4 (blocks are walked by adding
-    // this field to advance to the next one), so an 8-byte header plus a
-    // single 2-byte entry (10 bytes total) is malformed -- it must be
-    // padded with a second, all-zero entry to reach 12 bytes.
+    // this field to advance to the next one); one 8-byte header plus one
+    // 2-byte entry is 10 bytes, so it's padded with a second, all-zero
+    // (type 0) entry to reach 12.
+    let reloc_page_rva = idata_rva + (reloc_target_off & !0xFFF);
+    let reloc_page_offset = (reloc_target_off & 0xFFF) as u32;
     let reloc_rva = idata_rva + align_up(idata_vsize, SECTION_ALIGN);
     const RELOC_BLOCK_SIZE: u64 = 8 + 2 + 2; // header + one real entry + one zero-pad entry
     let reloc_vsize = RELOC_BLOCK_SIZE;
@@ -117,6 +147,7 @@ pub fn build(module: &mut Module, arch: Arch) -> (Vec<u8>, Layout) {
     patch(module, &layout);
 
     let size_of_image = reloc_rva + align_up(reloc_vsize, SECTION_ALIGN);
+
 
     // ---- serialize ----
     let mut out: Vec<u8> = Vec::new();
@@ -294,20 +325,31 @@ pub fn build(module: &mut Module, arch: Arch) -> (Vec<u8>, Layout) {
     // DLL name.
     out.extend_from_slice(dll_name);
     out.push(0);
+    while (out.len() as u64) < idata_fileoff + reloc_target_off {
+        out.push(0);
+    }
+    // Dedicated reloc-target slot: a genuine absolute VA (nothing reads
+    // this at runtime -- see the .reloc layout comment above for why it
+    // exists). Written as IMAGE_BASE + idata_rva so its *preferred-base*
+    // value is well-defined and checkable; the loader adds the rebase
+    // delta on top when the image doesn't load at IMAGE_BASE.
+    out.extend_from_slice(&(IMAGE_BASE + idata_rva).to_le_bytes());
+    debug_assert_eq!(out.len() as u64, idata_fileoff + reloc_target_off + 8);
     while (out.len() as u64) < idata_fileoff + idata_raw {
         out.push(0);
     }
 
-    // .reloc contents: one block covering .text's page, one
-    // IMAGE_REL_BASED_ABSOLUTE entry. That relocation type is defined to
-    // do nothing when applied -- it exists purely so the table is
-    // non-empty and well-formed, satisfying the loader's mandatory-ASLR
-    // check on ARM64 without actually patching any bytes.
+    // .reloc contents: one block covering the page containing our
+    // dedicated reloc-target slot, with one real IMAGE_REL_BASED_DIR64
+    // entry. See the .reloc layout comment above for why this replaced
+    // the previous type-0 ABSOLUTE no-op entry.
     debug_assert_eq!(out.len() as u64, reloc_fileoff);
-    out.extend_from_slice(&(SECTION_RVA as u32).to_le_bytes()); // Page RVA
+    out.extend_from_slice(&(reloc_page_rva as u32).to_le_bytes()); // Page RVA
     out.extend_from_slice(&(RELOC_BLOCK_SIZE as u32).to_le_bytes()); // SizeOfBlock
-    out.extend_from_slice(&0u16.to_le_bytes()); // type 0 (ABSOLUTE) << 12 | offset 0
-    out.extend_from_slice(&0u16.to_le_bytes()); // pad entry so SizeOfBlock is 4-byte aligned
+    const IMAGE_REL_BASED_DIR64: u16 = 10;
+    let entry = ((IMAGE_REL_BASED_DIR64 as u16) << 12) | (reloc_page_offset as u16 & 0xFFF);
+    out.extend_from_slice(&entry.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes()); // type 0 (ABSOLUTE) pad entry, 4-byte align
     while (out.len() as u64) < reloc_fileoff + reloc_raw {
         out.push(0);
     }
@@ -508,4 +550,86 @@ mod tests {
             assert_eq!(iat_rva, idata_rva);
         }
     }
+
+    #[test]
+    fn base_relocation_table_has_a_real_dir64_fixup() {
+        // Regression test: this table used to contain a single
+        // IMAGE_REL_BASED_ABSOLUTE (type 0) no-op entry. That's spec-legal
+        // (dumpbin, rcodesign, and every static PE parser accepted it) and
+        // loads fine on x86_64, but real ARM64 Windows hardware rejected
+        // the resulting image outright with "not a valid Win32
+        // application" -- a CreateProcess-level refusal before any code
+        // ran. This test walks the actual relocation block and requires
+        // at least one non-ABSOLUTE entry, so a future "simplify this
+        // back to a no-op" edit fails loudly instead of shipping a build
+        // that only breaks on hardware CI doesn't otherwise exercise.
+        const IMAGE_REL_BASED_DIR64: u16 = 10;
+        for name in ["windows-x86_64", "windows-aarch64"] {
+            let bytes = build_for(&[bfformat::Op::Output], name);
+
+            let reloc_dir = u64::from_le_bytes(
+                bytes[DIRS_OFF + DIR_BASERELOC * 8..DIRS_OFF + DIR_BASERELOC * 8 + 8]
+                    .try_into()
+                    .unwrap(),
+            );
+            let (reloc_rva, reloc_size) = (
+                (reloc_dir & 0xFFFF_FFFF) as u32,
+                (reloc_dir >> 32) as u32,
+            );
+            assert!(reloc_size >= 12, "block must hold header + at least one real entry");
+
+            // Map reloc_rva -> file offset via the section table (3
+            // sections: .text, .idata, .reloc).
+            let mut reloc_file_off = None;
+            for i in 0..3 {
+                let h = 0x148 + 40 * i;
+                let vsize = u32::from_le_bytes(bytes[h + 8..h + 12].try_into().unwrap()) as u64;
+                let rva = u32::from_le_bytes(bytes[h + 12..h + 16].try_into().unwrap()) as u64;
+                let raw = u32::from_le_bytes(bytes[h + 20..h + 24].try_into().unwrap()) as u64;
+                if reloc_rva as u64 >= rva && (reloc_rva as u64) < rva + vsize.max(1) {
+                    reloc_file_off = Some(raw + (reloc_rva as u64 - rva));
+                }
+            }
+            let pos = reloc_file_off.expect("reloc dir RVA maps into some section") as usize;
+
+            let page_rva = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
+            let size_of_block = u32::from_le_bytes(bytes[pos + 4..pos + 8].try_into().unwrap());
+            assert_eq!(size_of_block % 4, 0, "SizeOfBlock must be 4-byte aligned to be walkable");
+            assert!(size_of_block >= 10, "header (8) + at least one entry (2)");
+
+            let mut entries = Vec::new();
+            let mut off = pos + 8;
+            while off < pos + size_of_block as usize {
+                let raw = u16::from_le_bytes(bytes[off..off + 2].try_into().unwrap());
+                entries.push((raw >> 12, raw & 0xFFF)); // (type, page-relative offset)
+                off += 2;
+            }
+
+            let real_entries: Vec<_> = entries.iter().filter(|(t, _)| *t != 0).collect();
+            assert!(
+                !real_entries.is_empty(),
+                "relocation block for {name} has no non-ABSOLUTE entries -- this is the \
+                 exact degenerate table that real ARM64 Windows hardware rejected with \
+                 \"not a valid Win32 application\""
+            );
+            for (t, page_off) in &real_entries {
+                assert_eq!(*t, IMAGE_REL_BASED_DIR64, "expected a DIR64 fixup");
+                let target_rva = page_rva + *page_off as u32;
+                assert!(
+                    (target_rva as u64) < idata_end(&bytes),
+                    "DIR64 fixup at rva {target_rva:#x} must point inside .idata"
+                );
+            }
+        }
+    }
+
+    /// End RVA of the .idata section (start + virtual size), for
+    /// sanity-checking that a relocation target actually lands inside it.
+    fn idata_end(bytes: &[u8]) -> u64 {
+        let h = 0x148 + 40; // second section header (.idata)
+        let vsize = u32::from_le_bytes(bytes[h + 8..h + 12].try_into().unwrap()) as u64;
+        let rva = u32::from_le_bytes(bytes[h + 12..h + 16].try_into().unwrap()) as u64;
+        rva + vsize
+    }
 }
+
