@@ -262,19 +262,42 @@ inside the run. Reproduce with `scripts/benchmark_all.py`.
 
 Parsing is a straight character-by-character pass that validates bracket
 matching and builds an unoptimized op list. Optimization runs as a separate
-pass on top, currently two rules. Run folding turns `+++++` into one
-`Add(5)` instead of five separate `Add(1)`s (same idea for `-`, `>`, `<`),
-which cuts down how many times the bytecode runtime's dispatch loop spins
-on repetitive source and produces noticeably shorter assembly out of
-`bfnative` too. Zero-loop folding takes `[-]` and `[+]` — a loop that does
-nothing but drive the current cell to zero — and collapses it into a
-single `Zero` instruction instead of actually looping up to 255 times.
+pass on top, currently four rules, each running in sequence on the output
+of the last. Run folding turns `+++++` into one `Add(5)` instead of five
+separate `Add(1)`s (same idea for `-`, `>`, `<`), which cuts down how many
+times the bytecode runtime's dispatch loop spins on repetitive source and
+produces noticeably shorter assembly out of `bfnative` too. Zero-loop
+folding takes `[-]` and `[+]` — a loop that does nothing but drive the
+current cell to zero — and collapses it into a single `Zero` instruction
+instead of actually looping up to 255 times.
 
-Both are safe, semantics-preserving transformations: optimized output runs
-identically to unoptimized, just faster. Jump targets get recomputed after
-folding, since folding changes instruction indices. This applies to both
-backends, since `bfnative` reuses the same optimizer rather than
-reimplementing it.
+Offset-add folding targets the `[->+<]` idiom and its relatives: a loop
+that decrements the current cell by 1 per iteration while adding to one or
+more other cells and returning to its starting position each time. Since a
+loop like that always runs exactly N times for a starting value of N, the
+result is fully determined before the first iteration — so it collapses
+into one `MulAdd` per target cell (or several, for patterns like
+`[->+>+<<]` that spread a value into more than one place) followed by a
+`Zero`, instead of actually iterating. This only fires when every
+condition holds: the loop returns to its start, the counting cell's net
+change is exactly `-1`, every other touched cell only gets added to, and
+the body has no `Output`, `Input`, or nested loop — any of those would
+mean collapsing the loop changes something other than speed, like how many
+times a side effect fires. A loop that doesn't meet all four stays a real
+loop rather than risk folding something unsafe.
+
+Scan-loop folding handles the other common idiom, `[>]` / `[<]` and their
+multi-cell-stride variants — a loop whose entire body is a single move,
+used to walk the tape until landing on a zero cell. That collapses into a
+single `Scan` instruction carrying the stride and direction, which removes
+the per-cell jump-check-jump overhead without changing how many cells
+actually get inspected.
+
+All four are safe, semantics-preserving transformations: optimized output
+runs identically to unoptimized, just faster. Jump targets get recomputed
+once at the end, after every fold, since folding changes instruction
+indices. This applies to both backends, since `bfnative` reuses the same
+optimizer rather than reimplementing it.
 
 ## Runtime behavior
 
@@ -322,6 +345,16 @@ misparsing garbage further in. This only applies to `bfc`/`bfrun` — a
 `bfnative`-compiled binary is a normal executable for its platform, with
 no custom format of its own.
 
+The version check only guards one direction: it stops a `bfrun` build
+from accepting a `.bfry` file from a *newer* format than it understands,
+but nothing currently forces `FORMAT_VERSION` to bump when the op tag
+range grows. `MulAdd`/`Scan` (tags 9-10) are new as of the offset-add and
+scan-loop optimizer passes; a `.bfry` file compiled with them and read by
+a `bfrun` build old enough to only know tags 0-8 will misparse those
+bytes rather than fail cleanly. Whether that's worth a version bump now
+or only once it matters for a real compatibility case is an open call,
+not something this doc is deciding.
+
 ## Verification status
 
 What's actually been run, versus what's been inspected by outside tools
@@ -346,10 +379,12 @@ imply otherwise.
 
 ## What's not here
 
-No copy/multiply loop folding: the common `[->+<]` idiom and its
-relatives still run as actual loops instead of collapsing into one
-instruction, in either backend. Worth adding once there's a real reason
-to benchmark against — not before.
+No general-purpose loop folding beyond the offset-add and scan patterns.
+A loop that touches a cell with anything other than a net `+1`/`-1`
+step, or that both adds to and subtracts from other cells, still runs as
+an actual loop — the two folding passes are conservative by design and
+fall back to a real loop rather than guess at a pattern they can't fully
+verify.
 
 No macOS or Windows execution in the test suite. The containers are
 validated structurally (see above), but nothing here has actually booted
@@ -359,3 +394,6 @@ the differential harness locally is the missing experiment.
 No CI/build-matrix config for the six `bfnative` targets. That's a
 packaging concern layered on top of this source, not something baked
 into the crates themselves.
+
+
+
