@@ -48,6 +48,8 @@ const X6: u32 = 6;
 const X8: u32 = 8; // Linux syscall number register
 const X9: u32 = 9; // scratch
 const X10: u32 = 10; // constant scratch
+const X11: u32 = 11; // MulAdd: source value scratch
+const X12: u32 = 12; // MulAdd: factor scratch
 const X16: u32 = 16; // call-address scratch (IP1)
 const CELL: u32 = 19; // x19
 const BASE: u32 = 20; // x20
@@ -237,6 +239,19 @@ fn emit_op(e: &mut Emitter, op: &Op, i: usize, rt: &Rt) {
             ));
             emit_bracket_jump(e, true, target + 1);
         }
+        Op::MulAdd { offset, factor } => {
+            e.span(format!(
+                "op {i}: MulAdd {{ offset: {offset}, factor: {factor} }} — \
+                 [x19+offset] += [x19] * factor; [x19] = 0"
+            ));
+            emit_mul_add(e, offset, factor, rt);
+        }
+        Op::Scan { stride } => {
+            e.span(format!(
+                "op {i}: Scan {{ stride: {stride} }} — step by stride until [x19] == 0"
+            ));
+            emit_scan(e, stride, rt);
+        }
         Op::Output | Op::Input => unreachable!("dispatched by emit_body"),
     }
 }
@@ -261,6 +276,105 @@ fn emit_bracket_jump(e: &mut Emitter, is_nonzero: bool, target: u32) {
     e.span("  stub: b (far)");
     b_label(e, target);
     e.bind_here(next);
+}
+
+/// Computes `x19 + offset` into `x0`, applying the same bounds policy a
+/// literal `MoveRight`/`MoveLeft` by that many cells would have applied —
+/// growing the tape on the right, erroring on underflow on the left — since
+/// `MulAdd`'s `offset` and `Scan`'s per-step `stride` both stand in for a
+/// move the optimizer folded away, not a new kind of addressing. Leaves
+/// `x19` (the real cell pointer) untouched; the caller decides whether to
+/// commit the new address into `x19`.
+///
+/// `magnitude` must already be the absolute value of the offset/stride and
+/// fit in a u32 (both fields are i32, so `unsigned_abs()` always fits).
+fn emit_bounds_checked_offset(e: &mut Emitter, magnitude: u32, is_right: bool, rt: &Rt) {
+    if is_right {
+        // Same shape as MoveRight: x0 = cell + magnitude; grow if it lands
+        // at or past the current end.
+        if magnitude <= 4095 {
+            add_imm(e, X0, CELL, magnitude);
+        } else {
+            mov_imm32(e, X10, magnitude);
+            add_reg(e, X0, CELL, X10);
+        }
+        cmp_reg(e, X0, END);
+        let update = e.internal_label();
+        bcond(e, LO, update); // x0 < end → in bounds already
+        bl(e, rt.grow);
+        e.bind_here(update);
+    } else {
+        // Same shape as MoveLeft: x9 = cell - base (never wraps); underflow
+        // iff x9 < magnitude. x0 ends up holding the checked target address.
+        sub_reg(e, X9, CELL, BASE);
+        if magnitude <= 4095 {
+            cmp_imm(e, X9, magnitude);
+            let ok = e.internal_label();
+            bcond(e, HS, ok);
+            b_label(e, rt.err_underflow);
+            e.bind_here(ok);
+            sub_imm(e, X0, CELL, magnitude);
+        } else {
+            mov_imm32(e, X10, magnitude);
+            cmp_reg(e, X9, X10);
+            let ok = e.internal_label();
+            bcond(e, HS, ok);
+            b_label(e, rt.err_underflow);
+            e.bind_here(ok);
+            sub_reg(e, X0, CELL, X10);
+        }
+    }
+}
+
+/// `MulAdd { offset, factor }`: add `[x19] * factor` into the cell at
+/// `x19 + offset`, wrapping mod 256 like every other cell write, then zero
+/// the source cell — the same two-step effect as the `[->+<]`-style loop
+/// this op replaces, just without paying for the loop.
+fn emit_mul_add(e: &mut Emitter, offset: i32, factor: u8, rt: &Rt) {
+    // x9 = value in the source cell. If it's already 0 the loop this
+    // replaces would never have run, so skip the write to that cell
+    // entirely (its address might not even be valid to touch, e.g. one
+    // past the current tape end on a first-growth boundary).
+    ldrb_w(e, X9, CELL);
+    let skip = e.internal_label();
+    let done = e.internal_label();
+    cbz32(e, false, X9, skip);
+
+    // x11 = the source value, parked here because the bounds check below
+    // may call bf_grow, which is documented to clobber x1..x10 — x9 would
+    // not survive that call.
+    mov_reg(e, X11, X9);
+    emit_bounds_checked_offset(e, offset.unsigned_abs(), offset >= 0, rt);
+    // x0 now holds the checked target address.
+    mov_reg(e, X9, X0); // x9 = target address, freed from x0 for the mul call
+    ldrb_w(e, X10, X9); // x10 = *target
+    movz(e, X12, factor as u32); // x12 = factor
+    mul_w(e, X11, X11, X12); // x11 = value * factor (mod 2^32; strb truncates mod 256)
+    add_w_reg(e, X10, X10, X11); // x10 = *target + value*factor
+    strb_w(e, X10, X9);
+    b_label(e, done);
+
+    e.bind_here(skip);
+    e.bind_here(done);
+    strb_wzr(e, CELL);
+}
+
+/// `Scan { stride }`: step the cell pointer by `stride` cells at a time
+/// until it lands on a zero cell, applying the same per-step bounds check a
+/// literal `MoveRight`/`MoveLeft` loop body would have paid for on every
+/// iteration.
+fn emit_scan(e: &mut Emitter, stride: i32, rt: &Rt) {
+    let magnitude = stride.unsigned_abs();
+    let is_right = stride >= 0;
+    let top = e.internal_label();
+    let done = e.internal_label();
+    e.bind_here(top);
+    ldrb_w(e, X9, CELL);
+    cbz32(e, false, X9, done);
+    emit_bounds_checked_offset(e, magnitude, is_right, rt);
+    mov_reg(e, CELL, X0); // commit the checked address as the new cell pointer
+    b_label(e, top);
+    e.bind_here(done);
 }
 
 // ---------------------------------------------------------------------------
@@ -742,6 +856,17 @@ fn add_w_imm(e: &mut Emitter, rd: u32, rn: u32, imm: u32) {
     e.u32(0x1100_0000 | (imm << 10) | (rn << 5) | rd);
 }
 
+/// `add Wd, Wn, Wm` — 0B000000 | Rm<<16 | Rn<<5 | Rd. 32-bit register add;
+/// the byte-wide `strb` that follows truncates the result mod 256.
+fn add_w_reg(e: &mut Emitter, rd: u32, rn: u32, rm: u32) {
+    e.u32(0x0B00_0000 | (rm << 16) | (rn << 5) | rd);
+}
+
+/// `mul Wd, Wn, Wm` (MADD Wd, Wn, Wm, WZR) — 1B00_7C00 | Rm<<16 | Rn<<5 | Rd.
+fn mul_w(e: &mut Emitter, rd: u32, rn: u32, rm: u32) {
+    e.u32(0x1B00_7C00 | (rm << 16) | (rn << 5) | rd);
+}
+
 /// `sub Wd, Wn, #imm12` — 51000000.
 fn sub_w_imm(e: &mut Emitter, rd: u32, rn: u32, imm: u32) {
     debug_assert!(imm <= 4095);
@@ -1017,6 +1142,56 @@ mod tests {
             armbs
                 .iter()
                 .any(|f| matches!(f.target, PatchTarget::Label(4)))
+        );
+    }
+
+    #[test]
+    fn mul_add_emits_a_multiply() {
+        let ops = [Op::MulAdd {
+            offset: 1,
+            factor: 3,
+        }];
+        let m = crate::codegen::emit(
+            &ops,
+            crate::target::Target::from_name("linux-aarch64").unwrap(),
+        );
+        // MADD (mul_w) top byte pattern: 0001_1011_000..... with the low
+        // 15 bits masked off (Ra field must be 11111 = xzr for a plain mul).
+        assert!(m.code.chunks(4).any(|w| {
+            let word = u32::from_le_bytes(w.try_into().unwrap());
+            word & 0xFFE0_FC00 == 0x1B00_7C00
+        }));
+    }
+
+    #[test]
+    fn mul_add_negative_offset_checks_underflow() {
+        let ops = [Op::MulAdd {
+            offset: -5,
+            factor: 1,
+        }];
+        let m = crate::codegen::emit(
+            &ops,
+            crate::target::Target::from_name("linux-aarch64").unwrap(),
+        );
+        let underflow_msg = b"pointer moved left of cell 0";
+        assert!(
+            m.code
+                .windows(underflow_msg.len())
+                .any(|w| w == underflow_msg)
+        );
+    }
+
+    #[test]
+    fn scan_loops_back_to_its_own_start() {
+        let ops = [Op::Scan { stride: 1 }];
+        let m = crate::codegen::emit(
+            &ops,
+            crate::target::Target::from_name("linux-aarch64").unwrap(),
+        );
+        assert!(
+            m.fixups
+                .iter()
+                .any(|f| matches!(f.target, PatchTarget::Label(0)))
         );
     }
 }
