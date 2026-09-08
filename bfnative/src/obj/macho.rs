@@ -383,34 +383,44 @@ pub fn build(module: &mut Module, arch: Arch, image_name: &str) -> (Vec<u8>, Lay
         .copy_from_slice(&linkedit_size.to_le_bytes());
 
     // SuperBlob: header + one CodeDirectory.
-    out.extend_from_slice(&CSMAGIC_EMBEDDED_SIGNATURE.to_le_bytes());
-    out.extend_from_slice(&superblob_length.to_le_bytes());
-    out.extend_from_slice(&1u32.to_le_bytes());
-    out.extend_from_slice(&0u32.to_le_bytes()); // slot type: CodeDirectory
-    out.extend_from_slice(&20u32.to_le_bytes()); // slot offset
+    //
+    // Code-signing blobs are the one part of this file that isn't
+    // native-endian: cscdefs.h specifies every multi-byte field here as
+    // network byte order (big-endian) on both x86-64 and arm64, unlike
+    // the rest of Mach-O (header, load commands, symtab), which is
+    // little-endian on both arches. Mixing the two up produces a blob
+    // the kernel can't parse at all -- `codesign -dvvv` reports "code
+    // object is not signed at all" and `--verify` reports "invalid or
+    // unsupported format for signature" (error -67045), rather than
+    // flagging any specific field as wrong.
+    out.extend_from_slice(&CSMAGIC_EMBEDDED_SIGNATURE.to_be_bytes());
+    out.extend_from_slice(&superblob_length.to_be_bytes());
+    out.extend_from_slice(&1u32.to_be_bytes());
+    out.extend_from_slice(&0u32.to_be_bytes()); // slot type: CodeDirectory
+    out.extend_from_slice(&20u32.to_be_bytes()); // slot offset
 
     // CodeDirectory v0x20400.
-    out.extend_from_slice(&CSMAGIC_CODEDIRECTORY.to_le_bytes());
-    out.extend_from_slice(&cd_length.to_le_bytes());
-    out.extend_from_slice(&CODEDIRECTORY_VERSION.to_le_bytes());
-    out.extend_from_slice(&CS_ADHOC.to_le_bytes());
-    out.extend_from_slice(&(hash_offset as u32).to_le_bytes()); // hashOffset
-    out.extend_from_slice(&(CD_HEADER_SIZE as u32).to_le_bytes()); // identOffset
-    out.extend_from_slice(&0u32.to_le_bytes()); // nSpecialSlots
-    out.extend_from_slice(&(n_code_slots as u32).to_le_bytes());
-    out.extend_from_slice(&(code_limit as u32).to_le_bytes()); // codeLimit
+    out.extend_from_slice(&CSMAGIC_CODEDIRECTORY.to_be_bytes());
+    out.extend_from_slice(&cd_length.to_be_bytes());
+    out.extend_from_slice(&CODEDIRECTORY_VERSION.to_be_bytes());
+    out.extend_from_slice(&CS_ADHOC.to_be_bytes());
+    out.extend_from_slice(&(hash_offset as u32).to_be_bytes()); // hashOffset
+    out.extend_from_slice(&(CD_HEADER_SIZE as u32).to_be_bytes()); // identOffset
+    out.extend_from_slice(&0u32.to_be_bytes()); // nSpecialSlots
+    out.extend_from_slice(&(n_code_slots as u32).to_be_bytes());
+    out.extend_from_slice(&(code_limit as u32).to_be_bytes()); // codeLimit
     out.push(32); // hashSize
     out.push(CSHASH_SHA256);
     out.push(0); // platform
     out.push(page_log2);
-    out.extend_from_slice(&0u32.to_le_bytes()); // spare2
-    out.extend_from_slice(&0u32.to_le_bytes()); // scatterOffset
-    out.extend_from_slice(&0u32.to_le_bytes()); // teamOffset
-    out.extend_from_slice(&0u64.to_le_bytes()); // spare3
-    out.extend_from_slice(&0u64.to_le_bytes()); // codeLimit64
-    out.extend_from_slice(&pagezero.to_le_bytes()); // execSegBase
-    out.extend_from_slice(&text_vmsize.to_le_bytes()); // execSegLimit
-    out.extend_from_slice(&CS_EXECSEG_MAIN_BINARY.to_le_bytes());
+    out.extend_from_slice(&0u32.to_be_bytes()); // spare2
+    out.extend_from_slice(&0u32.to_be_bytes()); // scatterOffset
+    out.extend_from_slice(&0u32.to_be_bytes()); // teamOffset
+    out.extend_from_slice(&0u64.to_be_bytes()); // spare3
+    out.extend_from_slice(&0u64.to_be_bytes()); // codeLimit64
+    out.extend_from_slice(&pagezero.to_be_bytes()); // execSegBase
+    out.extend_from_slice(&text_vmsize.to_be_bytes()); // execSegLimit
+    out.extend_from_slice(&CS_EXECSEG_MAIN_BINARY.to_be_bytes());
     debug_assert_eq!(out.len() - dataoff as usize, (20 + CD_HEADER_SIZE) as usize);
 
     out.extend_from_slice(ident.as_bytes());
@@ -622,29 +632,30 @@ mod tests {
             assert_eq!(dataoff % 16, 0, "signature is 16-byte aligned");
             assert_eq!(dataoff + datasize, bytes.len(), "signature ends the file");
 
-            // SuperBlob header.
+            // SuperBlob header. Code-signing blobs are big-endian
+            // (cscdefs.h), unlike the Mach-O load commands walked above.
             let sb = dataoff;
             assert_eq!(
-                u32::from_le_bytes(bytes[sb..sb + 4].try_into().unwrap()),
+                u32::from_be_bytes(bytes[sb..sb + 4].try_into().unwrap()),
                 CSMAGIC_EMBEDDED_SIGNATURE
             );
             let cd_off = sb + 20;
             assert_eq!(
-                u32::from_le_bytes(bytes[cd_off..cd_off + 4].try_into().unwrap()),
+                u32::from_be_bytes(bytes[cd_off..cd_off + 4].try_into().unwrap()),
                 CSMAGIC_CODEDIRECTORY
             );
             // codeLimit + pageSize from the CodeDirectory.
             let cd = cd_off;
             let code_limit =
-                u32::from_le_bytes(bytes[cd + 32..cd + 36].try_into().unwrap()) as usize;
+                u32::from_be_bytes(bytes[cd + 32..cd + 36].try_into().unwrap()) as usize;
             let page_log2 = bytes[cd + 39];
             assert_eq!(page_log2, if page == 0x1000 { 12 } else { 14 });
             let hash_offset =
-                u32::from_le_bytes(bytes[cd + 16..cd + 20].try_into().unwrap()) as usize;
+                u32::from_be_bytes(bytes[cd + 16..cd + 20].try_into().unwrap()) as usize;
             let n_code_slots =
-                u32::from_le_bytes(bytes[cd + 28..cd + 32].try_into().unwrap()) as usize;
+                u32::from_be_bytes(bytes[cd + 28..cd + 32].try_into().unwrap()) as usize;
             let ident_offset =
-                u32::from_le_bytes(bytes[cd + 20..cd + 24].try_into().unwrap()) as usize;
+                u32::from_be_bytes(bytes[cd + 20..cd + 24].try_into().unwrap()) as usize;
             assert_eq!(ident_offset, CD_HEADER_SIZE as usize);
             assert_eq!(code_limit, dataoff);
             assert_eq!(
