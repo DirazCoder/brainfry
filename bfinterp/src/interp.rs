@@ -122,6 +122,12 @@ pub fn run<R: Read, W: Write>(ops: &[Op], mut stdin: R, mut stdout: W) -> Result
             }
             Op::Zero => tape[cell] = 0,
             Op::MulAdd { offset, factor } => {
+                // Does NOT zero the source cell: the optimizer emits one
+                // MulAdd per spread target followed by a single trailing
+                // Zero, so a whole group of MulAds sharing one source cell
+                // has to keep reading the original value until that final
+                // Zero runs. Zeroing here too would make every MulAdd after
+                // the first in a group read 0 instead of the real value.
                 let value = tape[cell];
                 if value != 0 {
                     let target = offset_cell(cell, offset)?;
@@ -130,7 +136,6 @@ pub fn run<R: Read, W: Write>(ops: &[Op], mut stdin: R, mut stdout: W) -> Result
                     }
                     tape[target] = tape[target].wrapping_add(value.wrapping_mul(factor));
                 }
-                tape[cell] = 0;
             }
             Op::Scan { stride } => {
                 while tape[cell] != 0 {

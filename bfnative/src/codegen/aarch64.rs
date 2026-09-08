@@ -327,18 +327,20 @@ fn emit_bounds_checked_offset(e: &mut Emitter, magnitude: u32, is_right: bool, r
 }
 
 /// `MulAdd { offset, factor }`: add `[x19] * factor` into the cell at
-/// `x19 + offset`, wrapping mod 256 like every other cell write, then zero
-/// the source cell — the same two-step effect as the `[->+<]`-style loop
-/// this op replaces, just without paying for the loop.
+/// `x19 + offset`, wrapping mod 256 like every other cell write.
+///
+/// Does NOT zero the source cell: the optimizer emits one MulAdd per spread
+/// target sharing the same source cell, followed by a single trailing Zero
+/// op. Zeroing here too would make every MulAdd after the first in such a
+/// group read 0 instead of the real value.
 fn emit_mul_add(e: &mut Emitter, offset: i32, factor: u8, rt: &Rt) {
     // x9 = value in the source cell. If it's already 0 the loop this
     // replaces would never have run, so skip the write to that cell
     // entirely (its address might not even be valid to touch, e.g. one
     // past the current tape end on a first-growth boundary).
     ldrb_w(e, X9, CELL);
-    let skip = e.internal_label();
     let done = e.internal_label();
-    cbz32(e, false, X9, skip);
+    cbz32(e, false, X9, done);
 
     // x11 = the source value, parked here because the bounds check below
     // may call bf_grow, which is documented to clobber x1..x10 — x9 would
@@ -352,11 +354,8 @@ fn emit_mul_add(e: &mut Emitter, offset: i32, factor: u8, rt: &Rt) {
     mul_w(e, X11, X11, X12); // x11 = value * factor (mod 2^32; strb truncates mod 256)
     add_w_reg(e, X10, X10, X11); // x10 = *target + value*factor
     strb_w(e, X10, X9);
-    b_label(e, done);
 
-    e.bind_here(skip);
     e.bind_here(done);
-    strb_wzr(e, CELL);
 }
 
 /// `Scan { stride }`: step the cell pointer by `stride` cells at a time

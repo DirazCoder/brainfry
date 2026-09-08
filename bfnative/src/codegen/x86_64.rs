@@ -304,11 +304,16 @@ fn emit_mul_add(e: &mut Emitter, offset: i32, factor: u8, rt: &Rt) {
     // replaces would never have run, so skip the write to that cell
     // entirely (its address might not even be valid to touch, e.g. one
     // past the current tape end on a first-growth boundary).
+    //
+    // Does NOT zero the source cell (unlike a lone `[->+<]` fold, this op
+    // doesn't own the source's lifetime): the optimizer emits one MulAdd
+    // per spread target sharing the same source cell, followed by a single
+    // trailing Zero op. Zeroing here too would make every MulAdd after the
+    // first in such a group read 0 instead of the real value.
     movzx_al_cell(e);
     test_al(e);
-    let skip = e.internal_label();
     let done = e.internal_label();
-    jcc(e, CC_E, skip);
+    jcc(e, CC_E, done);
 
     // The bounds check runs before touching al, and reloads al fresh
     // afterward, rather than saving/restoring al across it: bf_grow's
@@ -326,11 +331,8 @@ fn emit_mul_add(e: &mut Emitter, offset: i32, factor: u8, rt: &Rt) {
     movzx_al_cell(e); // al = [r12] again — untouched by the bounds check
     mul_al_cl(e); // ax = al * cl; the ah half is discarded, giving mod-256 wraparound
     add_al_to_mem(e, RDX); // [rdx] = [rdx] + al, wrapping mod 256 in hardware
-    jmp(e, done);
 
-    e.bind_here(skip);
     e.bind_here(done);
-    zero_cell(e);
 }
 
 /// `Scan { stride }`: step the cell pointer by `stride` cells at a time
