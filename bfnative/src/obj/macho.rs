@@ -106,7 +106,7 @@ const SEG_FILESIZE_OFF: usize = 48;
 pub fn build(module: &mut Module, arch: Arch, image_name: &str) -> (Vec<u8>, Layout) {
     let page: u64 = match arch {
         Arch::X86_64 => 0x1000,
-        Arch::Aarch64 => 0x10000,
+        Arch::Aarch64 => 0x4000,
     };
     let page_log2: u8 = match arch {
         Arch::X86_64 => 12,
@@ -633,7 +633,7 @@ mod tests {
 
     fn page_for(name: &str) -> u64 {
         if name.contains("aarch64") {
-            0x10000
+            0x4000
         } else {
             0x1000
         }
