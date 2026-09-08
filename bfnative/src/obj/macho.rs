@@ -87,6 +87,8 @@ const BIND_OPCODE_DONE: u8 = 0x00;
 // Code signature constants (codesign.h).
 const CSMAGIC_CODEDIRECTORY: u32 = 0xFADE_0C02;
 const CSMAGIC_EMBEDDED_SIGNATURE: u32 = 0xFADE_0CC0;
+const CSMAGIC_BLOBWRAPPER: u32 = 0xFADE_0B01;
+const CSSLOT_SIGNATURESLOT: u32 = 0x0001_0000;
 const CS_ADHOC: u32 = 0x0000_0002;
 const CS_EXECSEG_MAIN_BINARY: u64 = 0x0000_0001;
 const CSHASH_SHA256: u8 = 2;
@@ -363,7 +365,15 @@ pub fn build(module: &mut Module, arch: Arch, image_name: &str) -> (Vec<u8>, Lay
     let hash_offset = align_up(CD_HEADER_SIZE + ident_len, 8);
     let n_code_slots = code_limit.div_ceil(page);
     let cd_length = (hash_offset + 32 * n_code_slots) as u32;
-    let superblob_length = 20 + cd_length;
+    // Modern AMFI (observed on macOS 14+) hard-fails ad-hoc signatures
+    // that omit the CMS slot entirely -- it logs "has no CMS blob?" and
+    // kills the process at exec, even though CS_ADHOC never carries a
+    // real CMS signature. Apple's own codesign always emits an empty
+    // BlobWrapper here for ad-hoc signing (kSecCodeInfoCMS is documented
+    // as "empty for ad-hoc signed code", not absent). So: two blobs
+    // (CodeDirectory + empty CMS), two BlobIndex entries.
+    let cms_blob_length = 8u32; // GenericBlob header only, zero-length data
+    let superblob_length = 12 + 2 * 8 + cd_length + cms_blob_length;
     let datasize = align_up(superblob_length as u64, 16) as u32;
 
     // Patch LC_CODE_SIGNATURE and __LINKEDIT sizes BEFORE hashing any
@@ -382,7 +392,7 @@ pub fn build(module: &mut Module, arch: Arch, image_name: &str) -> (Vec<u8>, Lay
     out[le + SEG_FILESIZE_OFF..le + SEG_FILESIZE_OFF + 8]
         .copy_from_slice(&linkedit_size.to_le_bytes());
 
-    // SuperBlob: header + one CodeDirectory.
+    // SuperBlob: header + CodeDirectory + empty CMS wrapper.
     //
     // Code-signing blobs are the one part of this file that isn't
     // native-endian: cscdefs.h specifies every multi-byte field here as
@@ -393,11 +403,18 @@ pub fn build(module: &mut Module, arch: Arch, image_name: &str) -> (Vec<u8>, Lay
     // object is not signed at all" and `--verify` reports "invalid or
     // unsupported format for signature" (error -67045), rather than
     // flagging any specific field as wrong.
+    //
+    // CD_START is the CodeDirectory's offset from the start of the
+    // SuperBlob: a 12-byte SuperBlob header followed by two 8-byte
+    // BlobIndex entries (CodeDirectory, then CMS).
+    const CD_START: u32 = 12 + 2 * 8;
     out.extend_from_slice(&CSMAGIC_EMBEDDED_SIGNATURE.to_be_bytes());
     out.extend_from_slice(&superblob_length.to_be_bytes());
-    out.extend_from_slice(&1u32.to_be_bytes());
-    out.extend_from_slice(&0u32.to_be_bytes()); // slot type: CodeDirectory
-    out.extend_from_slice(&20u32.to_be_bytes()); // slot offset
+    out.extend_from_slice(&2u32.to_be_bytes()); // count: CodeDirectory + CMS
+    out.extend_from_slice(&0u32.to_be_bytes()); // slot 0 type: CodeDirectory
+    out.extend_from_slice(&CD_START.to_be_bytes()); // slot 0 offset
+    out.extend_from_slice(&CSSLOT_SIGNATURESLOT.to_be_bytes()); // slot 1 type: CMS
+    out.extend_from_slice(&(CD_START + cd_length).to_be_bytes()); // slot 1 offset
 
     // CodeDirectory v0x20400.
     out.extend_from_slice(&CSMAGIC_CODEDIRECTORY.to_be_bytes());
@@ -421,13 +438,17 @@ pub fn build(module: &mut Module, arch: Arch, image_name: &str) -> (Vec<u8>, Lay
     out.extend_from_slice(&pagezero.to_be_bytes()); // execSegBase
     out.extend_from_slice(&text_vmsize.to_be_bytes()); // execSegLimit
     out.extend_from_slice(&CS_EXECSEG_MAIN_BINARY.to_be_bytes());
-    debug_assert_eq!(out.len() - dataoff as usize, (20 + CD_HEADER_SIZE) as usize);
+    debug_assert_eq!(
+        out.len() - dataoff as usize,
+        (CD_START as u64 + CD_HEADER_SIZE) as usize
+    );
 
     out.extend_from_slice(ident.as_bytes());
     out.push(0);
-    // hash_offset is relative to the CodeDirectory, which starts 20 bytes
-    // into the blob (after the SuperBlob header) — pad relative to cd.
-    while (out.len() as u64) < dataoff + 20 + hash_offset {
+    // hash_offset is relative to the CodeDirectory, which starts CD_START
+    // bytes into the blob (after the SuperBlob header + both index
+    // entries) — pad relative to cd.
+    while (out.len() as u64) < dataoff + CD_START as u64 + hash_offset {
         out.push(0);
     }
 
@@ -439,6 +460,22 @@ pub fn build(module: &mut Module, arch: Arch, image_name: &str) -> (Vec<u8>, Lay
         out.extend_from_slice(&hash);
         hashed = end;
     }
+    debug_assert_eq!(
+        out.len() - dataoff as usize,
+        (CD_START + cd_length) as usize,
+        "CodeDirectory ends exactly where the CMS BlobIndex said it would"
+    );
+
+    // Empty CMS blob. CS_ADHOC never carries a real CMS signature, but
+    // modern AMFI (observed on macOS 14+) hard-kills any process whose
+    // signature omits the slot entirely -- it logs "has no CMS blob?"
+    // and treats the whole signature as unrecoverable, even though the
+    // CodeDirectory itself is well-formed. Apple's own codesign always
+    // writes this as an empty GenericBlob (magic + length, no data) for
+    // ad-hoc signing; kSecCodeInfoCMS is documented as "empty for
+    // ad-hoc signed code", not absent.
+    out.extend_from_slice(&CSMAGIC_BLOBWRAPPER.to_be_bytes());
+    out.extend_from_slice(&8u32.to_be_bytes()); // length: header only, no data
 
     // Pad the signature to datasize.
     while (out.len() - dataoff as usize) < datasize as usize {
