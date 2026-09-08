@@ -94,9 +94,13 @@ const CS_EXECSEG_MAIN_BINARY: u64 = 0x0000_0001;
 const CSHASH_SHA256: u8 = 2;
 const CODEDIRECTORY_VERSION: u32 = 0x0002_0400;
 const SEGMENT_INDEX_DATA: u8 = 2; // __PAGEZERO=0, __TEXT=1, __DATA=2
-/// Size of the v0x20400 CodeDirectory header (all fields through
-/// execSegFlags): 9 u32s + 4 u8s + spare2/scatter/team u32s + 5 u64s.
-const CD_HEADER_SIZE: u64 = 92;
+/// Size of the v0x20400 CodeDirectory fixed header, through execSegFlags,
+/// before the variable-length identifier string:
+/// 9 u32s (magic..codeLimit) + 4 u8s (hashSize..pageSize)
+/// + 3 u32s (spare2, scatterOffset, teamOffset) + 1 u32 (spare3)
+/// + 4 u64s (codeLimit64, execSegBase, execSegLimit, execSegFlags)
+/// = 9*4 + 4*1 + 3*4 + 1*4 + 4*8 = 36 + 4 + 12 + 4 + 32 = 88.
+const CD_HEADER_SIZE: u64 = 88;
 
 /// Field offsets inside `segment_command_64` (for post-hoc fix-ups).
 const SEG_VMSIZE_OFF: usize = 32;
@@ -433,7 +437,18 @@ pub fn build(module: &mut Module, arch: Arch, image_name: &str) -> (Vec<u8>, Lay
     out.extend_from_slice(&0u32.to_be_bytes()); // spare2
     out.extend_from_slice(&0u32.to_be_bytes()); // scatterOffset
     out.extend_from_slice(&0u32.to_be_bytes()); // teamOffset
-    out.extend_from_slice(&0u64.to_be_bytes()); // spare3
+    // spare3 is a u32 per the real CS_CodeDirectory layout (electra/xnu
+    // cs_blobs.h, LLVM's CS_CodeDirectory) -- codeLimit64 is the first
+    // u64-sized field after it. Writing spare3 as a u64 here shoved every
+    // subsequent field 4 bytes to the right: codeLimit64's write landed
+    // on what should be execSegBase's low half, execSegBase's write
+    // (`pagezero`) landed split across the real execSegBase/execSegLimit
+    // boundary, and so on -- a coherent-looking but wrong signature that
+    // codesign's own hash check doesn't catch (hashOffset/codeLimit were
+    // still right), but the kernel's exec-segment validation does, which
+    // is why the process gets SIGKILLed at launch instead of failing
+    // signature verification.
+    out.extend_from_slice(&0u32.to_be_bytes()); // spare3
     out.extend_from_slice(&0u64.to_be_bytes()); // codeLimit64
     out.extend_from_slice(&pagezero.to_be_bytes()); // execSegBase
     out.extend_from_slice(&text_vmsize.to_be_bytes()); // execSegLimit

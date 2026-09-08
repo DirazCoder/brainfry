@@ -334,6 +334,52 @@ jobs:
           }
           Write-Host "::endgroup::"
 
+          Write-Host "::group::.text raw bytes (real compiled bytes, not a re-derived simulation)"
+          # Every prior debug round re-derived the expected .text encoding by
+          # hand or via a Python port and disassembled *that*, never the
+          # actual bytes this specific CI build produced. Dump the real
+          # .text section (raw file bytes) so it can be disassembled against
+          # ground truth instead of a re-simulation.
+          $textFileOff = $null
+          $textRawSize = $null
+          for ($i = 0; $i -lt $numSections; $i++) {
+            $h = 0x148 + 40 * $i
+            $secName = [System.Text.Encoding]::ASCII.GetString($bytes[$h..($h+7)]).TrimEnd([char]0)
+            if ($secName -eq ".text") {
+              $textRawSize = [System.BitConverter]::ToUInt32($bytes, $h + 16)
+              $textFileOff = [System.BitConverter]::ToUInt32($bytes, $h + 20)
+            }
+          }
+          if ($textFileOff -ne $null) {
+            # dumpbin /disasm is a much better source of truth than another
+            # from-scratch decode -- try it first if available.
+            Write-Host "text file offset: 0x$($textFileOff.ToString('X')), raw size: 0x$($textRawSize.ToString('X'))"
+            $textBytes = $bytes[$textFileOff..($textFileOff + $textRawSize - 1)]
+            Write-Host "raw .text bytes (hex): $([System.BitConverter]::ToString($textBytes))"
+          } else {
+            Write-Host "could not locate .text section in table"
+          }
+          Write-Host "::endgroup::"
+
+          Write-Host "::group::dumpbin /disasm (real disassembly of the actual compiled bytes, if dumpbin available)"
+          $dumpbinDisasm = Get-Command dumpbin -ErrorAction SilentlyContinue
+          if (-not $dumpbinDisasm) {
+            $vswhereD = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+            if (Test-Path $vswhereD) {
+              $vsPathD = & $vswhereD -latest -products * -find "VC\Tools\MSVC\*\bin\Hostx64\arm64\dumpbin.exe" | Select-Object -First 1
+              if (-not $vsPathD) {
+                $vsPathD = & $vswhereD -latest -products * -find "VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" | Select-Object -First 1
+              }
+              if ($vsPathD) { & $vsPathD /disasm:bytes $exePath 2>&1 | Select-Object -First 150 }
+              else { Write-Host "dumpbin.exe not found via vswhere" }
+            } else {
+              Write-Host "vswhere.exe not present on this runner"
+            }
+          } else {
+            & dumpbin /disasm:bytes $exePath 2>&1 | Select-Object -First 150
+          }
+          Write-Host "::endgroup::"
+
           Write-Host "::group::dumpbin /headers (MSVC's own PE parser, if available)"
           $dumpbin = Get-Command dumpbin -ErrorAction SilentlyContinue
           if ($dumpbin) {
