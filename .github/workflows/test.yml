@@ -137,6 +137,64 @@ jobs:
           file tests/hello_native
           echo "::endgroup::"
 
+          echo "::group::raw hex dump of LC_CODE_SIGNATURE blob"
+          # Locate LC_CODE_SIGNATURE's dataoff/datasize by hand and dump the
+          # bytes directly -- this bypasses every Apple tool's interpretation
+          # and shows exactly what's on disk, so a wrong-endianness or
+          # wrong-offset bug is visible instead of hidden behind a generic
+          # "not signed" message.
+          python3 - <<'PYEOF'
+          import struct
+          with open("tests/hello_native", "rb") as f:
+              data = f.read()
+          magic, cputype, cpusubtype, filetype, ncmds, sizeofcmds, flags = struct.unpack_from('<7I', data, 0)
+          print(f"mach_header: magic={magic:#x} ncmds={ncmds} sizeofcmds={sizeofcmds} filesize={len(data)}")
+          pos = 32
+          dataoff = datasize = None
+          for i in range(ncmds):
+              cmd, cmdsize = struct.unpack_from('<II', data, pos)
+              if cmd == 0x1D:  # LC_CODE_SIGNATURE
+                  dataoff, datasize = struct.unpack_from('<II', data, pos + 8)
+                  print(f"LC_CODE_SIGNATURE: dataoff={dataoff:#x} datasize={datasize} (cmd #{i} at file offset {pos:#x})")
+              pos += cmdsize
+          if dataoff is None:
+              print("!! no LC_CODE_SIGNATURE load command found at all")
+          else:
+              print(f"file length vs dataoff+datasize: {len(data)} vs {dataoff+datasize} "
+                    f"({'MATCH' if len(data) == dataoff+datasize else 'MISMATCH -- truncated or overrun'})")
+              blob = data[dataoff:dataoff+min(datasize, 256)]
+              print(f"first {len(blob)} bytes of the signature blob:")
+              for off in range(0, len(blob), 16):
+                  chunk = blob[off:off+16]
+                  hexpart = ' '.join(f'{b:02x}' for b in chunk)
+                  print(f"  {dataoff+off:#08x}: {hexpart}")
+              magic_be = struct.unpack_from('>I', data, dataoff)[0] if len(data) >= dataoff + 4 else None
+              magic_le = struct.unpack_from('<I', data, dataoff)[0] if len(data) >= dataoff + 4 else None
+              print(f"SuperBlob magic as BE: {magic_be:#x} (want 0xfade0cc0)  as LE: {magic_le:#x}")
+          PYEOF
+          echo "::endgroup::"
+
+          echo "::group::rcodesign print-signature-info (independent Rust parser, reports specific structural errors)"
+          # apple-codesign's parser is far more diagnostic than Apple's own
+          # codesign/spctl, which both collapse every malformed-blob case to
+          # the same generic "not signed at all" / "invalid format" message.
+          # This either prints the parsed structure (telling us exactly what
+          # dataoff/hashOffset/nCodeSlots/etc. it read) or a specific parse
+          # error naming the field it choked on.
+          if [ "$(uname -m)" = "arm64" ]; then
+            RC_URL="https://github.com/indygreg/apple-platform-rs/releases/download/apple-codesign%2F0.29.0/apple-codesign-0.29.0-aarch64-apple-darwin.tar.gz"
+          else
+            RC_URL="https://github.com/indygreg/apple-platform-rs/releases/download/apple-codesign%2F0.29.0/apple-codesign-0.29.0-x86_64-apple-darwin.tar.gz"
+          fi
+          curl -sL -o /tmp/rcodesign.tar.gz "$RC_URL"
+          mkdir -p /tmp/rcodesign_extract
+          tar -xzf /tmp/rcodesign.tar.gz -C /tmp/rcodesign_extract
+          RC=$(find /tmp/rcodesign_extract -name rcodesign -type f | head -1)
+          chmod +x "$RC"
+          "$RC" print-signature-info tests/hello_native
+          echo "exit: $?"
+          echo "::endgroup::"
+
           echo "::group::codesign -dvvv (static signature inspection)"
           codesign -dvvv tests/hello_native
           echo "exit: $?"
@@ -177,6 +235,81 @@ jobs:
             echo "::endgroup::"
           fi
           set -e
+
+      # Temporary: isolates why bfnative's windows-aarch64 binary gets
+      # "Exec format error" (exit 126) -- a loader-level rejection, before
+      # any code runs, distinct from the macOS signature failure. dumpbin
+      # and a manual PE header parse both bypass Git-bash's interpretation
+      # and show exactly what field the Windows loader is choking on.
+      - name: debug bfnative windows-arm64 exec format error
+        if: always() && matrix.target == 'aarch64-pc-windows-msvc'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+          $BIN = "target/aarch64-pc-windows-msvc/release"
+          Push-Location $BIN
+
+          Write-Host "::group::file size and first bytes"
+          $bytes = [System.IO.File]::ReadAllBytes("tests/hello_native.exe")
+          Write-Host "file size: $($bytes.Length)"
+          Write-Host "first 4 bytes (MZ check): $([System.BitConverter]::ToString($bytes[0..3]))"
+          Write-Host "::endgroup::"
+
+          Write-Host "::group::manual PE header parse"
+          # Read e_lfanew (offset 0x3C), then walk the COFF header fields
+          # by hand -- independent of any OS trust decision, so this shows
+          # what's actually on disk regardless of whether the loader
+          # accepts it.
+          $eLfanew = [System.BitConverter]::ToUInt32($bytes, 0x3C)
+          Write-Host "e_lfanew: 0x$($eLfanew.ToString('X'))"
+          $peSig = [System.Text.Encoding]::ASCII.GetString($bytes[$eLfanew..($eLfanew+3)])
+          Write-Host "PE signature bytes: '$peSig' (want 'PE`0`0')"
+          $coffOff = $eLfanew + 4
+          $machine = [System.BitConverter]::ToUInt16($bytes, $coffOff)
+          Write-Host ("Machine: 0x{0:X4} (want 0xAA64 for ARM64, 0x8664 for AMD64, 0x014C for i386)" -f $machine)
+          $numSections = [System.BitConverter]::ToUInt16($bytes, $coffOff + 2)
+          Write-Host "NumberOfSections: $numSections"
+          $sizeOptHdr = [System.BitConverter]::ToUInt16($bytes, $coffOff + 16)
+          Write-Host "SizeOfOptionalHeader: $sizeOptHdr (want 240 for PE32+)"
+          $characteristics = [System.BitConverter]::ToUInt16($bytes, $coffOff + 18)
+          Write-Host ("Characteristics: 0x{0:X4}" -f $characteristics)
+          $optHdrOff = $coffOff + 20
+          $magic = [System.BitConverter]::ToUInt16($bytes, $optHdrOff)
+          Write-Host ("OptionalHeader magic: 0x{0:X4} (want 0x020B for PE32+)" -f $magic)
+          Write-Host "::endgroup::"
+
+          Write-Host "::group::dumpbin /headers (MSVC's own PE parser, if available)"
+          $dumpbin = Get-Command dumpbin -ErrorAction SilentlyContinue
+          if ($dumpbin) {
+            & dumpbin /headers tests/hello_native.exe 2>&1 | Select-Object -First 80
+          } else {
+            Write-Host "dumpbin not on PATH -- trying vswhere to locate it"
+            $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+            if (Test-Path $vswhere) {
+              $vsPath = & $vswhere -latest -products * -find "VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" | Select-Object -First 1
+              if ($vsPath) {
+                & $vsPath /headers tests/hello_native.exe 2>&1 | Select-Object -First 80
+              } else {
+                Write-Host "dumpbin.exe not found via vswhere either"
+              }
+            } else {
+              Write-Host "vswhere.exe not present on this runner"
+            }
+          }
+          Write-Host "::endgroup::"
+
+          Write-Host "::group::running the binary directly, capturing exit code and error"
+          try {
+            $proc = Start-Process -FilePath ".\tests\hello_native.exe" -NoNewWindow -Wait -PassThru -RedirectStandardError "stderr.txt" -RedirectStandardOutput "stdout.txt"
+            Write-Host "exit code: $($proc.ExitCode)"
+          } catch {
+            Write-Host "Start-Process threw: $($_.Exception.Message)"
+          }
+          if (Test-Path "stdout.txt") { Write-Host "stdout:"; Get-Content "stdout.txt" }
+          if (Test-Path "stderr.txt") { Write-Host "stderr:"; Get-Content "stderr.txt" }
+          Write-Host "::endgroup::"
+
+          Pop-Location
 
       - name: 8-bit wraparound
         shell: bash
