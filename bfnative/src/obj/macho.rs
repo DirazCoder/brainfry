@@ -439,19 +439,35 @@ pub fn build(module: &mut Module, arch: Arch, image_name: &str) -> (Vec<u8>, Lay
     out.extend_from_slice(&0u32.to_be_bytes()); // teamOffset
     // spare3 is a u32 per the real CS_CodeDirectory layout (electra/xnu
     // cs_blobs.h, LLVM's CS_CodeDirectory) -- codeLimit64 is the first
-    // u64-sized field after it. Writing spare3 as a u64 here shoved every
-    // subsequent field 4 bytes to the right: codeLimit64's write landed
-    // on what should be execSegBase's low half, execSegBase's write
-    // (`pagezero`) landed split across the real execSegBase/execSegLimit
-    // boundary, and so on -- a coherent-looking but wrong signature that
-    // codesign's own hash check doesn't catch (hashOffset/codeLimit were
-    // still right), but the kernel's exec-segment validation does, which
-    // is why the process gets SIGKILLed at launch instead of failing
-    // signature verification.
+    // u64-sized field after it. This field offset is correct; the bug
+    // that was here was in the *values*, not the layout:
+    //
+    // execSegBase/execSegLimit describe the executable segment as a FILE
+    // OFFSET range -- xnu's cs_blobs.h says so explicitly ("offset of
+    // executable segment"), and Apple's own linker (ld64) and Go's
+    // Mach-O signer both write __TEXT's fileoff/filesize here, not its
+    // vmaddr/vmsize. This code was writing `pagezero` (__TEXT's *virtual*
+    // address, 0x1_0000_0000) into execSegBase and `text_vmsize` (the
+    // page-rounded *VM* size) into execSegLimit. Confirmed against a real
+    // CI-built binary's on-disk bytes: execSegBase decoded to
+    // 0x100000000 in a 16,816-byte file, i.e. "the executable segment
+    // starts past the end of the file" as far as the kernel's
+    // exec-segment validator is concerned. codesign/rcodesign never
+    // catch this because they only re-verify the CodeDirectory's own
+    // hashes against file contents -- they don't cross-check
+    // execSegBase/execSegLimit against the actual segment table. The
+    // kernel does, at exec time, and SIGKILLs before the process ever
+    // runs -- which is why re-signing with the OS's own `codesign`
+    // didn't help: that recomputes hashes, not this cross-check, and
+    // __TEXT's fileoff is genuinely 0 regardless of who signs it.
+    //
+    // __TEXT's fileoff is 0 (it's the first thing in the file) and its
+    // filesize is text_file_end (the file-relative span code+rodata
+    // actually occupy, before padding out to a full page).
     out.extend_from_slice(&0u32.to_be_bytes()); // spare3
     out.extend_from_slice(&0u64.to_be_bytes()); // codeLimit64
-    out.extend_from_slice(&pagezero.to_be_bytes()); // execSegBase
-    out.extend_from_slice(&text_vmsize.to_be_bytes()); // execSegLimit
+    out.extend_from_slice(&0u64.to_be_bytes()); // execSegBase (__TEXT fileoff)
+    out.extend_from_slice(&text_file_end.to_be_bytes()); // execSegLimit (__TEXT filesize)
     out.extend_from_slice(&CS_EXECSEG_MAIN_BINARY.to_be_bytes());
     debug_assert_eq!(
         out.len() - dataoff as usize,
@@ -797,6 +813,77 @@ mod tests {
                 }
                 pos += cmdsize;
             }
+        }
+    }
+
+    #[test]
+    fn exec_seg_base_and_limit_are_text_file_offsets_not_vm_addresses() {
+        // Regression test: execSegBase/execSegLimit were being written as
+        // __TEXT's vmaddr/vmsize (0x1_0000_0000 and a page-rounded size)
+        // instead of its fileoff/filesize. codesign/rcodesign never catch
+        // this — they only re-verify the CodeDirectory's hashes against
+        // file bytes, not execSegBase/execSegLimit against the segment
+        // table — so a binary with this bug passes `codesign --verify`
+        // and `rcodesign print-signature-info` cleanly and still gets
+        // SIGKILLed by the kernel's exec-segment check at launch.
+        for name in ["macos-x86_64", "macos-aarch64"] {
+            let bytes = build_for(&[bfformat::Op::Output, bfformat::Op::Input], name);
+
+            // Find __TEXT's real fileoff/filesize from the segment table.
+            let ncmds = u32::from_le_bytes(bytes[16..20].try_into().unwrap());
+            let mut pos = 32usize;
+            let mut text_fileoff = None;
+            let mut text_filesize = None;
+            let mut codesig_dataoff = None;
+            for _ in 0..ncmds {
+                let cmd = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
+                let cmdsize =
+                    u32::from_le_bytes(bytes[pos + 4..pos + 8].try_into().unwrap()) as usize;
+                if cmd == LC_SEGMENT_64 {
+                    let seg_name = &bytes[pos + 8..pos + 24];
+                    if &seg_name[..6] == b"__TEXT" {
+                        text_fileoff =
+                            Some(u64::from_le_bytes(bytes[pos + 40..pos + 48].try_into().unwrap()));
+                        text_filesize =
+                            Some(u64::from_le_bytes(bytes[pos + 48..pos + 56].try_into().unwrap()));
+                    }
+                } else if cmd == LC_CODE_SIGNATURE {
+                    codesig_dataoff =
+                        Some(u32::from_le_bytes(bytes[pos + 8..pos + 12].try_into().unwrap()) as usize);
+                }
+                pos += cmdsize;
+            }
+            let text_fileoff = text_fileoff.expect("__TEXT segment present");
+            let text_filesize = text_filesize.expect("__TEXT segment present");
+            let dataoff = codesig_dataoff.expect("LC_CODE_SIGNATURE present");
+
+            // Walk to the CodeDirectory the same way the hash-reverify
+            // test does, then read execSegBase/execSegLimit at their
+            // fixed offsets (56 bytes of fixed header, then codeLimit64,
+            // then these two u64s — see cs_blobs.h CS_CodeDirectory).
+            let sb = dataoff;
+            let cd_index_off =
+                u32::from_be_bytes(bytes[sb + 16..sb + 20].try_into().unwrap()) as usize;
+            let cd = sb + cd_index_off;
+            let version = u32::from_be_bytes(bytes[cd + 8..cd + 12].try_into().unwrap());
+            assert!(
+                version >= 0x20400,
+                "test assumes a CodeDirectory version that carries execSeg* fields"
+            );
+            let exec_seg_base = u64::from_be_bytes(bytes[cd + 64..cd + 72].try_into().unwrap());
+            let exec_seg_limit = u64::from_be_bytes(bytes[cd + 72..cd + 80].try_into().unwrap());
+
+            assert_eq!(
+                exec_seg_base, text_fileoff,
+                "execSegBase must be __TEXT's FILE OFFSET ({text_fileoff:#x}), not its \
+                 vmaddr — xnu cs_blobs.h documents this field as 'offset of executable \
+                 segment'"
+            );
+            assert_eq!(
+                exec_seg_limit, text_filesize,
+                "execSegLimit must be __TEXT's file-relative size ({text_filesize:#x}), \
+                 not its page-rounded vmsize"
+            );
         }
     }
 

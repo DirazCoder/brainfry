@@ -111,6 +111,17 @@ jobs:
 
           ./bfnative$EXT tests/hello.bf -o tests/hello_native$EXT
           chmod +x tests/hello_native$EXT 2>/dev/null || true
+
+          # Structural validation before execution: catches segment-table /
+          # code-signature mismatches (e.g. execSegBase/execSegLimit
+          # pointing at the wrong offsets) that codesign and rcodesign
+          # don't check but the kernel's exec-segment validator does. This
+          # fails with the exact bad field instead of a bare SIGKILL.
+          if [[ "${{ runner.os }}" == "macOS" ]]; then
+            python3 "$GITHUB_WORKSPACE/scripts/validate_macho.py" tests/hello_native$EXT \
+              || { echo "FAIL: hello_native failed structural validation (see above)"; exit 1; }
+          fi
+
           out_native=$(./tests/hello_native$EXT)
           echo "bfnative:  $out_native"
 
