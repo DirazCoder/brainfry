@@ -218,6 +218,29 @@ jobs:
           echo "::endgroup::"
 
           if [ "$RUN_EXIT" -ne 0 ]; then
+            echo "::group::control experiment: re-sign with the OS's own codesign, then re-run"
+            # Our own writer produces a structurally-verified-correct
+            # CodeDirectory (confirmed via rcodesign and manual hex decode
+            # against the real struct layout), and codesign --verify
+            # reports it valid -- yet the kernel still kills it. Before
+            # inventing a fourth theory about our signature bytes, isolate
+            # whether this is actually a bytes bug at all: strip our
+            # signature and let the OS's own codesign apply a fresh
+            # ad-hoc one. If THAT also gets killed, the cause is outside
+            # macho.rs entirely (a CI/runner Gatekeeper policy issue, not
+            # our signature construction). If it runs fine, our bytes are
+            # still wrong in some way rcodesign/codesign --verify don't
+            # catch.
+            cp tests/hello_native /tmp/hello_native_control
+            codesign --remove-signature /tmp/hello_native_control
+            codesign -s - -f /tmp/hello_native_control
+            echo "control binary codesign -dvvv:"
+            codesign -dvvv /tmp/hello_native_control
+            chmod +x /tmp/hello_native_control
+            /tmp/hello_native_control
+            echo "control run exit code: $?"
+            echo "::endgroup::"
+
             echo "::group::log show (kernel/amfid denial reason, since $START_TS)"
             # AMFI/codesigning kills show up in the unified log even when
             # nothing is written to stdout/stderr. --info/--debug widen
