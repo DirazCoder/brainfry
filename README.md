@@ -3,18 +3,19 @@
 Brainfuck has no standard bytecode, no packaging format — nothing beyond raw
 `.bf` text that every existing implementation just interprets directly. This
 project treats it like a real language instead: a compiler, a bytecode
-format, a bytecode runtime, and a backend that emits actual x86-64/ARM64
-machine code and links it straight into a native executable, for anyone who
-doesn't want an interpreter in the loop at all. Written in Rust — no manual
-memory management to get wrong while hand-rolling machine code and
-executable containers.
+format, a bytecode runtime, a backend that emits actual x86-64/ARM64
+machine code and links it straight into a native executable, and a backend
+that emits a standalone WebAssembly module, for anyone who doesn't want an
+interpreter in the loop at all. Written in Rust — no manual memory
+management to get wrong while hand-rolling machine code, executable
+containers, and wasm modules.
 
-Four ways to run a `.bf` file, in increasing order of "how far do you want
+Five ways to run a `.bf` file, in increasing order of "how far do you want
 to get from an interpreter":
 
 1. **`bfinterp`** — walk the source directly, no bytecode, no compile step,
    no optimizer by default. The simplest and slowest path, and the one the
-   other three are checked against.
+   other four are checked against.
 2. **`bfc` + `bfrun`** — compile to `.bfry` bytecode, run it on a small VM.
    The javac/java split. Fast to build, portable, no toolchain needed.
 3. **`bfjit`** — same codegen as `bfnative`, but instead of writing an
@@ -27,12 +28,19 @@ to get from an interpreter":
    code and the ELF/Mach-O/PE container around it are emitted byte-by-byte
    by `bfnative` itself, in-process, with zero external commands and zero
    object-file crates.
+5. **`bfwasm`** — compile straight to a standalone `.wasm` module: WASI
+   imports for I/O, linear memory for the tape, structured control flow
+   for loops. Runs on any WASI-preview1 runtime (`wasmtime`, `wasmer`,
+   Node with `--experimental-wasi-unstable-preview1`, a browser with a
+   WASI shim) instead of a specific OS/CPU pair — the one backend in this
+   project whose output isn't tied to the machine it was compiled on.
 
-Checking whether a bug is in your program or in one of the other three?
+Checking whether a bug is in your program or in one of the other four?
 `bfinterp` is the ground truth. Iterating on a program, `bfc`/`bfrun` is
 zero-friction. Want near-native speed without managing a build artifact —
 `bfjit`. Shipping something you want to hand someone as a standalone
-`.exe`, that's `bfnative`.
+`.exe`, that's `bfnative`. Shipping something that runs anywhere a wasm
+runtime does, independent of OS or CPU — that's `bfwasm`.
 
 ## Layout
 
@@ -52,7 +60,7 @@ zero-friction. Want near-native speed without managing a build artifact —
 - `bfinterp/` — the raw source interpreter. Reads a `.bf` file and executes
   it one op at a time, no bytecode, no optimizer by default, no machine
   code. Deliberately the simplest and slowest correct execution path, so it
-  can serve as the ground-truth reference the other three are
+  can serve as the ground-truth reference the other four are
   differential-tested against. `--optimize` opts into the shared optimizer
   for comparison runs; the default is the naive walk.
 - `bfjit/` — the JIT. Same parser, same optimizer, and the *same source
@@ -62,27 +70,37 @@ zero-friction. Want near-native speed without managing a build artifact —
   (W^X), and jumps straight into it. No file ever hits the disk, no
   ELF/Mach-O/PE writer involved, and only the host platform can be
   JIT-compiled.
+- `bfwasm/` — a third independent backend, targeting WebAssembly instead of
+  a CPU. Reuses `bfc`'s parser and optimizer like every other backend, then
+  emits a binary `.wasm` module directly: a hand-rolled LEB128/section
+  encoder (`encode.rs`), WASI `fd_write`/`fd_read` imports for I/O, one
+  page-granular linear memory for the tape, and Brainfuck's `[...]` loops
+  translated to structured `block`/`loop`/`br_if` rather than the
+  fixup-based jumps `bfnative`'s emitter uses — wasm has no such thing as a
+  branch to an absolute address, so the whole fixup mechanism `bfnative`
+  needs doesn't apply here. No `wasm-bindgen`, no `wat2wasm`, no
+  Emscripten; every byte comes out of `bfwasm` itself, same discipline as
+  `bfnative`.
 
-`bfinterp` and `bfjit` are independent crates with independent runtimes.
-They share the front end (`bfc`/`bfformat`) exactly like `bfnative` does,
-and share no execution code with `bfrun`/`bfnative` or each other. Delete
-either one and the rest of the workspace builds and behaves exactly as
-before.
+`bfinterp`, `bfjit`, and `bfwasm` are independent crates with independent
+runtimes/emitters. They share the front end (`bfc`/`bfformat`) exactly like
+`bfnative` does, and share no execution code with `bfrun`/`bfnative` or each
+other. Delete any one of them and the rest of the workspace builds and
+behaves exactly as before.
 
 ## Building
 
 Requires a Rust toolchain (rustc + cargo). That's the whole list — no C
-compiler, no linker, no platform SDK, for any of the six targets.
+compiler, no linker, no platform SDK, for any target, including wasm.
 
 ```
 cargo build --release
 ```
 
-This builds all five binaries — `bfc`, `bfrun`, `bfnative`, `bfinterp`, and
-`bfjit` — in one shot. `bfinterp` and `bfjit` are both listed in
-`Cargo.toml`'s `[workspace] members`, same as the other three, so there's
-no special-casing needed like earlier states of this repo required for
-`bfnative`.
+This builds all six binaries — `bfc`, `bfrun`, `bfnative`, `bfinterp`,
+`bfjit`, and `bfwasm` — in one shot. Every crate is listed in
+`Cargo.toml`'s `[workspace] members`, so there's no special-casing needed
+for any of them.
 
 ## Usage: bfc / bfrun
 
