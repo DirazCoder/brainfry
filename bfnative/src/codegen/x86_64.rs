@@ -229,8 +229,126 @@ fn emit_op(e: &mut Emitter, op: &Op, i: usize, rt: &Rt) {
             cmp_cell_zero(e);
             jcc(e, CC_NE, target + 1);
         }
+        Op::MulAdd { offset, factor } => {
+            e.span(format!(
+                "op {i}: MulAdd {{ offset: {offset}, factor: {factor} }} — \
+                 [r12+offset] += [r12] * factor; [r12] = 0"
+            ));
+            emit_mul_add(e, offset, factor, rt);
+        }
+        Op::Scan { stride } => {
+            e.span(format!(
+                "op {i}: Scan {{ stride: {stride} }} — step by stride until [r12] == 0"
+            ));
+            emit_scan(e, stride, rt);
+        }
         Op::Output | Op::Input => unreachable!("dispatched by emit_body"),
     }
+}
+
+/// Computes `r12 + offset` into `rax`, applying the same bounds policy a
+/// literal `MoveRight`/`MoveLeft` by that many cells would have applied:
+/// growing the tape on the right, erroring on underflow on the left. Both
+/// `MulAdd`'s `offset` and `Scan`'s per-step `stride` stand in for a move
+/// the optimizer folded away, not a new kind of addressing, so they get the
+/// exact bounds treatment a real move would have paid for. Leaves `r12`
+/// (the real cell pointer) untouched — the caller decides whether to commit
+/// the checked address into `r12`.
+///
+/// `magnitude` must already be the absolute value of the offset/stride.
+fn emit_bounds_checked_offset(e: &mut Emitter, magnitude: u32, is_right: bool, rt: &Rt) {
+    if is_right {
+        // Same shape as MoveRight: rax = cell + magnitude; grow if it lands
+        // at or past the current end.
+        if magnitude <= i32::MAX as u32 {
+            lea_rax_cell(e, magnitude as i64);
+        } else {
+            mov_r32_imm32(e, RAX, magnitude);
+            add64(e, RAX, CELL);
+        }
+        let grow_path = e.internal_label();
+        let update = e.internal_label();
+        cmp64(e, RAX, END);
+        jcc(e, CC_AE, grow_path);
+        jmp(e, update);
+        e.bind_here(grow_path);
+        call(e, rt.grow);
+        e.bind_here(update);
+    } else {
+        // Same shape as MoveLeft: rax = cell - base (never wraps);
+        // underflow iff rax < magnitude. rax ends up holding the checked
+        // target address.
+        mov64(e, RAX, CELL);
+        sub64(e, RAX, BASE);
+        if magnitude <= i32::MAX as u32 {
+            cmp_rax_imm32(e, magnitude);
+            jcc(e, CC_B, rt.err_underflow);
+            mov64(e, RAX, CELL);
+            sub64_imm32(e, RAX, magnitude);
+        } else {
+            mov_r32_imm32(e, RDX, magnitude);
+            cmp64(e, RAX, RDX);
+            jcc(e, CC_B, rt.err_underflow);
+            mov64(e, RAX, CELL);
+            sub64(e, RAX, RDX);
+        }
+    }
+}
+
+/// `MulAdd { offset, factor }`: add `[r12] * factor` into the cell at
+/// `r12 + offset`, wrapping mod 256 like every other cell write, then zero
+/// the source cell — the same two-step effect as the `[->+<]`-style loop
+/// this op replaces, just without paying for the loop.
+fn emit_mul_add(e: &mut Emitter, offset: i32, factor: u8, rt: &Rt) {
+    // al = value in the source cell. If it's already 0 the loop this
+    // replaces would never have run, so skip the write to that cell
+    // entirely (its address might not even be valid to touch, e.g. one
+    // past the current tape end on a first-growth boundary).
+    movzx_al_cell(e);
+    test_al(e);
+    let skip = e.internal_label();
+    let done = e.internal_label();
+    jcc(e, CC_E, skip);
+
+    // The bounds check runs before touching al, and reloads al fresh
+    // afterward, rather than saving/restoring al across it: bf_grow's
+    // entry assumes the stack is exactly where a plain MoveRight would
+    // leave it (its own `push rax` re-aligns to 16 for its internal
+    // calls), so pushing anything ahead of that call here would throw off
+    // every subsequent aligned call inside grow.
+    emit_bounds_checked_offset(e, offset.unsigned_abs(), offset >= 0, rt);
+    // rax now holds the checked target address; move it out of the way so
+    // rax is free again for the 8-bit multiply, which the x86 ALU only
+    // offers in the al/ax form (mul r/m8 -> ax = al * r/m8, with the
+    // multiplicand in another 8-bit register — cl here).
+    mov64(e, RDX, RAX);
+    mov_cl_imm8(e, factor);
+    movzx_al_cell(e); // al = [r12] again — untouched by the bounds check
+    mul_al_cl(e); // ax = al * cl; the ah half is discarded, giving mod-256 wraparound
+    add_al_to_mem(e, RDX); // [rdx] = [rdx] + al, wrapping mod 256 in hardware
+    jmp(e, done);
+
+    e.bind_here(skip);
+    e.bind_here(done);
+    zero_cell(e);
+}
+
+/// `Scan { stride }`: step the cell pointer by `stride` cells at a time
+/// until it lands on a zero cell, applying the same per-step bounds check a
+/// literal `MoveRight`/`MoveLeft` loop body would have paid for on every
+/// iteration.
+fn emit_scan(e: &mut Emitter, stride: i32, rt: &Rt) {
+    let magnitude = stride.unsigned_abs();
+    let is_right = stride >= 0;
+    let top = e.internal_label();
+    let done = e.internal_label();
+    e.bind_here(top);
+    cmp_cell_zero(e);
+    jcc(e, CC_E, done);
+    emit_bounds_checked_offset(e, magnitude, is_right, rt);
+    mov64(e, CELL, RAX); // commit the checked address as the new cell pointer
+    jmp(e, top);
+    e.bind_here(done);
 }
 
 // ---------------------------------------------------------------------------
@@ -728,6 +846,39 @@ fn cmp_cell_zero(e: &mut Emitter) {
     e.bytes(&[0x41, 0x80, 0x3C, 0x24, 0x00]);
 }
 
+/// `movzx eax, byte ptr [r12]` — 41 0F B6 04 24. Zero-extends so the rest
+/// of `rax` is clean going into the multiply below (`mul` reads all of
+/// `al`, but a stale high bit anywhere else in the register would be a trap
+/// waiting for whoever next reads `rax`).
+fn movzx_al_cell(e: &mut Emitter) {
+    e.bytes(&[0x41, 0x0F, 0xB6, 0x04, 0x24]);
+}
+
+/// `test al, al` — 84 C0.
+fn test_al(e: &mut Emitter) {
+    e.bytes(&[0x84, 0xC0]);
+}
+
+/// `mov cl, imm8` — B1 ib.
+fn mov_cl_imm8(e: &mut Emitter, imm: u8) {
+    e.bytes(&[0xB1, imm]);
+}
+
+/// `mul cl` — F6 E1. Unsigned multiply: `ax = al * cl`. The op only ever
+/// needs the low byte of the product (`al`), which is exactly the mod-256
+/// wraparound `wrapping_mul` gives on the interpreter side — the discarded
+/// `ah` half is never read.
+fn mul_al_cl(e: &mut Emitter) {
+    e.bytes(&[0xF6, 0xE1]);
+}
+
+/// `add byte ptr [rdx], al` — 00 02. The 8-bit ALU add wraps mod 256 in
+/// hardware, same as every other cell write in this backend.
+fn add_al_to_mem(e: &mut Emitter, addr_reg: u8) {
+    debug_assert_eq!(addr_reg, RDX, "only rdx is wired as the mod/rm base here");
+    e.bytes(&[0x00, 0x02]);
+}
+
 /// `mov r64, r64` — REX.W[+R][+B] 89 11reg_rm.
 fn mov64(e: &mut Emitter, dst: u8, src: u8) {
     let (mut rex, s) = reg_field(src);
@@ -1097,6 +1248,48 @@ mod tests {
         assert_eq!(
             &module(&[Op::Zero], "linux-x86_64").code[..2],
             &[0x31, 0xFF]
+        );
+    }
+
+    #[test]
+    fn mul_add_emits_a_multiply_and_skips_on_zero() {
+        let ops = [Op::MulAdd {
+            offset: 1,
+            factor: 3,
+        }];
+        let m = module(&ops, "linux-x86_64");
+        // mul cl (F6 E1) must appear: the actual multiply this op exists for.
+        assert!(find(&m.code, &[0xF6, 0xE1]).is_some());
+        // add [rdx], al (00 02): the accumulate into the target cell.
+        assert!(find(&m.code, &[0x00, 0x02]).is_some());
+        // A conditional branch on the source cell's value must exist to
+        // skip the whole thing when it's already zero.
+        assert!(find(&m.code, &[0x84, 0xC0]).is_some()); // test al, al
+    }
+
+    #[test]
+    fn mul_add_negative_offset_checks_underflow() {
+        // A MulAdd with a negative offset must go through the same
+        // underflow path a MoveLeft would, landing on err_underflow.
+        let ops = [Op::MulAdd {
+            offset: -5,
+            factor: 1,
+        }];
+        let m = module(&ops, "linux-x86_64");
+        let underflow_msg = b"pointer moved left of cell 0";
+        assert!(find(&m.code, underflow_msg).is_some());
+    }
+
+    #[test]
+    fn scan_loops_back_to_its_own_start() {
+        // Scan must be a real loop: some branch's fixup target must be the
+        // scan op's own label (label 0, since it's the only op).
+        let ops = [Op::Scan { stride: 1 }];
+        let m = module(&ops, "linux-x86_64");
+        assert!(
+            m.fixups
+                .iter()
+                .any(|f| matches!(f.target, PatchTarget::Label(0)))
         );
     }
 }
