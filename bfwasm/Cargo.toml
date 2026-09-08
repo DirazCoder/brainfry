@@ -1,0 +1,8 @@
+[package]
+name = "bfwasm"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bfformat = { path = "../bfformat" }
+bfc = { path = "../bfc" }

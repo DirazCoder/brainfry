@@ -112,15 +112,13 @@ unsafe extern "C" {
 
 #[cfg(target_os = "windows")]
 fn windows_slots() -> Vec<usize> {
-    unsafe {
-        vec![
-            GetStdHandle as usize,
-            WriteFile as usize,
-            ReadFile as usize,
-            ExitProcess as usize,
-            VirtualAlloc as usize,
-        ]
-    }
+    vec![
+        GetStdHandle as *const () as usize,
+        WriteFile as *const () as usize,
+        ReadFile as *const () as usize,
+        ExitProcess as *const () as usize,
+        VirtualAlloc as *const () as usize,
+    ]
 }
 
 #[cfg(not(target_os = "windows"))]

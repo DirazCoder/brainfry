@@ -43,3 +43,11 @@ version = "0.1.0"
 dependencies = [
  "bfformat",
 ]
+
+[[package]]
+name = "bfwasm"
+version = "0.1.0"
+dependencies = [
+ "bfc",
+ "bfformat",
+]

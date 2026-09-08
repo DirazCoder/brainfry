@@ -46,7 +46,7 @@ jobs:
       - name: build
         shell: bash
         run: |
-          cargo build --release --target ${{ matrix.target }} -p bfc -p bfrun -p bfnative -p bfinterp -p bfjit
+          cargo build --release --target ${{ matrix.target }} -p bfc -p bfrun -p bfnative -p bfinterp -p bfjit -p bfwasm
 
       - name: codesign bfjit for JIT entitlement (macOS)
         if: runner.os == 'macOS'

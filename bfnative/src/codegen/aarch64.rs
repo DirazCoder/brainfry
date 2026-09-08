@@ -1014,16 +1014,6 @@ fn sub_sp_reg(e: &mut Emitter, rm: u32) {
     e.u32(0xCB20_0000 | (rm << 16) | 0x63FF);
 }
 
-/// `str x0, [sp]` — F90003E0.
-fn str_x0_sp(e: &mut Emitter) {
-    e.u32(0xF900_03E0);
-}
-
-/// `ldr x0, [sp]` — F94003E0.
-fn ldr_x0_sp(e: &mut Emitter) {
-    e.u32(0xF940_03E0);
-}
-
 /// `str x30, [sp]` — F90003FE. Grow's return-address save: `blr` overwrites
 /// x30, so a routine that calls and then returns must spill LR first.
 fn str_x30_sp(e: &mut Emitter) {

@@ -383,7 +383,7 @@ unsafe fn protect_exec(base: *mut u8, len: usize) -> Result<(), String> {
 #[cfg(target_os = "windows")]
 unsafe extern "C" {
     fn VirtualAlloc(
-        address: *const c_void,
+        address: *mut c_void,
         size: usize,
         allocation_type: u32,
         protect: u32,
@@ -414,7 +414,7 @@ mod windows {
 unsafe fn alloc_region(len: usize) -> Result<JitRegion, String> {
     unsafe {
         let ty = windows::MEM_COMMIT | windows::MEM_RESERVE;
-        let base = VirtualAlloc(core::ptr::null(), len, ty, windows::PAGE_READWRITE);
+        let base = VirtualAlloc(core::ptr::null_mut(), len, ty, windows::PAGE_READWRITE);
         if base.is_null() {
             return Err(format!(
                 "VirtualAlloc failed for JIT memory ({} bytes): {}",
