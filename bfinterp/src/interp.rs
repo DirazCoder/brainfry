@@ -121,12 +121,42 @@ pub fn run<R: Read, W: Write>(ops: &[Op], mut stdin: R, mut stdout: W) -> Result
                 }
             }
             Op::Zero => tape[cell] = 0,
+            Op::MulAdd { offset, factor } => {
+                let value = tape[cell];
+                if value != 0 {
+                    let target = offset_cell(cell, offset)?;
+                    if target >= tape.len() {
+                        tape.resize(target + 1, 0);
+                    }
+                    tape[target] = tape[target].wrapping_add(value.wrapping_mul(factor));
+                }
+                tape[cell] = 0;
+            }
+            Op::Scan { stride } => {
+                while tape[cell] != 0 {
+                    cell = offset_cell(cell, stride)?;
+                    if cell >= tape.len() {
+                        tape.resize(cell + 1, 0);
+                    }
+                }
+            }
         }
         pc += 1;
     }
 
     stdout.flush()?;
     Ok(())
+}
+
+/// Applies a signed offset to a cell index, erroring on underflow the same
+/// way `MoveLeft` does rather than silently wrapping.
+fn offset_cell(cell: usize, offset: i32) -> Result<usize, RunError> {
+    let new_cell = cell as i64 + offset as i64;
+    if new_cell < 0 {
+        Err(RunError::PointerUnderflow)
+    } else {
+        Ok(new_cell as usize)
+    }
 }
 
 #[cfg(test)]
