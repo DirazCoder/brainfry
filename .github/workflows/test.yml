@@ -249,8 +249,20 @@ jobs:
           $BIN = "target/aarch64-pc-windows-msvc/release"
           Push-Location $BIN
 
+          # [System.IO.File]::ReadAllBytes resolves relative paths against
+          # [Environment]::CurrentDirectory, which Push-Location does NOT
+          # update (it only moves PowerShell's own provider location) --
+          # so a relative path here silently reads against a stale cwd and
+          # throws "Could not find file". Resolve to an absolute path via
+          # Get-Location (which Push-Location does update) instead.
+          $exePath = Join-Path (Get-Location) "tests/hello_native.exe"
+
           Write-Host "::group::file size and first bytes"
-          $bytes = [System.IO.File]::ReadAllBytes("tests/hello_native.exe")
+          Write-Host "resolved exe path: $exePath"
+          if (-not (Test-Path $exePath)) {
+            Write-Host "FILE DOES NOT EXIST at that path"
+          }
+          $bytes = [System.IO.File]::ReadAllBytes($exePath)
           Write-Host "file size: $($bytes.Length)"
           Write-Host "first 4 bytes (MZ check): $([System.BitConverter]::ToString($bytes[0..3]))"
           Write-Host "::endgroup::"
@@ -278,17 +290,61 @@ jobs:
           Write-Host ("OptionalHeader magic: 0x{0:X4} (want 0x020B for PE32+)" -f $magic)
           Write-Host "::endgroup::"
 
+          Write-Host "::group::full section table (raw, not via dumpbin -- dumpbin has printed a header with zero fields for section #2 on prior runs)"
+          # Section table starts at 0x148, 40 bytes per entry, count = $numSections.
+          for ($i = 0; $i -lt $numSections; $i++) {
+            $h = 0x148 + 40 * $i
+            $secName = [System.Text.Encoding]::ASCII.GetString($bytes[$h..($h+7)]).TrimEnd([char]0)
+            $vsize = [System.BitConverter]::ToUInt32($bytes, $h + 8)
+            $rva = [System.BitConverter]::ToUInt32($bytes, $h + 12)
+            $rawSize = [System.BitConverter]::ToUInt32($bytes, $h + 16)
+            $rawOff = [System.BitConverter]::ToUInt32($bytes, $h + 20)
+            $secChar = [System.BitConverter]::ToUInt32($bytes, $h + 36)
+            Write-Host ("[{0}] name={1} vsize=0x{2:X} rva=0x{3:X} rawsize=0x{4:X} rawoff=0x{5:X} char=0x{6:X8}" -f $i, $secName, $vsize, $rva, $rawSize, $rawOff, $secChar)
+          }
+          Write-Host "::endgroup::"
+
+          Write-Host "::group::base relocation directory (raw bytes, since this is the newest change and least-tested)"
+          # Data directory 5 (BASERELOC) lives at optional-header-offset 112,
+          # i.e. file offset $optHdrOff + 112, as an (RVA:u32, Size:u32) pair.
+          $direntOff = $optHdrOff + 112 + (5 * 8)
+          $relocRva = [System.BitConverter]::ToUInt32($bytes, $direntOff)
+          $relocSize = [System.BitConverter]::ToUInt32($bytes, $direntOff + 4)
+          Write-Host ("BASERELOC dir: rva=0x{0:X} size=0x{1:X} (size should be a multiple of 4)" -f $relocRva, $relocSize)
+          Write-Host ("size % 4 == 0 ? {0}" -f ($relocSize % 4 -eq 0))
+          # Map that RVA to a file offset using the section table we just read.
+          $relocFileOff = $null
+          for ($i = 0; $i -lt $numSections; $i++) {
+            $h = 0x148 + 40 * $i
+            $vsize = [System.BitConverter]::ToUInt32($bytes, $h + 8)
+            $rva = [System.BitConverter]::ToUInt32($bytes, $h + 12)
+            $rawOff = [System.BitConverter]::ToUInt32($bytes, $h + 20)
+            if ($relocRva -ge $rva -and $relocRva -lt ($rva + $vsize)) {
+              $relocFileOff = $rawOff + ($relocRva - $rva)
+            }
+          }
+          if ($relocFileOff -ne $null -and $relocSize -gt 0) {
+            $relocBytes = $bytes[$relocFileOff..($relocFileOff + $relocSize - 1)]
+            Write-Host "raw .reloc directory bytes: $([System.BitConverter]::ToString($relocBytes))"
+            $blockRva = [System.BitConverter]::ToUInt32($bytes, $relocFileOff)
+            $blockSize = [System.BitConverter]::ToUInt32($bytes, $relocFileOff + 4)
+            Write-Host ("block: page_rva=0x{0:X} size_of_block=0x{1:X} (should be multiple of 4)" -f $blockRva, $blockSize)
+          } else {
+            Write-Host "could not map BASERELOC rva to a file offset, or size is 0"
+          }
+          Write-Host "::endgroup::"
+
           Write-Host "::group::dumpbin /headers (MSVC's own PE parser, if available)"
           $dumpbin = Get-Command dumpbin -ErrorAction SilentlyContinue
           if ($dumpbin) {
-            & dumpbin /headers tests/hello_native.exe 2>&1 | Select-Object -First 80
+            & dumpbin /headers $exePath 2>&1 | Select-Object -First 120
           } else {
             Write-Host "dumpbin not on PATH -- trying vswhere to locate it"
             $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
             if (Test-Path $vswhere) {
               $vsPath = & $vswhere -latest -products * -find "VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" | Select-Object -First 1
               if ($vsPath) {
-                & $vsPath /headers tests/hello_native.exe 2>&1 | Select-Object -First 80
+                & $vsPath /headers $exePath 2>&1 | Select-Object -First 120
               } else {
                 Write-Host "dumpbin.exe not found via vswhere either"
               }
@@ -300,7 +356,7 @@ jobs:
 
           Write-Host "::group::running the binary directly, capturing exit code and error"
           try {
-            $proc = Start-Process -FilePath ".\tests\hello_native.exe" -NoNewWindow -Wait -PassThru -RedirectStandardError "stderr.txt" -RedirectStandardOutput "stdout.txt"
+            $proc = Start-Process -FilePath $exePath -NoNewWindow -Wait -PassThru -RedirectStandardError "stderr.txt" -RedirectStandardOutput "stdout.txt"
             Write-Host "exit code: $($proc.ExitCode)"
           } catch {
             Write-Host "Start-Process threw: $($_.Exception.Message)"

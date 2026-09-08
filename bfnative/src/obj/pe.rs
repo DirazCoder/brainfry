@@ -97,8 +97,13 @@ pub fn build(module: &mut Module, arch: Arch) -> (Vec<u8>, Layout) {
     // padding entry PE emitters use when there's genuinely nothing to
     // relocate. The table only has to exist and be well-formed; the
     // loader only walks it if it actually has to rebase.
+    //
+    // SizeOfBlock must be a multiple of 4 (blocks are walked by adding
+    // this field to advance to the next one), so an 8-byte header plus a
+    // single 2-byte entry (10 bytes total) is malformed -- it must be
+    // padded with a second, all-zero entry to reach 12 bytes.
     let reloc_rva = idata_rva + align_up(idata_vsize, SECTION_ALIGN);
-    const RELOC_BLOCK_SIZE: u64 = 8 + 2; // header (VirtualAddress, SizeOfBlock) + one u16 entry
+    const RELOC_BLOCK_SIZE: u64 = 8 + 2 + 2; // header + one real entry + one zero-pad entry
     let reloc_vsize = RELOC_BLOCK_SIZE;
     let reloc_raw = align_up(reloc_vsize, FILE_ALIGN);
     let reloc_fileoff = align_up(idata_fileoff + idata_raw, FILE_ALIGN);
@@ -302,6 +307,7 @@ pub fn build(module: &mut Module, arch: Arch) -> (Vec<u8>, Layout) {
     out.extend_from_slice(&(SECTION_RVA as u32).to_le_bytes()); // Page RVA
     out.extend_from_slice(&(RELOC_BLOCK_SIZE as u32).to_le_bytes()); // SizeOfBlock
     out.extend_from_slice(&0u16.to_le_bytes()); // type 0 (ABSOLUTE) << 12 | offset 0
+    out.extend_from_slice(&0u16.to_le_bytes()); // pad entry so SizeOfBlock is 4-byte aligned
     while (out.len() as u64) < reloc_fileoff + reloc_raw {
         out.push(0);
     }
