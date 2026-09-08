@@ -408,7 +408,7 @@ pub fn build(module: &mut Module, arch: Arch, image_name: &str) -> (Vec<u8>, Lay
     out.extend_from_slice(&0u32.to_le_bytes()); // teamOffset
     out.extend_from_slice(&0u64.to_le_bytes()); // spare3
     out.extend_from_slice(&0u64.to_le_bytes()); // codeLimit64
-    out.extend_from_slice(&0u64.to_le_bytes()); // execSegBase
+    out.extend_from_slice(&pagezero.to_le_bytes()); // execSegBase
     out.extend_from_slice(&text_vmsize.to_le_bytes()); // execSegLimit
     out.extend_from_slice(&CS_EXECSEG_MAIN_BINARY.to_le_bytes());
     debug_assert_eq!(out.len() - dataoff as usize, (20 + CD_HEADER_SIZE) as usize);
