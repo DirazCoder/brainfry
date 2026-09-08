@@ -70,6 +70,11 @@ impl Program {
                     out.write_all(&target.to_le_bytes())?
                 }
                 Op::Output | Op::Input | Op::Zero => {}
+                Op::MulAdd { offset, factor } => {
+                    out.write_all(&offset.to_le_bytes())?;
+                    out.write_all(&[*factor])?;
+                }
+                Op::Scan { stride } => out.write_all(&stride.to_le_bytes())?,
             }
         }
 
@@ -128,6 +133,13 @@ fn read_op<R: Read>(input: &mut R) -> Result<Op, FormatError> {
             target: read_u32(input)?,
         },
         8 => Op::Zero,
+        9 => Op::MulAdd {
+            offset: read_i32(input)?,
+            factor: read_u8(input)?,
+        },
+        10 => Op::Scan {
+            stride: read_i32(input)?,
+        },
         other => return Err(FormatError::UnknownOpTag(other)),
     };
 
@@ -150,6 +162,14 @@ fn read_u32<R: Read>(input: &mut R) -> Result<u32, FormatError> {
     Ok(u32::from_le_bytes(buf))
 }
 
+fn read_i32<R: Read>(input: &mut R) -> Result<i32, FormatError> {
+    let mut buf = [0u8; 4];
+    input
+        .read_exact(&mut buf)
+        .map_err(|_| FormatError::Truncated)?;
+    Ok(i32::from_le_bytes(buf))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -164,6 +184,33 @@ mod tests {
                 Op::Output,
                 Op::JumpIfNonZero { target: 1 },
                 Op::Zero,
+                Op::MulAdd {
+                    offset: 2,
+                    factor: 3,
+                },
+                Op::Scan { stride: 1 },
+            ],
+        };
+
+        let mut bytes = Vec::new();
+        program.write_to(&mut bytes).unwrap();
+
+        let restored = Program::read_from(&bytes[..]).unwrap();
+        assert_eq!(restored.ops, program.ops);
+    }
+
+    #[test]
+    fn round_trips_negative_offset_and_stride() {
+        // offset/stride are the first signed fields in the format -- the
+        // original round-trip test only used positive values, which
+        // wouldn't have caught a sign-extension bug in read_i32/to_le_bytes.
+        let program = Program {
+            ops: vec![
+                Op::MulAdd {
+                    offset: -7,
+                    factor: 255,
+                },
+                Op::Scan { stride: -3 },
             ],
         };
 
