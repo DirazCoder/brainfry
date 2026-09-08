@@ -120,6 +120,64 @@ jobs:
           test "$out_interp" = "$out_native"   || { echo "FAIL: bfnative disagrees with bfinterp"; exit 1; }
           echo "PASS: all execution paths (bfjit excluded) agree on hello world"
 
+      # Temporary: isolates why bfnative's macOS binary gets SIGKILLed.
+      # Runs codesign verification (same check the kernel does) before
+      # execution, then captures amfid/kernel denial logs around the
+      # actual run so the failure reason can't get lost in a truncated
+      # GHA log or swallowed by set -e.
+      - name: debug bfnative macOS crash
+        if: always() && runner.os == 'macOS'
+        shell: bash
+        run: |
+          set +e
+          BIN="target/${{ matrix.target }}/release"
+          cd "$BIN"
+
+          echo "::group::file(1)"
+          file tests/hello_native
+          echo "::endgroup::"
+
+          echo "::group::codesign -dvvv (static signature inspection)"
+          codesign -dvvv tests/hello_native
+          echo "exit: $?"
+          echo "::endgroup::"
+
+          echo "::group::codesign --verify --deep --strict --verbose=4 (kernel-equivalent check)"
+          codesign --verify --deep --strict --verbose=4 tests/hello_native
+          echo "exit: $?"
+          echo "::endgroup::"
+
+          echo "::group::spctl -a -vv (Gatekeeper assessment)"
+          spctl -a -vv tests/hello_native
+          echo "exit: $?"
+          echo "::endgroup::"
+
+          echo "::group::running the binary directly, capturing exit code"
+          START_TS=$(date -u +"%Y-%m-%d %H:%M:%S")
+          ./tests/hello_native
+          RUN_EXIT=$?
+          echo "run exit code: $RUN_EXIT"
+          echo "::endgroup::"
+
+          if [ "$RUN_EXIT" -ne 0 ]; then
+            echo "::group::log show (kernel/amfid denial reason, since $START_TS)"
+            # AMFI/codesigning kills show up in the unified log even when
+            # nothing is written to stdout/stderr. --info/--debug widen
+            # the net since denial messages are sometimes below default
+            # verbosity.
+            log show --start "$START_TS" --predicate \
+              '(process == "amfid") OR (process == "kernel" AND eventMessage CONTAINS "hello_native") OR (eventMessage CONTAINS "hello_native")' \
+              --info --debug 2>&1 | tail -200
+            echo "::endgroup::"
+
+            echo "::group::log show (broader taskgated/Security fallback)"
+            log show --start "$START_TS" --predicate \
+              'subsystem == "com.apple.securityd" OR process == "taskgated" OR process == "syspolicyd"' \
+              --info --debug 2>&1 | tail -200
+            echo "::endgroup::"
+          fi
+          set -e
+
       - name: 8-bit wraparound
         shell: bash
         run: |
