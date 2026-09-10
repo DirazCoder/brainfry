@@ -283,6 +283,20 @@ jobs:
           echo "exit: $?"
           echo "::endgroup::"
 
+          echo "::group::rcodesign print-signature-info on baseline (real ld64 output, for direct exec-segment-field comparison)"
+          # Every fix so far (LC_LOAD_DYLINKER, LC_UUID, minos/sdk) was
+          # confirmed via otool -l diffing against baseline, but this is
+          # the one field group (execSegFlags/execSegBase/execSegLimit,
+          # inside the CodeDirectory itself) that only rcodesign surfaces,
+          # and it was never run against baseline in any prior round --
+          # only against hello_native. Since these are the fields this
+          # codebase's own comments say already caused one prior
+          # arm64-relevant kernel-rejection bug, get the real ld64
+          # baseline for them before guessing again.
+          "$RC" print-signature-info /tmp/baseline
+          echo "exit: $?"
+          echo "::endgroup::"
+
           echo "::group::codesign -dvvv (static signature inspection)"
           codesign -dvvv tests/hello_native
           echo "exit: $?"
