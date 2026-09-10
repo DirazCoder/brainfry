@@ -139,10 +139,18 @@ pub fn build(module: &mut Module, arch: Arch, image_name: &str) -> (Vec<u8>, Lay
         Arch::X86_64 => 0x1000,
         Arch::Aarch64 => 0x4000,
     };
-    let page_log2: u8 = match arch {
-        Arch::X86_64 => 12,
-        Arch::Aarch64 => 14,
-    };
+    // CodeDirectory hash-page size is a separate knob from segment/VM
+    // alignment above, and real ld64 keeps it at 4K on both arches --
+    // confirmed against a same-runner arm64 baseline (`rcodesign
+    // print-signature-info` reports pageSize=4096, not 16384) even
+    // though arm64's actual VM page size is 16K. Reusing `page`/
+    // `page_log2` for both was wrong: it made hello_native's arm64
+    // CodeDirectory claim 16K hash granularity while everything else
+    // on the system, including the kernel's own signature evaluator,
+    // expects 4K here. Segment alignment (`page` above) still needs
+    // to stay arch-dependent; only the signature's hashing unit doesn't.
+    const CD_PAGE: u64 = 0x1000;
+    const CD_PAGE_LOG2: u8 = 12;
     // 4 GiB PAGEZERO on both arches — matches what ld64 emits (checked
     // against real arm64 and x86_64 macOS binaries). dyld only requires a
     // page-multiple guard segment, but staying on the standard keeps
@@ -447,7 +455,7 @@ pub fn build(module: &mut Module, arch: Arch, image_name: &str) -> (Vec<u8>, Lay
     let ident = sanitize_ident(image_name);
     let ident_len = ident.len() as u64 + 1; // NUL
     let hash_offset = align_up(CD_HEADER_SIZE + ident_len, 8);
-    let n_code_slots = code_limit.div_ceil(page);
+    let n_code_slots = code_limit.div_ceil(CD_PAGE);
     let cd_length = (hash_offset + 32 * n_code_slots) as u32;
     // A prior version of this code emitted an empty CMS BlobWrapper slot
     // here, on the theory that AMFI hard-fails ad-hoc signatures that
@@ -512,7 +520,7 @@ pub fn build(module: &mut Module, arch: Arch, image_name: &str) -> (Vec<u8>, Lay
     out.push(32); // hashSize
     out.push(CSHASH_SHA256);
     out.push(0); // platform
-    out.push(page_log2);
+    out.push(CD_PAGE_LOG2);
     out.extend_from_slice(&0u32.to_be_bytes()); // spare2
     out.extend_from_slice(&0u32.to_be_bytes()); // scatterOffset
     out.extend_from_slice(&0u32.to_be_bytes()); // teamOffset
@@ -565,7 +573,7 @@ pub fn build(module: &mut Module, arch: Arch, image_name: &str) -> (Vec<u8>, Lay
     // SHA-256 over each page of [0, codeLimit).
     let mut hashed = 0usize;
     while hashed < code_limit as usize {
-        let end = (hashed + page as usize).min(code_limit as usize);
+        let end = (hashed + CD_PAGE as usize).min(code_limit as usize);
         let hash = crate::sha256::digest(&out[hashed..end]);
         out.extend_from_slice(&hash);
         hashed = end;
@@ -749,7 +757,11 @@ mod tests {
     fn code_signature_hashes_reverify() {
         for name in ["macos-x86_64", "macos-aarch64"] {
             let bytes = build_for(&[bfformat::Op::Zero], name);
-            let page = page_for(name);
+            // The CodeDirectory's hash-page size is fixed at 4K on both
+            // arches (matches real ld64 output; see CD_PAGE in build()) --
+            // distinct from `page_for`'s segment/VM alignment, which is
+            // arch-dependent (16K on arm64). Don't reuse the latter here.
+            let cd_page: u64 = 0x1000;
             // Walk to LC_CODE_SIGNATURE and re-verify every page hash.
             let ncmds = u32::from_le_bytes(bytes[16..20].try_into().unwrap());
             let sizeofcmds = u32::from_le_bytes(bytes[20..24].try_into().unwrap()) as usize;
@@ -801,7 +813,7 @@ mod tests {
             let code_limit =
                 u32::from_be_bytes(bytes[cd + 32..cd + 36].try_into().unwrap()) as usize;
             let page_log2 = bytes[cd + 39];
-            assert_eq!(page_log2, if page == 0x1000 { 12 } else { 14 });
+            assert_eq!(page_log2, 12, "CodeDirectory hash page is always 4K, on both arches");
             let hash_offset =
                 u32::from_be_bytes(bytes[cd + 16..cd + 20].try_into().unwrap()) as usize;
             let n_code_slots =
@@ -812,12 +824,12 @@ mod tests {
             assert_eq!(code_limit, dataoff);
             assert_eq!(
                 n_code_slots,
-                (code_limit as u64 + page - 1) as usize / page as usize
+                (code_limit as u64 + cd_page - 1) as usize / cd_page as usize
             );
 
             for slot in 0..n_code_slots {
-                let start = slot * page as usize;
-                let end = ((slot + 1) * page as usize).min(code_limit);
+                let start = slot * cd_page as usize;
+                let end = ((slot + 1) * cd_page as usize).min(code_limit);
                 let expected = crate::sha256::digest(&bytes[start..end]);
                 let actual: [u8; 32] = bytes
                     [cd + hash_offset + slot * 32..cd + hash_offset + slot * 32 + 32]
