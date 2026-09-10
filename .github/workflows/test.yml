@@ -312,6 +312,55 @@ jobs:
           echo "exit: $?"
           echo "::endgroup::"
 
+          echo "::group::otool -fixup_chains baseline (chained fixups, since baseline has them)"
+          otool -fixup_chains /tmp/baseline 2>&1
+          echo "exit: $?"
+          echo "::endgroup::"
+
+          echo "::group::dyld_info baseline (fixups/exports/binds via ld64's own inspector)"
+          # Everything the code signature can express (flags, exec-segment
+          # fields, blob shape, minos/sdk, LC_UUID) now matches baseline
+          # byte-for-byte per the last three rounds of rcodesign diffing,
+          # and hello_native still dies. So the signature is very likely
+          # not the actual cause -- the AMFI "adhoc signed or unknown
+          # cert chain" message may just be what gets logged for *any*
+          # image-activation failure at that stage, not the literal
+          # reason. The last unexamined structural difference is the bind
+          # mechanism itself: baseline uses LC_DYLD_CHAINED_FIXUPS +
+          # LC_DYLD_EXPORTS_TRIE (the current, required-on-modern-arm64
+          # format), hello_native still emits the legacy
+          # LC_DYLD_INFO_ONLY bind-opcode stream. dyld_info shows what
+          # ld64 actually encodes there, to compare against by hand.
+          if command -v dyld_info >/dev/null 2>&1; then
+            dyld_info -fixups -exports /tmp/baseline 2>&1
+          else
+            echo "dyld_info not present on this runner"
+          fi
+          echo "::endgroup::"
+
+          echo "::group::otool -fixup_chains hello_native (expect: not applicable, uses LC_DYLD_INFO_ONLY)"
+          otool -fixup_chains tests/hello_native 2>&1
+          echo "exit: $?"
+          echo "::endgroup::"
+
+          echo "::group::otool -dyld_info hello_native (decode the legacy bind-opcode stream)"
+          otool -dyld_info tests/hello_native 2>&1
+          echo "exit: $?"
+          echo "::endgroup::"
+
+          echo "::group::control experiment 3: hello_native with signature stripped entirely (unsigned, like x86_64's baseline)"
+          # x86_64's baseline has no LC_CODE_SIGNATURE at all and runs
+          # fine; the working assumption has been that arm64 requires
+          # *some* signature to exec at all (documented Apple behavior).
+          # Cheap to actually check rather than keep assuming, now that
+          # every signed variant we've tried still dies.
+          cp tests/hello_native /tmp/hello_native_unsigned
+          codesign --remove-signature /tmp/hello_native_unsigned
+          chmod +x /tmp/hello_native_unsigned
+          /tmp/hello_native_unsigned
+          echo "unsigned hello_native exit code: $?"
+          echo "::endgroup::"
+
           echo "::group::running the binary directly, capturing exit code"
           # Start a *live* log stream before the run, not a post-hoc `log
           # show --start`. log show queries the log database after the
