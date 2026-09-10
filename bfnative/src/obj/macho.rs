@@ -476,13 +476,21 @@ pub fn build(module: &mut Module, arch: Arch, image_name: &str) -> (Vec<u8>, Lay
     let sig_pos = codesig_cmd_pos + 8;
     out[sig_pos..sig_pos + 4].copy_from_slice(&(dataoff as u32).to_le_bytes());
     out[sig_pos + 4..sig_pos + 8].copy_from_slice(&datasize.to_le_bytes());
-    let linkedit_size = dataoff + datasize as u64 - linkedit_fileoff;
+    let linkedit_filesize = dataoff + datasize as u64 - linkedit_fileoff;
+    // vmsize is a virtual-memory extent, not a byte count, and real ld64
+    // always page-rounds it -- confirmed against a same-runner baseline,
+    // whose __LINKEDIT vmsize is 0x4000 even though its filesize is only
+    // 664 bytes. __TEXT and __DATA already round their own vmsize up via
+    // align_up(..., page) above; __LINKEDIT was the one segment skipping
+    // that and shipping an exact byte count (0x250) as vmsize instead,
+    // unlike every other segment in this same file.
+    let linkedit_vmsize = align_up(linkedit_filesize, page);
     let le = linkedit_cmd_pos;
-    out[le + SEG_VMSIZE_OFF..le + SEG_VMSIZE_OFF + 8].copy_from_slice(&linkedit_size.to_le_bytes());
+    out[le + SEG_VMSIZE_OFF..le + SEG_VMSIZE_OFF + 8].copy_from_slice(&linkedit_vmsize.to_le_bytes());
     out[le + SEG_FILEOFF_OFF..le + SEG_FILEOFF_OFF + 8]
         .copy_from_slice(&linkedit_fileoff.to_le_bytes());
     out[le + SEG_FILESIZE_OFF..le + SEG_FILESIZE_OFF + 8]
-        .copy_from_slice(&linkedit_size.to_le_bytes());
+        .copy_from_slice(&linkedit_filesize.to_le_bytes());
 
     // SuperBlob: header + CodeDirectory (no CMS slot -- see note above).
     //
