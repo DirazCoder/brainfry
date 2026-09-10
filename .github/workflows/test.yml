@@ -230,24 +230,33 @@ jobs:
           # bytes directly -- this bypasses every Apple tool's interpretation
           # and shows exactly what's on disk, so a wrong-endianness or
           # wrong-offset bug is visible instead of hidden behind a generic
-          # "not signed" message.
+          # "not signed" message. Also independently recomputes every page
+          # hash and diffs it against what's actually stored in the
+          # CodeDirectory -- rcodesign reporting the blob as parseable
+          # doesn't guarantee the hashes are correct, only that the format
+          # is well-formed. Runs against both hello_native and baseline so
+          # a real side-by-side is possible instead of trusting either
+          # tool's summary alone.
           python3 - <<'PYEOF'
-          import struct
-          with open("tests/hello_native", "rb") as f:
-              data = f.read()
-          magic, cputype, cpusubtype, filetype, ncmds, sizeofcmds, flags = struct.unpack_from('<7I', data, 0)
-          print(f"mach_header: magic={magic:#x} ncmds={ncmds} sizeofcmds={sizeofcmds} filesize={len(data)}")
-          pos = 32
-          dataoff = datasize = None
-          for i in range(ncmds):
-              cmd, cmdsize = struct.unpack_from('<II', data, pos)
-              if cmd == 0x1D:  # LC_CODE_SIGNATURE
-                  dataoff, datasize = struct.unpack_from('<II', data, pos + 8)
-                  print(f"LC_CODE_SIGNATURE: dataoff={dataoff:#x} datasize={datasize} (cmd #{i} at file offset {pos:#x})")
-              pos += cmdsize
-          if dataoff is None:
-              print("!! no LC_CODE_SIGNATURE load command found at all")
-          else:
+          import struct, hashlib
+
+          def inspect(path):
+              print(f"--- {path} ---")
+              with open(path, "rb") as f:
+                  data = f.read()
+              magic, cputype, cpusubtype, filetype, ncmds, sizeofcmds, flags = struct.unpack_from('<7I', data, 0)
+              print(f"mach_header: magic={magic:#x} ncmds={ncmds} sizeofcmds={sizeofcmds} filesize={len(data)}")
+              pos = 32
+              dataoff = datasize = None
+              for i in range(ncmds):
+                  cmd, cmdsize = struct.unpack_from('<II', data, pos)
+                  if cmd == 0x1D:  # LC_CODE_SIGNATURE
+                      dataoff, datasize = struct.unpack_from('<II', data, pos + 8)
+                      print(f"LC_CODE_SIGNATURE: dataoff={dataoff:#x} datasize={datasize} (cmd #{i} at file offset {pos:#x})")
+                  pos += cmdsize
+              if dataoff is None:
+                  print("!! no LC_CODE_SIGNATURE load command found at all")
+                  return
               print(f"file length vs dataoff+datasize: {len(data)} vs {dataoff+datasize} "
                     f"({'MATCH' if len(data) == dataoff+datasize else 'MISMATCH -- truncated or overrun'})")
               blob = data[dataoff:dataoff+min(datasize, 256)]
@@ -259,6 +268,43 @@ jobs:
               magic_be = struct.unpack_from('>I', data, dataoff)[0] if len(data) >= dataoff + 4 else None
               magic_le = struct.unpack_from('<I', data, dataoff)[0] if len(data) >= dataoff + 4 else None
               print(f"SuperBlob magic as BE: {magic_be:#x} (want 0xfade0cc0)  as LE: {magic_le:#x}")
+
+              # SuperBlob header (big-endian per cscdefs.h).
+              sb_magic, sb_length, sb_count = struct.unpack_from('>III', data, dataoff)
+              print(f"SuperBlob: magic={sb_magic:#x} length={sb_length} count={sb_count}")
+              blob_type, blob_off = struct.unpack_from('>II', data, dataoff + 12)
+              cd_off = dataoff + blob_off
+              cd_magic, cd_length, cd_version, cd_flags = struct.unpack_from('>IIII', data, cd_off)
+              hash_offset, ident_offset, n_special, n_code, code_limit = struct.unpack_from('>IIIII', data, cd_off + 16)
+              hash_size = data[cd_off + 36]
+              hash_type = data[cd_off + 37]
+              page_log2 = data[cd_off + 39]
+              page_size = 1 << page_log2
+              print(f"CodeDirectory: magic={cd_magic:#x} length={cd_length} version={cd_version:#x} "
+                    f"flags={cd_flags:#x} hashOffset={hash_offset} identOffset={ident_offset} "
+                    f"nSpecial={n_special} nCode={n_code} codeLimit={code_limit} hashSize={hash_size} "
+                    f"hashType={hash_type} pageSize={page_size}")
+
+              # Independently recompute every code-slot hash from the raw
+              # file bytes and compare against what's stored -- this is the
+              # actual claim to test ("incorrect page hashes"), not just
+              # whether the blob parses.
+              mismatches = 0
+              for slot in range(n_code):
+                  start = slot * page_size
+                  end = min(start + page_size, code_limit)
+                  computed = hashlib.sha256(data[start:end]).digest()
+                  stored_off = cd_off + hash_offset + slot * hash_size
+                  stored = data[stored_off:stored_off + hash_size]
+                  if computed[:hash_size] != stored:
+                      mismatches += 1
+                      print(f"  !! page {slot} hash MISMATCH: computed={computed[:hash_size].hex()} stored={stored.hex()}")
+              print(f"page hash check: {n_code} slots, {mismatches} mismatches "
+                    f"({'ALL CORRECT' if mismatches == 0 else 'REAL DEFECT FOUND'})")
+
+          inspect("tests/hello_native")
+          print()
+          inspect("/tmp/baseline")
           PYEOF
           echo "::endgroup::"
 
