@@ -94,7 +94,12 @@ const BIND_OPCODE_DONE: u8 = 0x00;
 // Code signature constants (codesign.h).
 const CSMAGIC_CODEDIRECTORY: u32 = 0xFADE_0C02;
 const CSMAGIC_EMBEDDED_SIGNATURE: u32 = 0xFADE_0CC0;
+// Unused since the CMS BlobWrapper slot was removed (real ld64 ad-hoc
+// signatures on this runner don't carry one -- see build()). Kept for
+// reference/documentation of the format.
+#[allow(dead_code)]
 const CSMAGIC_BLOBWRAPPER: u32 = 0xFADE_0B01;
+#[allow(dead_code)]
 const CSSLOT_SIGNATURESLOT: u32 = 0x0001_0000;
 const CS_ADHOC: u32 = 0x0000_0002;
 // "Automatically signed by the linker" (xnu cs_blobs.h). bfnative *is* the
@@ -444,15 +449,15 @@ pub fn build(module: &mut Module, arch: Arch, image_name: &str) -> (Vec<u8>, Lay
     let hash_offset = align_up(CD_HEADER_SIZE + ident_len, 8);
     let n_code_slots = code_limit.div_ceil(page);
     let cd_length = (hash_offset + 32 * n_code_slots) as u32;
-    // Modern AMFI (observed on macOS 14+) hard-fails ad-hoc signatures
-    // that omit the CMS slot entirely -- it logs "has no CMS blob?" and
-    // kills the process at exec, even though CS_ADHOC never carries a
-    // real CMS signature. Apple's own codesign always emits an empty
-    // BlobWrapper here for ad-hoc signing (kSecCodeInfoCMS is documented
-    // as "empty for ad-hoc signed code", not absent). So: two blobs
-    // (CodeDirectory + empty CMS), two BlobIndex entries.
-    let cms_blob_length = 8u32; // GenericBlob header only, zero-length data
-    let superblob_length = 12 + 2 * 8 + cd_length + cms_blob_length;
+    // A prior version of this code emitted an empty CMS BlobWrapper slot
+    // here, on the theory that AMFI hard-fails ad-hoc signatures that
+    // omit it. That's contradicted by direct, same-runner evidence: a
+    // baseline binary built by the system's own `cc`/ld64 on this exact
+    // CI image has blob_count=1 (CodeDirectory only, no CMS slot at all)
+    // per `rcodesign print-signature-info`, and it runs fine. Real ld64
+    // ad-hoc signing does not add a CMS blob. Matching that shape here:
+    // one blob (CodeDirectory), one BlobIndex entry.
+    let superblob_length = 12 + 1 * 8 + cd_length;
     let datasize = align_up(superblob_length as u64, 16) as u32;
 
     // Patch LC_CODE_SIGNATURE and __LINKEDIT sizes BEFORE hashing any
@@ -471,7 +476,7 @@ pub fn build(module: &mut Module, arch: Arch, image_name: &str) -> (Vec<u8>, Lay
     out[le + SEG_FILESIZE_OFF..le + SEG_FILESIZE_OFF + 8]
         .copy_from_slice(&linkedit_size.to_le_bytes());
 
-    // SuperBlob: header + CodeDirectory + empty CMS wrapper.
+    // SuperBlob: header + CodeDirectory (no CMS slot -- see note above).
     //
     // Code-signing blobs are the one part of this file that isn't
     // native-endian: cscdefs.h specifies every multi-byte field here as
@@ -484,16 +489,15 @@ pub fn build(module: &mut Module, arch: Arch, image_name: &str) -> (Vec<u8>, Lay
     // flagging any specific field as wrong.
     //
     // CD_START is the CodeDirectory's offset from the start of the
-    // SuperBlob: a 12-byte SuperBlob header followed by two 8-byte
-    // BlobIndex entries (CodeDirectory, then CMS).
-    const CD_START: u32 = 12 + 2 * 8;
+    // SuperBlob: a 12-byte SuperBlob header followed by one 8-byte
+    // BlobIndex entry (CodeDirectory only -- see note above on why
+    // there's no separate CMS slot).
+    const CD_START: u32 = 12 + 1 * 8;
     out.extend_from_slice(&CSMAGIC_EMBEDDED_SIGNATURE.to_be_bytes());
     out.extend_from_slice(&superblob_length.to_be_bytes());
-    out.extend_from_slice(&2u32.to_be_bytes()); // count: CodeDirectory + CMS
+    out.extend_from_slice(&1u32.to_be_bytes()); // count: CodeDirectory only
     out.extend_from_slice(&0u32.to_be_bytes()); // slot 0 type: CodeDirectory
     out.extend_from_slice(&CD_START.to_be_bytes()); // slot 0 offset
-    out.extend_from_slice(&CSSLOT_SIGNATURESLOT.to_be_bytes()); // slot 1 type: CMS
-    out.extend_from_slice(&(CD_START + cd_length).to_be_bytes()); // slot 1 offset
 
     // CodeDirectory v0x20400.
     out.extend_from_slice(&CSMAGIC_CODEDIRECTORY.to_be_bytes());
@@ -552,8 +556,8 @@ pub fn build(module: &mut Module, arch: Arch, image_name: &str) -> (Vec<u8>, Lay
     out.extend_from_slice(ident.as_bytes());
     out.push(0);
     // hash_offset is relative to the CodeDirectory, which starts CD_START
-    // bytes into the blob (after the SuperBlob header + both index
-    // entries) — pad relative to cd.
+    // bytes into the blob (after the SuperBlob header + the one index
+    // entry) — pad relative to cd.
     while (out.len() as u64) < dataoff + CD_START as u64 + hash_offset {
         out.push(0);
     }
@@ -569,19 +573,11 @@ pub fn build(module: &mut Module, arch: Arch, image_name: &str) -> (Vec<u8>, Lay
     debug_assert_eq!(
         out.len() - dataoff as usize,
         (CD_START + cd_length) as usize,
-        "CodeDirectory ends exactly where the CMS BlobIndex said it would"
+        "CodeDirectory ends exactly where the SuperBlob length said it would"
     );
 
-    // Empty CMS blob. CS_ADHOC never carries a real CMS signature, but
-    // modern AMFI (observed on macOS 14+) hard-kills any process whose
-    // signature omits the slot entirely -- it logs "has no CMS blob?"
-    // and treats the whole signature as unrecoverable, even though the
-    // CodeDirectory itself is well-formed. Apple's own codesign always
-    // writes this as an empty GenericBlob (magic + length, no data) for
-    // ad-hoc signing; kSecCodeInfoCMS is documented as "empty for
-    // ad-hoc signed code", not absent.
-    out.extend_from_slice(&CSMAGIC_BLOBWRAPPER.to_be_bytes());
-    out.extend_from_slice(&8u32.to_be_bytes()); // length: header only, no data
+    // No CMS blob is written -- see the note at superblob_length above.
+    // baseline's CodeDirectory ends the SuperBlob; ours does the same now.
 
     // Pad the signature to datasize.
     while (out.len() - dataoff as usize) < datasize as usize {
@@ -786,18 +782,16 @@ mod tests {
                 u32::from_be_bytes(bytes[sb..sb + 4].try_into().unwrap()),
                 CSMAGIC_EMBEDDED_SIGNATURE
             );
-            // SuperBlob header (12 bytes) + two 8-byte BlobIndex entries
-            // (CodeDirectory, then CMS) precede the CodeDirectory itself.
+            // SuperBlob header (12 bytes) + one 8-byte BlobIndex entry
+            // (CodeDirectory) precede the CodeDirectory itself. (No CMS
+            // slot: real ld64 ad-hoc signing doesn't emit one either --
+            // see the comment above superblob_length in build().)
             let count = u32::from_be_bytes(bytes[sb + 8..sb + 12].try_into().unwrap());
-            assert_eq!(count, 2, "CodeDirectory + empty CMS blob");
+            assert_eq!(count, 1, "CodeDirectory only, no CMS blob");
             let cd_index_off =
                 u32::from_be_bytes(bytes[sb + 16..sb + 20].try_into().unwrap()) as usize;
-            let cms_slot_type = u32::from_be_bytes(bytes[sb + 20..sb + 24].try_into().unwrap());
-            assert_eq!(cms_slot_type, CSSLOT_SIGNATURESLOT, "slot 1 is the CMS signature slot");
-            let cms_index_off =
-                u32::from_be_bytes(bytes[sb + 24..sb + 28].try_into().unwrap()) as usize;
             let cd_off = sb + cd_index_off;
-            assert_eq!(cd_off, sb + 28, "CodeDirectory starts right after both BlobIndex entries");
+            assert_eq!(cd_off, sb + 20, "CodeDirectory starts right after the one BlobIndex entry");
             assert_eq!(
                 u32::from_be_bytes(bytes[cd_off..cd_off + 4].try_into().unwrap()),
                 CSMAGIC_CODEDIRECTORY
@@ -832,27 +826,17 @@ mod tests {
                 assert_eq!(expected, actual, "page {slot} hash mismatch");
             }
 
-            // Empty CMS BlobWrapper. Its BlobIndex offset should land
-            // exactly where the CodeDirectory's own length says it ends
-            // (hash_offset + one hash per code slot), and the blob itself
-            // is just an 8-byte header (magic + length) with no payload --
-            // AMFI on macOS 14+ requires the slot to be present even
-            // though CS_ADHOC never carries a real signature.
+            // The CodeDirectory is the last thing in the SuperBlob now
+            // (no trailing CMS blob) -- its own length should account for
+            // every remaining byte up to datasize (modulo the final
+            // pad-to-16 which is zero bytes, checked separately below).
             let cd_length = (hash_offset + 32 * n_code_slots) as u32;
+            let superblob_length_field =
+                u32::from_be_bytes(bytes[sb + 4..sb + 8].try_into().unwrap());
             assert_eq!(
-                cms_index_off,
-                (28 + cd_length) as usize,
-                "CMS BlobIndex offset matches where the CodeDirectory ends"
-            );
-            let cms_off = sb + cms_index_off;
-            assert_eq!(
-                u32::from_be_bytes(bytes[cms_off..cms_off + 4].try_into().unwrap()),
-                CSMAGIC_BLOBWRAPPER
-            );
-            assert_eq!(
-                u32::from_be_bytes(bytes[cms_off + 4..cms_off + 8].try_into().unwrap()),
-                8,
-                "CMS blob is header-only, no payload"
+                superblob_length_field,
+                20 + cd_length,
+                "SuperBlob length is header + one BlobIndex + CodeDirectory, nothing after it"
             );
         }
     }
