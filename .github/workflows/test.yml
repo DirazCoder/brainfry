@@ -459,6 +459,23 @@ jobs:
             /tmp/baseline_control
             echo "baseline_control exit code: $?"
             echo "::endgroup::"
+            echo "::group::inode-cache test: same bytes, fresh path (bypass possible amfid path/inode cache)"
+            # codesign --remove-signature + codesign -s -f above both
+            # rewrite /tmp/baseline_control's signature in place, on the
+            # same inode cp created it on. Several independently-reported
+            # macOS bugs (golang.org/issue/54132; Apple DevForums thread
+            # 718129) describe the kernel caching code-signing validation
+            # status by inode/path and serving a stale verdict after an
+            # in-place rewrite, fixed only by using a fresh inode (delete
+            # + recreate, not overwrite). Test that directly: copy the
+            # already-signed baseline_control bytes to a brand-new path
+            # that has never been written to before, then run that.
+            rm -f /tmp/baseline_control_freshinode
+            cp /tmp/baseline_control /tmp/baseline_control_freshinode
+            chmod +x /tmp/baseline_control_freshinode
+            /tmp/baseline_control_freshinode
+            echo "baseline_control_freshinode exit code: $?"
+            echo "::endgroup::"
             echo "::group::control experiment: re-sign with the OS's own codesign, then re-run"
             # Our own writer produces a structurally-verified-correct
             # CodeDirectory (confirmed via rcodesign and manual hex decode
@@ -480,6 +497,13 @@ jobs:
             chmod +x /tmp/hello_native_control
             /tmp/hello_native_control
             echo "control run exit code: $?"
+            echo "::endgroup::"
+            echo "::group::inode-cache test: hello_native_control bytes on a fresh, never-before-written path"
+            rm -f /tmp/hello_native_control_freshinode
+            cp /tmp/hello_native_control /tmp/hello_native_control_freshinode
+            chmod +x /tmp/hello_native_control_freshinode
+            /tmp/hello_native_control_freshinode
+            echo "hello_native_control_freshinode exit code: $?"
             echo "::endgroup::"
 
             echo "::group::log show (kernel/amfid denial reason, since $START_TS)"
