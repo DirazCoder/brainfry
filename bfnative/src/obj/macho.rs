@@ -62,7 +62,12 @@ const LC_BUILD_VERSION: u32 = 0x32;
 const LC_CODE_SIGNATURE: u32 = 0x1D;
 
 const PLATFORM_MACOS: u32 = 1;
-const MINOS_MACOS_11: u32 = 0x000B_0000;
+// Declared minos/sdk on LC_BUILD_VERSION. Was 11.0/11.0 (0x000B_0000);
+// bumped to 26.0 to match what ld64 emits on the CI runner. Unconfirmed
+// hypothesis fix for the arm64 AMFI kill - see PR discussion. If this
+// doesn't resolve it, revert to 0x000B_0000 rather than layering more
+// changes on top.
+const MINOS_MACOS_26: u32 = 0x001A_0000;
 
 const VM_PROT_READ: u32 = 1;
 const VM_PROT_WRITE: u32 = 2;
@@ -358,8 +363,8 @@ pub fn build(module: &mut Module, arch: Arch, image_name: &str) -> (Vec<u8>, Lay
     out.extend_from_slice(&LC_BUILD_VERSION.to_le_bytes());
     out.extend_from_slice(&24u32.to_le_bytes());
     out.extend_from_slice(&PLATFORM_MACOS.to_le_bytes());
-    out.extend_from_slice(&MINOS_MACOS_11.to_le_bytes());
-    out.extend_from_slice(&MINOS_MACOS_11.to_le_bytes());
+    out.extend_from_slice(&MINOS_MACOS_26.to_le_bytes());
+    out.extend_from_slice(&MINOS_MACOS_26.to_le_bytes());
     out.extend_from_slice(&0u32.to_le_bytes()); // ntools
 
     // LC_CODE_SIGNATURE (dataoff/datasize patched after hashing)
