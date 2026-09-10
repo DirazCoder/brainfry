@@ -57,6 +57,7 @@ const LC_SYMTAB: u32 = 0x2;
 const LC_DYSYMTAB: u32 = 0xB;
 const LC_LOAD_DYLIB: u32 = 0xC;
 const LC_LOAD_DYLINKER: u32 = 0xE;
+const LC_UUID: u32 = 0x1B;
 const LC_MAIN: u32 = 0x8000_0028;
 const LC_BUILD_VERSION: u32 = 0x32;
 const LC_CODE_SIGNATURE: u32 = 0x1D;
@@ -179,8 +180,9 @@ pub fn build(module: &mut Module, arch: Arch, image_name: &str) -> (Vec<u8>, Lay
         + load_dylib_cmdsize
         + 24 // LC_MAIN
         + 24 // LC_BUILD_VERSION
+        + 24 // LC_UUID
         + 16; // LC_CODE_SIGNATURE
-    let ncmds: u32 = 12;
+    let ncmds: u32 = 13;
 
     let header_size = 32u64 + sizeofcmds as u64;
     let code_off = align_up(header_size, 16);
@@ -366,6 +368,17 @@ pub fn build(module: &mut Module, arch: Arch, image_name: &str) -> (Vec<u8>, Lay
     out.extend_from_slice(&MINOS_MACOS_26.to_le_bytes());
     out.extend_from_slice(&MINOS_MACOS_26.to_le_bytes());
     out.extend_from_slice(&0u32.to_le_bytes()); // ntools
+
+    // LC_UUID. dyld requires this load command to be present (missing it
+    // is a hard load error: "missing LC_UUID load command", not a
+    // warning) -- it's only used for symbolication/crash-report matching,
+    // not validated against anything else, so any stable 16-byte value
+    // works. Derived from a hash of the module's own code/rodata so the
+    // build stays deterministic (no RNG dependency).
+    out.extend_from_slice(&LC_UUID.to_le_bytes());
+    out.extend_from_slice(&24u32.to_le_bytes());
+    let uuid_seed = crate::sha256::digest(&module.code);
+    out.extend_from_slice(&uuid_seed[0..16]);
 
     // LC_CODE_SIGNATURE (dataoff/datasize patched after hashing)
     let codesig_cmd_pos = out.len();
@@ -714,10 +727,11 @@ mod tests {
             );
             let ncmds = u32::from_le_bytes(bytes[16..20].try_into().unwrap());
             let sizeofcmds = u32::from_le_bytes(bytes[20..24].try_into().unwrap());
-            // 12, not 11: __PAGEZERO, __TEXT, __DATA, __LINKEDIT,
+            // 13, not 11: __PAGEZERO, __TEXT, __DATA, __LINKEDIT,
             // LC_DYLD_INFO_ONLY, LC_LOAD_DYLINKER, LC_SYMTAB, LC_DYSYMTAB,
-            // LC_LOAD_DYLIB, LC_MAIN, LC_BUILD_VERSION, LC_CODE_SIGNATURE.
-            assert_eq!(ncmds, 12);
+            // LC_LOAD_DYLIB, LC_MAIN, LC_BUILD_VERSION, LC_UUID,
+            // LC_CODE_SIGNATURE.
+            assert_eq!(ncmds, 13);
             // sizeofcmds must place code exactly at align16(32 + sizeofcmds).
             let code_off = align_up(32 + sizeofcmds as u64, 16);
             assert_eq!((32 + sizeofcmds as u64) % 8, 0, "commands are 8-aligned");
