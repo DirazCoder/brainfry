@@ -56,6 +56,7 @@ const LC_DYLD_INFO_ONLY: u32 = 0x8000_0022;
 const LC_SYMTAB: u32 = 0x2;
 const LC_DYSYMTAB: u32 = 0xB;
 const LC_LOAD_DYLIB: u32 = 0xC;
+const LC_LOAD_DYLINKER: u32 = 0xE;
 const LC_MAIN: u32 = 0x8000_0028;
 const LC_BUILD_VERSION: u32 = 0x32;
 const LC_CODE_SIGNATURE: u32 = 0x1D;
@@ -148,19 +149,33 @@ pub fn build(module: &mut Module, arch: Arch, image_name: &str) -> (Vec<u8>, Lay
     let dylib_path = b"/usr/lib/libSystem.B.dylib";
     let load_dylib_cmdsize = align_up((24 + dylib_path.len() + 1) as u64, 8) as u32;
 
+    // LC_LOAD_DYLINKER: names the dynamic linker (dyld) the kernel hands
+    // this image to at exec time. Without it, the file has no way to
+    // reach dyld at all -- confirmed missing entirely from every binary
+    // this writer produced (otool -l on a real ld64-built binary shows
+    // it; ours never had it), and its absence is invisible to
+    // codesign/rcodesign/validate_macho.py, none of which check for its
+    // presence, only for signature-blob and segment-table consistency.
+    // dylinker_command layout mirrors dylib_command: cmd, cmdsize, a
+    // name offset (conventionally 12, right after the fixed header),
+    // then the NUL-terminated path, padded to 8 bytes.
+    let dylinker_path = b"/usr/lib/dyld";
+    let load_dylinker_cmdsize = align_up((12 + dylinker_path.len() + 1) as u64, 8) as u32;
+
     // ---- load-command table (fixed shape, so sizeofcmds is static) ----
     let sizeofcmds: u32 = 72 // __PAGEZERO
         + (72 + 2 * 80) // __TEXT (2 sections)
         + (72 + 80) // __DATA (1 section)
         + 72 // __LINKEDIT
         + 48 // LC_DYLD_INFO_ONLY
+        + load_dylinker_cmdsize
         + 24 // LC_SYMTAB
         + 80 // LC_DYSYMTAB
         + load_dylib_cmdsize
         + 24 // LC_MAIN
         + 24 // LC_BUILD_VERSION
         + 16; // LC_CODE_SIGNATURE
-    let ncmds: u32 = 11;
+    let ncmds: u32 = 12;
 
     let header_size = 32u64 + sizeofcmds as u64;
     let code_off = align_up(header_size, 16);
@@ -309,6 +324,16 @@ pub fn build(module: &mut Module, arch: Arch, image_name: &str) -> (Vec<u8>, Lay
     }
     for _ in 0..12 {
         out.extend_from_slice(&0u32.to_le_bytes());
+    }
+
+    // LC_LOAD_DYLINKER
+    out.extend_from_slice(&LC_LOAD_DYLINKER.to_le_bytes());
+    out.extend_from_slice(&load_dylinker_cmdsize.to_le_bytes());
+    out.extend_from_slice(&12u32.to_le_bytes()); // name offset within command
+    out.extend_from_slice(dylinker_path);
+    out.push(0); // NUL terminator
+    while !out.len().is_multiple_of(8) {
+        out.push(0);
     }
 
     // LC_LOAD_DYLIB
@@ -684,7 +709,10 @@ mod tests {
             );
             let ncmds = u32::from_le_bytes(bytes[16..20].try_into().unwrap());
             let sizeofcmds = u32::from_le_bytes(bytes[20..24].try_into().unwrap());
-            assert_eq!(ncmds, 11);
+            // 12, not 11: __PAGEZERO, __TEXT, __DATA, __LINKEDIT,
+            // LC_DYLD_INFO_ONLY, LC_LOAD_DYLINKER, LC_SYMTAB, LC_DYSYMTAB,
+            // LC_LOAD_DYLIB, LC_MAIN, LC_BUILD_VERSION, LC_CODE_SIGNATURE.
+            assert_eq!(ncmds, 12);
             // sizeofcmds must place code exactly at align16(32 + sizeofcmds).
             let code_off = align_up(32 + sizeofcmds as u64, 16);
             assert_eq!((32 + sizeofcmds as u64) % 8, 0, "commands are 8-aligned");
