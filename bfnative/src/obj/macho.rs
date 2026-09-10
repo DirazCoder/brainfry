@@ -90,6 +90,21 @@ const CSMAGIC_EMBEDDED_SIGNATURE: u32 = 0xFADE_0CC0;
 const CSMAGIC_BLOBWRAPPER: u32 = 0xFADE_0B01;
 const CSSLOT_SIGNATURESLOT: u32 = 0x0001_0000;
 const CS_ADHOC: u32 = 0x0000_0002;
+// "Automatically signed by the linker" (xnu cs_blobs.h). bfnative *is* the
+// linker here, so this is the accurate flag, not just an ad-hoc afterthought
+// -- and it matters: AMFI on newer macOS (observed on the macos-26-intel /
+// current macos-latest CI images) SIGKILLs a process whose CodeDirectory
+// carries CS_ADHOC alone, logging "adhoc signed or signed by an unknown
+// certificate chain" (AppleMobileFileIntegrityError -423), even though
+// codesign --verify --deep --strict reports the same binary "valid on
+// disk". Confirmed by control experiment: stripping our signature and
+// having the OS's own `codesign -s -` re-sign from scratch (which also
+// only sets CS_ADHOC, no CS_LINKER_SIGNED, for a bare re-sign) reproduces
+// the identical kill -- so this isn't a malformed-bytes bug in our
+// CodeDirectory, it's a missing-flag one. Every real linker-produced
+// ad-hoc binary (rustc, cc, Go's toolchain, ld64) sets both bits; ours
+// only set CS_ADHOC.
+const CS_LINKER_SIGNED: u32 = 0x0002_0000;
 const CS_EXECSEG_MAIN_BINARY: u64 = 0x0000_0001;
 const CSHASH_SHA256: u8 = 2;
 const CODEDIRECTORY_VERSION: u32 = 0x0002_0400;
@@ -441,7 +456,7 @@ pub fn build(module: &mut Module, arch: Arch, image_name: &str) -> (Vec<u8>, Lay
     out.extend_from_slice(&CSMAGIC_CODEDIRECTORY.to_be_bytes());
     out.extend_from_slice(&cd_length.to_be_bytes());
     out.extend_from_slice(&CODEDIRECTORY_VERSION.to_be_bytes());
-    out.extend_from_slice(&CS_ADHOC.to_be_bytes());
+    out.extend_from_slice(&(CS_ADHOC | CS_LINKER_SIGNED).to_be_bytes());
     out.extend_from_slice(&(hash_offset as u32).to_be_bytes()); // hashOffset
     out.extend_from_slice(&(CD_HEADER_SIZE as u32).to_be_bytes()); // identOffset
     out.extend_from_slice(&0u32.to_be_bytes()); // nSpecialSlots
