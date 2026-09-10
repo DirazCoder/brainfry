@@ -193,11 +193,36 @@ jobs:
           echo "baseline exit code: $?"
           echo "::endgroup::"
 
+          # Every prior round compared hello_native's CodeDirectory/flags
+          # against a working binary and found no difference -- three
+          # rounds straight. That means the differentiator, if there is
+          # one, is somewhere neither codesign nor rcodesign's signature
+          # parser looks: the load-command/segment table itself, which
+          # the kernel's Mach-O loader reads independently of AMFI's
+          # signature check. Dump both with otool -l (full load command
+          # detail, not just what validate_macho.py's narrower parser
+          # extracts) so a diff is possible instead of eyeballing hex.
+          echo "::group::otool -l baseline (known-good ld64 output, full load command dump)"
+          otool -l /tmp/baseline 2>&1
+          echo "::endgroup::"
+
+          echo "::group::otool -hv baseline (header flags, symbolic)"
+          otool -hv /tmp/baseline 2>&1
+          echo "::endgroup::"
+
           cd "$BIN"
 
 
           echo "::group::file(1)"
           file tests/hello_native
+          echo "::endgroup::"
+
+          echo "::group::otool -l hello_native (full load command dump, diff against baseline's above)"
+          otool -l tests/hello_native 2>&1
+          echo "::endgroup::"
+
+          echo "::group::otool -hv hello_native (header flags, symbolic)"
+          otool -hv tests/hello_native 2>&1
           echo "::endgroup::"
 
           echo "::group::raw hex dump of LC_CODE_SIGNATURE blob"
@@ -285,7 +310,14 @@ jobs:
           LOG_STREAM_PID=$!
           sleep 1  # let log stream actually attach before we run anything
           START_TS=$(date -u +"%Y-%m-%d %H:%M:%S")
-          ./tests/hello_native
+          # DYLD_PRINT_* surfaces dyld's own load-time reasoning (library
+          # search, binding, segment mapping) independent of whatever
+          # AMFI logs -- worth capturing in case the AMFI message is a
+          # downstream symptom of a dyld-level rejection rather than the
+          # root cause itself.
+          DYLD_PRINT_LIBRARIES=1 DYLD_PRINT_APIS=1 DYLD_PRINT_SEGMENTS=1 \
+          DYLD_PRINT_BINDINGS=1 DYLD_PRINT_INITIALIZERS=1 \
+            ./tests/hello_native
           RUN_EXIT=$?
           echo "run exit code: $RUN_EXIT"
           sleep 1  # let any trailing async log lines land
