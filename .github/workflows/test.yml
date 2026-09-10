@@ -132,17 +132,69 @@ jobs:
           echo "PASS: all execution paths (bfjit excluded) agree on hello world"
 
       # Temporary: isolates why bfnative's macOS binary gets SIGKILLed.
-      # Runs codesign verification (same check the kernel does) before
-      # execution, then captures amfid/kernel denial logs around the
-      # actual run so the failure reason can't get lost in a truncated
-      # GHA log or swallowed by set -e.
+      # Two prior rounds of hello_native-only diagnostics (structural
+      # validation, hex dump, rcodesign, codesign --verify, a single
+      # re-sign control) all came back clean and still couldn't explain
+      # the kill, including after fixing a real CS_LINKER_SIGNED gap that
+      # turned out not to be the cause. This round adds the controls that
+      # were still missing: an independent cc-compiled binary with zero
+      # bfnative code in it (as both a plain ad-hoc build and a
+      # codesign -s --resigned copy, to separate "this runner kills ALL
+      # ad-hoc binaries" from "this runner kills hello_native
+      # specifically"), system policy state (SIP, Gatekeeper switch, MDM
+      # profiles) that no prior round checked, a live `log stream`
+      # instead of a post-hoc `log show` (which can miss/reorder entries
+      # near the kill), and diagnostic-report (.ips) capture.
       - name: debug bfnative macOS crash
         if: always() && runner.os == 'macOS'
         shell: bash
         run: |
           set +e
           BIN="target/${{ matrix.target }}/release"
+
+          # ---- system policy state, checked once up front ----
+          # None of the existing diagnostics below ask whether this
+          # *runner image* is doing something to ad-hoc binaries in
+          # general (an MDM-pushed configuration profile, SIP state,
+          # a non-default AMFI/Gatekeeper master switch) as opposed to
+          # something specific to our file's bytes. Check that first.
+          echo "::group::system policy state (SIP, Gatekeeper master switch, MDM profiles)"
+          echo "csrutil status:"
+          csrutil status 2>&1
+          echo
+          echo "spctl --status:"
+          spctl --status 2>&1
+          echo
+          echo "spctl master-disable check (gatekeeper --global-enable state via defaults):"
+          defaults read /Library/Preferences/com.apple.security.libraryvalidation.plist 2>&1
+          echo
+          echo "installed configuration profiles (MDM-pushed policy, if any):"
+          profiles show 2>&1
+          echo
+          echo "macOS version:"
+          sw_vers 2>&1
+          echo "::endgroup::"
+
+          # ---- independent baseline: a binary with zero bfnative code in it ----
+          # Every diagnostic in this file so far inspects hello_native's own
+          # bytes. None of them establish whether ANY freshly-built ad-hoc
+          # binary dies on this runner, independent of anything macho.rs
+          # writes. Build the simplest possible C program right here with
+          # the system's own cc + its own default linker-driven ad-hoc
+          # signing (no hand-rolled signature at all), and run it the same
+          # way, under the same harness, before touching hello_native.
+          echo "::group::independent baseline: bare cc-compiled binary, unrelated to bfnative"
+          printf '#include <stdio.h>\nint main(void) { printf("baseline ok\\n"); return 0; }\n' > /tmp/baseline.c
+          cc -o /tmp/baseline /tmp/baseline.c
+          echo "baseline codesign -dvvv:"
+          codesign -dvvv /tmp/baseline 2>&1
+          echo "running baseline:"
+          /tmp/baseline
+          echo "baseline exit code: $?"
+          echo "::endgroup::"
+
           cd "$BIN"
+
 
           echo "::group::file(1)"
           file tests/hello_native
@@ -222,13 +274,50 @@ jobs:
           echo "::endgroup::"
 
           echo "::group::running the binary directly, capturing exit code"
+          # Start a *live* log stream before the run, not a post-hoc `log
+          # show --start`. log show queries the log database after the
+          # fact and can miss or reorder entries depending on flush
+          # timing; log stream attaches first and can't lose the window
+          # between "process killed" and "message durably written".
+          log stream --predicate \
+            '(process == "amfid") OR (process == "kernel") OR (subsystem == "com.apple.securityd") OR (process == "taskgated") OR (process == "syspolicyd")' \
+            --info --debug > /tmp/live_log_stream.txt 2>&1 &
+          LOG_STREAM_PID=$!
+          sleep 1  # let log stream actually attach before we run anything
           START_TS=$(date -u +"%Y-%m-%d %H:%M:%S")
           ./tests/hello_native
           RUN_EXIT=$?
           echo "run exit code: $RUN_EXIT"
+          sleep 1  # let any trailing async log lines land
+          kill "$LOG_STREAM_PID" 2>/dev/null
+          wait "$LOG_STREAM_PID" 2>/dev/null
           echo "::endgroup::"
 
           if [ "$RUN_EXIT" -ne 0 ]; then
+            echo "::group::live log stream captured during the hello_native run"
+            cat /tmp/live_log_stream.txt
+            echo "::endgroup::"
+
+            echo "::group::control experiment 2: cc-compiled binary, then ad-hoc re-signed the same way as hello_native's control"
+            # Separates two different claims that the single existing
+            # control (re-sign hello_native itself) can't distinguish:
+            #   (a) "this runner kills ALL codesign -s - re-signed ad-hoc
+            #       binaries, regardless of origin" -- if the baseline
+            #       above already ran fine un-re-signed but dies here
+            #       after a forced re-sign, the act of re-signing itself
+            #       (not being ad-hoc per se) is the trigger.
+            #   (b) "this runner kills hello_native specifically" -- if
+            #       this control runs fine, the earlier hello_native
+            #       control result was about hello_native's content, not
+            #       ad-hoc signing in general.
+            cp /tmp/baseline /tmp/baseline_control
+            codesign --remove-signature /tmp/baseline_control
+            codesign -s - -f /tmp/baseline_control
+            codesign -dvvv /tmp/baseline_control 2>&1
+            chmod +x /tmp/baseline_control
+            /tmp/baseline_control
+            echo "baseline_control exit code: $?"
+            echo "::endgroup::"
             echo "::group::control experiment: re-sign with the OS's own codesign, then re-run"
             # Our own writer produces a structurally-verified-correct
             # CodeDirectory (confirmed via rcodesign and manual hex decode
@@ -266,6 +355,21 @@ jobs:
             log show --start "$START_TS" --predicate \
               'subsystem == "com.apple.securityd" OR process == "taskgated" OR process == "syspolicyd"' \
               --info --debug 2>&1 | tail -200
+            echo "::endgroup::"
+
+            echo "::group::diagnostic reports (.ips crash logs written for the kill, if any)"
+            # AMFI/codesign kills sometimes also produce a structured
+            # diagnostic report independent of the unified log -- worth
+            # checking since it's a different subsystem's record of the
+            # same event and may name a different/more specific reason.
+            for dir in ~/Library/Logs/DiagnosticReports /Library/Logs/DiagnosticReports; do
+              echo "-- $dir --"
+              find "$dir" -maxdepth 1 -newermt "$START_TS" \( -name '*hello_native*' -o -name '*baseline*' \) -print 2>/dev/null \
+                | while read -r report; do
+                    echo "== $report =="
+                    cat "$report"
+                  done
+            done
             echo "::endgroup::"
           fi
           set -e
