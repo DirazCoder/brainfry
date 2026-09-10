@@ -502,8 +502,29 @@ jobs:
             rm -f /tmp/hello_native_control_freshinode
             cp /tmp/hello_native_control /tmp/hello_native_control_freshinode
             chmod +x /tmp/hello_native_control_freshinode
+            FRESHINODE_START_TS=$(date "+%Y-%m-%d %H:%M:%S")
             /tmp/hello_native_control_freshinode
             echo "hello_native_control_freshinode exit code: $?"
+            echo "::endgroup::"
+
+            echo "::group::UNFILTERED log show around the freshinode kill (no process/message filter at all)"
+            # Every prior round filtered log show to process == "amfid" or
+            # process == "kernel" AND eventMessage CONTAINS the filename.
+            # That's exactly the kind of predicate that silently drops
+            # anything from syspolicyd, taskgated, trustd, sandboxd, or a
+            # kernel line that doesn't happen to echo the filename back --
+            # and Code=-423 from amfid turned out NOT to correlate with
+            # the kill (baseline_control_freshinode logs the identical
+            # amfid line and still exits 0). So the actual kill decision
+            # has never actually been captured; only a message that fires
+            # regardless of outcome has. Capture everything, no predicate,
+            # in the exact ~2s window around this one specific kill.
+            sleep 2
+            log show --start "$FRESHINODE_START_TS" \
+              --info --debug 2>&1 > /tmp/unfiltered_log.txt
+            wc -l /tmp/unfiltered_log.txt
+            echo "-- full unfiltered capture --"
+            cat /tmp/unfiltered_log.txt
             echo "::endgroup::"
 
             echo "::group::log show (kernel/amfid denial reason, since $START_TS)"
