@@ -68,6 +68,19 @@ jobs:
       - name: run differential test harness
         shell: bash
         run: |
+          # The harness looks for binaries under target/release (its
+          # layout for a plain `cargo build --release`), but this matrix
+          # cross-compiles with --target, which puts them under
+          # target/<triple>/release instead. Make the plain path resolve
+          # to this run's actual output rather than teaching the script
+          # about per-target directories, since it's also used locally.
+          EXE=""
+          [[ "${{ matrix.target }}" == *windows* ]] && EXE=".exe"
+          SRC="target/${{ matrix.target }}/release"
+          mkdir -p target/release
+          for bin in bfc bfrun bfnative bfinterp bfjit; do
+            cp "$SRC/$bin$EXE" "target/release/$bin$EXE"
+          done
           python3 scripts/differential_test_all.py .
 
       - name: compile hello world for windows-arm64 debug step
