@@ -45,11 +45,13 @@ import tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = sys.argv[1] if len(sys.argv) > 1 else os.path.dirname(HERE)
 
-BFC = os.path.join(ROOT, "target", "release", "bfc")
-BFRUN = os.path.join(ROOT, "target", "release", "bfrun")
-BFNATIVE = os.path.join(ROOT, "target", "release", "bfnative")
-BFINTERP = os.path.join(ROOT, "target", "release", "bfinterp")
-BFJIT = os.path.join(ROOT, "target", "release", "bfjit")
+EXE = ".exe" if os.name == "nt" else ""
+
+BFC = os.path.join(ROOT, "target", "release", "bfc" + EXE)
+BFRUN = os.path.join(ROOT, "target", "release", "bfrun" + EXE)
+BFNATIVE = os.path.join(ROOT, "target", "release", "bfnative" + EXE)
+BFINTERP = os.path.join(ROOT, "target", "release", "bfinterp" + EXE)
+BFJIT = os.path.join(ROOT, "target", "release", "bfjit" + EXE)
 MANDELBROT = os.path.join(ROOT, "tests", "mandelbrot.b")
 
 QEMU_AARCH64 = os.environ.get("QEMU_AARCH64", "")
