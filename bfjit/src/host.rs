@@ -12,7 +12,7 @@
 //!
 //! - macOS: `write`, `read`, `mmap`, `mprotect`, `_exit` (libSystem)
 //! - Windows: `GetStdHandle`, `WriteFile`, `ReadFile`, `ExitProcess`,
-//!   `VirtualAlloc` (kernel32)
+//!   `VirtualAlloc`, `GetLastError` (kernel32)
 //! - Linux: nothing — the generated code talks to the kernel through raw
 //!   `syscall` instructions and has no external calls at all.
 //!
@@ -108,6 +108,7 @@ unsafe extern "C" {
         allocation_type: u32,
         protect: u32,
     ) -> *mut core::ffi::c_void;
+    fn GetLastError() -> u32;
 }
 
 #[cfg(target_os = "windows")]
@@ -118,6 +119,7 @@ fn windows_slots() -> Vec<usize> {
         ReadFile as *const () as usize,
         ExitProcess as *const () as usize,
         VirtualAlloc as *const () as usize,
+        GetLastError as *const () as usize,
     ]
 }
 
