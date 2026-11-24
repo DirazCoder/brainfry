@@ -171,13 +171,28 @@ ad-hoc code signature itself: a v0x20400 CodeDirectory with SHA-256 page
 hashes (4 KiB pages on x86-64, 16 KiB on ARM64, matching what the kernel
 verifies), built with an in-process SHA-256. No `codesign` subprocess.
 
-Windows binaries are freestanding PE32+ executables that import five
+Windows binaries are freestanding PE32+ executables that import six
 functions from `kernel32.dll` (`GetStdHandle`, `WriteFile`, `ReadFile`,
-`ExitProcess`, `VirtualAlloc`) through a real import address table the
+`ExitProcess`, `VirtualAlloc`, `GetLastError`) through a real import address table the
 loader resolves at startup, with a custom entry point. No CRT, no startup
 objects. Win32 got picked over the C runtime for the usual reason:
 kernel32's exports are the one stable surface on every Windows install,
 while CRT `read`/`write` export names vary across toolchain flavors.
+
+The ARM64 image is not the x86-64 one with a different machine field.
+Windows on ARM doesn't let you turn ASLR off (the linker rejects
+`/DYNAMICBASE:NO` for ARM64), so that image stays relocatable: no
+`RELOCS_STRIPPED`, `DYNAMIC_BASE` on, one real base relocation, and a
+`.pdata`/`.xdata` unwind record over `.text`. The unwind record is
+probably not required (a minimal `lld-link` ARM64 exe has neither it nor
+a `.reloc`), but it's valid and harmless, so it stayed. What did matter
+was the header flags: both Windows arches set `LARGE_ADDRESS_AWARE`
+(the image base is above 4 GiB), and ARM64 uses the same
+DllCharacteristics `lld-link` writes (`0x8160`). With the flags missing,
+Windows 11 ARM refused the exe at `CreateProcess` with
+`ERROR_BAD_EXE_FORMAT` even though every offline parser accepted it. Both
+flags were fixed in one commit, so which of them the loader objected to
+isn't pinned down.
 
 None of that touches instruction selection. A given CPU architecture emits
 the same arithmetic and branch instructions no matter which of the three
@@ -227,11 +242,11 @@ coincidence.
 
 Memory discipline is W^X on every platform. Linux maps RW and `mprotect`s
 to RX. Windows `VirtualAlloc`s `PAGE_READWRITE` and `VirtualProtect`s to
-`PAGE_EXECUTE_READ`. macOS on Intel uses the plain `mmap`/`mprotect` pair;
-macOS on Apple Silicon maps with `MAP_JIT` and brackets the code writes
-with `pthread_jit_write_protect_np(false)` / `(true)`, the hardened
-runtime's JIT toggle — without it, self-generated code SIGBUSes the moment
-it executes. On ARM64 hosts, freshly written code also runs through the
+`PAGE_EXECUTE_READ`. macOS uses the same plain `mmap`/`mprotect` pair on
+both Intel and Apple Silicon. `MAP_JIT` is deliberately not used: it needs
+the `allow-jit` entitlement honored by a Developer ID, Hardened
+Runtime signature, and with the ad-hoc signing this project does the
+`mmap` fails with `ENOMEM`. On ARM64 hosts, freshly written code also runs through the
 proper cache-maintenance sequence (`sys_icache_invalidate` on macOS,
 DC CVAU / DSB / IC IVAU / ISB on Linux) before the first jump, because the
 ARM instruction cache isn't coherent with the data cache.
@@ -250,12 +265,12 @@ the Rust compiler supports.)
 
 | bfjit target | Status | How |
 |---|---|---|
-| `linux-x86_64` | **executed** | full workspace test suite (19 e2e tests executing JITed code, incl. mandelbrot.b byte-exact) plus the four-way differential harness: 26 programs × 4 execution strategies, all byte-identical to `bfrun` on stdout/stderr/exit status |
-| `linux-aarch64` | **executed under emulation** | aarch64 bfjit built for `aarch64-unknown-linux-musl` and run under `qemu-aarch64-static`: same 26-program corpus, byte-identical to `bfrun`, mandelbrot included — a real run of the JIT pipeline (map, patch, W^X flip, cache maintenance, jump) on emulated ARM64 hardware |
-| `macos-x86_64` | written, not run | plain `mmap`/`mprotect` path; needs a real Mac to execute |
-| `macos-aarch64` | written, not run | `MAP_JIT` + `pthread_jit_write_protect_np` + `sys_icache_invalidate` sequence written per the documented contract, plus a stack-alignment trampoline for the generated entry; not executed — no dyld/hardened runtime here |
-| `windows-x86_64` | written, not run | `VirtualAlloc`/`VirtualProtect` + `FlushInstructionCache`; not executed |
-| `windows-aarch64` | written, not run | same; not executed |
+| `linux-x86_64` | **executed** | full workspace test suite (19 e2e tests executing JITed code, incl. mandelbrot.b byte-exact) plus the differential harness; CI on `ubuntu-latest` |
+| `linux-aarch64` | **executed** | CI on a native ARM runner (`ubuntu-26.04-arm`). Also run during development under `qemu-aarch64-static` (aarch64 bfjit built for `aarch64-unknown-linux-musl`): same corpus, byte-identical to `bfrun`, mandelbrot included |
+| `macos-x86_64` | **executed** | CI on `macos-26-intel`: plain `mmap`/`mprotect` path, ad-hoc signed |
+| `macos-aarch64` | **executed** | CI on `macos-latest` (Apple Silicon): plain `mmap`/`mprotect` plus `sys_icache_invalidate` and a stack-alignment trampoline for the generated entry |
+| `windows-x86_64` | **executed** | CI on `windows-latest`: `VirtualAlloc`/`VirtualProtect` + `FlushInstructionCache` |
+| `windows-aarch64` | **executed** | CI on `windows-11-arm`: same Windows path on ARM64 |
 
 ## Benchmarks (mandelbrot.b)
 
@@ -375,25 +390,34 @@ not something this doc is deciding.
 
 ## Verification status
 
-What's actually been run, versus what's been inspected by outside tools
-and not run:
+Every target now runs for real. `.github/workflows/test.yml` builds all
+six on a native GitHub-hosted runner (same OS and architecture, no
+emulation) and runs `scripts/differential_test_all.py`: 26 programs (the
+25-program corpus plus `mandelbrot.b`) through `bfinterp`,
+`bfinterp --optimize`, `bfrun`, `bfnative` and `bfjit`, with stdout,
+stderr and exit status required to be byte-identical to `bfrun`. The
+corpus covers hello world, six-deep nesting, multiplication loops, tape
+growth to 200k cells, wraparound, EOF semantics, stdin echo, and every
+runtime-error path.
 
-| Target | Status | How |
-|---|---|---|
-| `linux-x86_64` | **executed** | `cargo test` end-to-end suite, plus a differential harness (`scripts/differential_test.py`) comparing stdout/stderr/exit status against `bfrun` on 25 programs: hello world, six-deep nesting, multiplication loops, tape growth to 200k cells, wraparound, EOF semantics, stdin echo, and every runtime-error path |
-| `linux-aarch64` | **executed under emulation** | same 25-program differential corpus under `qemu-aarch64-static` (user mode, real Linux syscalls) — 50/50 total executions match `bfrun` exactly |
-| `macos-x86_64` | statically validated | load-command table, segment congruence, and bind stream decoded by `llvm-objdump --macho`; ad-hoc signature page hashes re-verified by an independent unit test; entry code disassembled and hand-checked; format cross-checked against real ld64-produced binaries |
-| `macos-aarch64` | statically validated | same, plus 16 KiB-page layout checks. **Not executed** — no macOS hardware or dyld here |
-| `windows-x86_64` | statically validated | full header/import/section parse by GNU `objdump` (`pei-x86-64`), IAT slot layout and entry disassembly verified |
-| `windows-aarch64` | statically validated | headers walked field-by-field by unit tests, machine code disassembled by `llvm-objdump`. **Not executed** — no Windows-on-ARM here |
+| Target | Status | Runner | Also checked statically |
+|---|---|---|---|
+| `linux-x86_64` | **executed** | `ubuntu-latest` | `cargo test` end-to-end suite |
+| `linux-aarch64` | **executed** | `ubuntu-26.04-arm` | earlier run under `qemu-aarch64-static` (user mode, real Linux syscalls): 50/50 executions matched `bfrun` |
+| `macos-x86_64` | **executed** | `macos-26-intel` | load-command table, segment congruence and bind stream decoded by `llvm-objdump --macho`; ad-hoc signature page hashes re-verified by an independent unit test; format cross-checked against real ld64-produced binaries |
+| `macos-aarch64` | **executed** | `macos-latest` | same, plus 16 KiB-page layout checks |
+| `windows-x86_64` | **executed** | `windows-latest` | full header/import/section parse by GNU `objdump` (`pei-x86-64`), IAT slot layout and entry disassembly |
+| `windows-aarch64` | **executed** | `windows-11-arm` | headers walked field-by-field by unit tests, machine code disassembled by `llvm-objdump` |
 
-The signature, bind-opcode, and import-table details were all
-cross-checked against real binaries produced by Apple's `ld64` — that's
-how a bind-opcode encoding bug got caught before it ever reached a Mac.
-Still, "structurally perfect by every tool that will look at it" isn't
-the same thing as "ran." The macOS and Windows targets have never been
-executed, and that's worth saying plainly instead of letting the table
-imply otherwise.
+Static validation was the only evidence for the macOS and Windows targets
+for a long time, and it wasn't enough on its own. The signature,
+bind-opcode and import-table details were cross-checked against real
+`ld64` output, which caught a bind-opcode encoding bug before it reached
+a Mac. But the Windows ARM64 image passed every offline parse and was
+still refused by the loader until two header flags were corrected (see
+the Windows paragraph above). "Structurally perfect by every tool that
+will look at it" isn't the same thing as "ran", so the runner column is
+the one that counts.
 
 ## What's not here
 
@@ -404,14 +428,9 @@ an actual loop — the two folding passes are conservative by design and
 fall back to a real loop rather than guess at a pattern they can't fully
 verify.
 
-No macOS or Windows execution in the test suite. The containers are
-validated structurally (see above), but nothing here has actually booted
-dyld or the Windows loader. If you're on one of those platforms, running
-the differential harness locally is the missing experiment.
+CI runs the differential harness, not `cargo test`. The unit tests
+(PE and Mach-O header checks, instruction encoders) only run when someone
+runs `cargo test` locally, so a failing one can sit red unnoticed.
 
-No CI/build-matrix config for the six `bfnative` targets. That's a
-packaging concern layered on top of this source, not something baked
-into the crates themselves.
-
-
-
+Each target is exercised on one runner image (listed above). Other
+Windows and macOS releases, or older Linux distributions, aren't covered.
