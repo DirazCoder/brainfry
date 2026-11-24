@@ -122,7 +122,15 @@ jobs:
               || { echo "FAIL: hello_native failed structural validation (see above)"; exit 1; }
           fi
 
-          out_native=$(./tests/hello_native$EXT)
+          # On Windows ARM64, bash (Git Bash / MSYS) is x86_64 and cannot
+          # directly exec a native ARM64 PE via ./foo.exe -- the MSYS runtime
+          # raises "Exec format error". Delegate to pwsh, which is native
+          # ARM64 on windows-11-arm runners and can launch ARM64 children.
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            out_native=$(pwsh -NoProfile -Command "./tests/hello_native$EXT")
+          else
+            out_native=$(./tests/hello_native$EXT)
+          fi
           echo "bfnative:  $out_native"
 
           test "$out_interp" = "Hello World!" || { echo "FAIL: bfinterp wrong output"; exit 1; }
