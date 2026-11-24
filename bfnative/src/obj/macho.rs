@@ -44,6 +44,8 @@ use crate::target::{Arch, Os};
 // ---- constants ----
 
 const MH_EXECUTE: u32 = 2;
+const MH_NOUNDEFS: u32 = 0x0001;
+const MH_DYLDLINK: u32 = 0x0004;
 const MH_PIE: u32 = 0x0020_0000; // 0x200 is MH_NOMULTIDEFS, not PIE!
 const MH_TWOLEVEL: u32 = 0x0080;
 const CPU_TYPE_X86_64: u32 = 0x0100_0007;
@@ -246,7 +248,7 @@ pub fn build(module: &mut Module, arch: Arch, image_name: &str) -> (Vec<u8>, Lay
     out.extend_from_slice(&MH_EXECUTE.to_le_bytes());
     out.extend_from_slice(&ncmds.to_le_bytes());
     out.extend_from_slice(&sizeofcmds.to_le_bytes());
-    out.extend_from_slice(&(MH_PIE | MH_TWOLEVEL).to_le_bytes());
+    out.extend_from_slice(&(MH_NOUNDEFS | MH_DYLDLINK | MH_PIE | MH_TWOLEVEL).to_le_bytes());
     out.extend_from_slice(&0u32.to_le_bytes()); // reserved
 
     // __PAGEZERO
