@@ -589,16 +589,15 @@ fn emit_errors_macos(e: &mut Emitter, rt: &Rt) {
 // ---------------------------------------------------------------------------
 
 fn emit_entry_windows(e: &mut Emitter, rt: &Rt) {
-    e.span("entry (windows-aarch64): align sp, VirtualAlloc tape, std handles");
-    // The loader's entry alignment is a convention, not a contract, so
-    // align defensively, then take a fixed 64-byte frame: [sp+0,16) is the
+    e.span("entry (windows-aarch64): VirtualAlloc tape, std handles");
+    // Windows hardware-enforces 16-byte SP alignment at all times, so SP is
+    // already aligned when the loader transfers control here -- no dynamic
+    // realignment needed. Take a fixed 64-byte frame: [sp+0,16) is the
     // callee scratch area the Windows ARM64 ABI reserves, [sp+16,64) is
     // ours (the lpNumberOfBytesWritten qword lives at sp+16). Nothing ever
-    // changes sp again, so every blr call site is 16-byte aligned.
-    mov_sp_to(e, X9);
-    movz(e, X10, 15);
-    and_reg(e, X9, X9, X10);
-    sub_sp_reg(e, X9);
+    // changes sp again, so every blr call site is 16-byte aligned. This
+    // fixed shape is also what pe.rs's .pdata/.xdata unwind record
+    // (ARM64_ENTRY_FRAME_BYTES) describes -- the two must stay in sync.
     sub_imm(e, 31, 31, 64); // sub sp, sp, #64
 
     // VirtualAlloc(NULL, RESERVE, MEM_RESERVE, PAGE_NOACCESS)

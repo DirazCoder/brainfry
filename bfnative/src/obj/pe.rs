@@ -13,16 +13,24 @@
 //! The IAT is the first thing in `.idata` (section RVAs are 4 KiB-aligned,
 //! slots occupy the first 40 bytes), which keeps the ARM64 backend's
 //! `ADRP + LDR #imm12` sequence encodable. The code references everything
-//! position-relatively (rip-relative on x86-64, ADRP on ARM64), so the
-//! image needs no base relocations and ships with RELOCS_STRIPPED at the
-//! fixed preferred base 0x140000000.
+//! position-relatively (rip-relative on x86-64, ADRP on ARM64), so nothing
+//! in `.text` itself needs fixing up if the loader rebases the image.
+//! x86_64 takes advantage of that and ships with RELOCS_STRIPPED and no
+//! `.reloc` content at the fixed preferred base 0x140000000. ARM64 can't:
+//! the linker rejects disabling ASLR for ARM64/ARM64EC, so it ships one
+//! real base relocation (against a dedicated slot in `.idata`, read by
+//! nothing at runtime) to satisfy the loader's relocatability check, and a
+//! `.pdata`/`.xdata` unwind-info record (the ARM64 loader also rejects an
+//! image with stack-allocating code and no exception directory) -- see the
+//! comments by `DIR_BASERELOC` and `DIR_EXCEPTION` below for both.
 //!
-//! Layout:
+//! Layout (x86_64; ARM64 additionally has a `.pdata` section after
+//! `.reloc`):
 //!
 //! ```text
 //! file 0x000   DOS header (MZ + e_lfanew)
 //!      0x040   PE signature, IMAGE_FILE_HEADER, IMAGE_OPTIONAL_HEADER64
-//!      0x148   section table (.text, .idata, .reloc)
+//!      0x148   section table (.text, .idata, .reloc[, .pdata])
 //!      0x200   .text  RX: entry stub, program body, runtime, strings
 //!      ....    .idata RW: IAT, import descriptors, INT, hint/names, dll name
 //! ```
@@ -55,20 +63,67 @@ const IMAGE_SCN_WRITE: u32 = 0x8000_0000;
 
 // Data directory indices.
 const DIR_IMPORT: usize = 1;
+const DIR_EXCEPTION: usize = 3;
 const DIR_BASERELOC: usize = 5;
 const DIR_IAT: usize = 12;
 
 const IMAGE_SCN_MEM_READ: u32 = 0x4000_0000;
 const IMAGE_SCN_MEM_DISCARDABLE: u32 = 0x0200_0000;
 
+// ARM64 Windows requires every function that establishes a stack frame to
+// have a corresponding .pdata (RUNTIME_FUNCTION) + .xdata (unwind codes)
+// record; the loader validates this (via the Exception Data Directory) and
+// rejects images that allocate stack without one with "%1 is not a valid
+// Win32 application" -- a CreateProcess-level refusal, confirmed on real
+// ARM64 Windows hardware (dumpbin showed an otherwise well-formed image
+// with Exception Directory = 0). x86_64 has no equivalent hard requirement
+// here, so this is ARM64-only, same pattern as the DYNAMIC_BASE/reloc
+// handling above.
+//
+// The whole of .text (entry stub + translated program + runtime + error
+// paths) is one continuous, unreturning stretch with a single fixed-size
+// frame that's never torn down -- see emit_entry_windows's "nothing ever
+// changes sp again" comment -- so one RUNTIME_FUNCTION covers all of
+// .text. Its packed-unwind-data form only has an 11-bit function-length
+// field (max ~8KB of code, in 4-byte units), which real generated programs
+// can exceed (e.g. mandelbrot), so this uses the full .xdata form instead
+// (18-bit function length, effectively no practical ceiling) rather than
+// packed unwind data.
+//
+// Unwind codes: alloc_s (000iiiii, "sub sp,sp,i*16") covers our fixed
+// 64-byte (4 * 16) frame, since the dynamic SP realignment that used to
+// precede it was removed (Windows ARM64 hardware-enforces 16-byte SP
+// alignment at all times, so entry SP is already aligned -- see
+// emit_entry_windows), followed by end (0xE4) to terminate the sequence.
+// No epilogue scopes: the entry point never executes a normal function
+// return (it calls ExitProcess), so there's nothing to describe there.
+// Must match the fixed frame size emit_entry_windows allocates on ARM64
+// ("sub sp, sp, #64" -- see that function's comment).
+const ARM64_ENTRY_FRAME_BYTES: u32 = 64;
+const UNWIND_CODE_END: u8 = 0xE4;
+
+const fn alloc_s_unwind_code(frame_bytes: u32) -> u8 {
+    assert!(frame_bytes % 16 == 0, "alloc_s requires a 16-byte-aligned frame size");
+    let units = frame_bytes / 16;
+    assert!(units < 32, "alloc_s's 5-bit immediate covers at most 31*16 = 496 bytes");
+    units as u8 // tag bits 000 are implicitly 0 in the low 3 bits of this 5-bit value's byte
+}
+
 pub fn build(module: &mut Module, arch: Arch) -> (Vec<u8>, Layout) {
     let symbols = external_symbols(crate::target::Os::Windows);
-    debug_assert_eq!(symbols.len(), 5);
+    debug_assert_eq!(symbols.len(), 6);
 
     // ---- .text layout ----
     let code_off = 0u64; // entry stub is the first thing emitted
     let rodata_off = align_up(module.code.len() as u64, 16);
-    let text_vsize = rodata_off + module.rodata.len() as u64;
+    // 4-byte-aligned so ARM64's .xdata Function Length field (.text size in
+    // 4-byte units -- see the .pdata content block below) always divides
+    // evenly; rodata (error-message strings, NUL-terminated) has no
+    // alignment guarantee of its own, so this can't be assumed otherwise.
+    // The extra padding (at most 3 bytes) doesn't affect anything else:
+    // text_raw and idata_rva round this up again to FILE_ALIGN/SECTION_ALIGN
+    // boundaries far coarser than 4 bytes.
+    let text_vsize = align_up(rodata_off + module.rodata.len() as u64, 4);
     let text_raw = align_up(text_vsize, FILE_ALIGN);
     let text_fileoff = 0x200u64;
 
@@ -138,6 +193,19 @@ pub fn build(module: &mut Module, arch: Arch) -> (Vec<u8>, Layout) {
     let reloc_raw = align_up(reloc_vsize, FILE_ALIGN);
     let reloc_fileoff = align_up(idata_fileoff + idata_raw, FILE_ALIGN);
 
+    // ---- .pdata layout (ARM64 only) ----
+    // RUNTIME_FUNCTION (8 bytes: BeginAddress RVA, UnwindData RVA) followed
+    // immediately by its .xdata unwind-info blob (two words: header, then
+    // one word of unwind codes -- see the ARM64_ENTRY_FRAME_BYTES/alloc_s_unwind_code
+    // comment above). Both live in the same section for simplicity; nothing
+    // requires them to be split into separate .pdata/.xdata sections.
+    let pdata_rva = reloc_rva + align_up(reloc_vsize, SECTION_ALIGN);
+    const RUNTIME_FUNCTION_SIZE: u64 = 8;
+    const XDATA_SIZE: u64 = 8; // header word + one unwind-code word
+    let pdata_vsize = RUNTIME_FUNCTION_SIZE + XDATA_SIZE;
+    let pdata_raw = align_up(pdata_vsize, FILE_ALIGN);
+    let pdata_fileoff = align_up(reloc_fileoff + reloc_raw, FILE_ALIGN);
+
     // ---- patch code ----
     let layout = Layout {
         code_vaddr: IMAGE_BASE + SECTION_RVA + code_off,
@@ -146,7 +214,10 @@ pub fn build(module: &mut Module, arch: Arch) -> (Vec<u8>, Layout) {
     };
     patch(module, &layout);
 
-    let size_of_image = reloc_rva + align_up(reloc_vsize, SECTION_ALIGN);
+    let size_of_image = match arch {
+        Arch::X86_64 => reloc_rva + align_up(reloc_vsize, SECTION_ALIGN),
+        Arch::Aarch64 => pdata_rva + align_up(pdata_vsize, SECTION_ALIGN),
+    };
 
 
     // ---- serialize ----
@@ -182,8 +253,12 @@ pub fn build(module: &mut Module, arch: Arch) -> (Vec<u8>, Layout) {
         }
         Arch::Aarch64 => IMAGE_FILE_EXECUTABLE_IMAGE,
     };
+    let number_of_sections: u16 = match arch {
+        Arch::X86_64 => 3,
+        Arch::Aarch64 => 4, // + .pdata, required by the ARM64 Windows loader
+    };
     out.extend_from_slice(&machine.to_le_bytes());
-    out.extend_from_slice(&3u16.to_le_bytes()); // NumberOfSections
+    out.extend_from_slice(&number_of_sections.to_le_bytes());
     out.extend_from_slice(&0u32.to_le_bytes()); // TimeDateStamp
     out.extend_from_slice(&0u32.to_le_bytes()); // PointerToSymbolTable
     out.extend_from_slice(&0u32.to_le_bytes()); // NumberOfSymbols
@@ -195,7 +270,11 @@ pub fn build(module: &mut Module, arch: Arch) -> (Vec<u8>, Layout) {
     out.push(1); // MajorLinkerVersion
     out.push(0); // MinorLinkerVersion
     out.extend_from_slice(&(text_raw as u32).to_le_bytes()); // SizeOfCode
-    out.extend_from_slice(&(idata_raw as u32).to_le_bytes()); // SizeOfInitializedData
+    let size_of_initialized_data = match arch {
+        Arch::X86_64 => idata_raw,
+        Arch::Aarch64 => idata_raw + pdata_raw,
+    };
+    out.extend_from_slice(&(size_of_initialized_data as u32).to_le_bytes()); // SizeOfInitializedData
     out.extend_from_slice(&0u32.to_le_bytes()); // SizeOfUninitializedData
     out.extend_from_slice(&((SECTION_RVA + code_off) as u32).to_le_bytes()); // entry
     out.extend_from_slice(&(SECTION_RVA as u32).to_le_bytes()); // BaseOfCode
@@ -235,6 +314,9 @@ pub fn build(module: &mut Module, arch: Arch) -> (Vec<u8>, Layout) {
     dirs[DIR_IMPORT] = (idata_rva + descriptor_off) | (40 << 32); // 2 descriptors
     dirs[DIR_IAT] = idata_rva | ((8 * (symbols.len() as u64 + 1)) << 32);
     dirs[DIR_BASERELOC] = reloc_rva | (RELOC_BLOCK_SIZE << 32);
+    if arch == Arch::Aarch64 {
+        dirs[DIR_EXCEPTION] = pdata_rva | (RUNTIME_FUNCTION_SIZE << 32);
+    }
     for dir in dirs {
         out.extend_from_slice(&dir.to_le_bytes());
     }
@@ -268,7 +350,18 @@ pub fn build(module: &mut Module, arch: Arch) -> (Vec<u8>, Layout) {
         reloc_fileoff,
         IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_DISCARDABLE | IMAGE_SCN_INITIALIZED_DATA,
     );
-    debug_assert_eq!(out.len(), 0x1C0);
+    if arch == Arch::Aarch64 {
+        write_section_header(
+            &mut out,
+            ".pdata",
+            pdata_vsize,
+            pdata_rva,
+            pdata_raw,
+            pdata_fileoff,
+            IMAGE_SCN_MEM_READ | IMAGE_SCN_INITIALIZED_DATA,
+        );
+    }
+    debug_assert_eq!(out.len() as u64, 0x148 + 40 * number_of_sections as u64);
 
     // .text contents
     while out.len() < text_fileoff as usize {
@@ -352,6 +445,56 @@ pub fn build(module: &mut Module, arch: Arch) -> (Vec<u8>, Layout) {
     out.extend_from_slice(&0u16.to_le_bytes()); // type 0 (ABSOLUTE) pad entry, 4-byte align
     while (out.len() as u64) < reloc_fileoff + reloc_raw {
         out.push(0);
+    }
+
+    // .pdata contents (ARM64 only): one RUNTIME_FUNCTION entry covering the
+    // whole of .text, pointing at a one-word .xdata unwind-info blob. See
+    // the ARM64_ENTRY_FRAME_BYTES/alloc_s_unwind_code/DIR_EXCEPTION comment above for
+    // why this exists and why the full .xdata form (not packed unwind
+    // data) is used.
+    if arch == Arch::Aarch64 {
+        debug_assert_eq!(out.len() as u64, pdata_fileoff);
+        let xdata_rva = pdata_rva + RUNTIME_FUNCTION_SIZE;
+        out.extend_from_slice(&(SECTION_RVA as u32).to_le_bytes()); // BeginAddress
+        out.extend_from_slice(&(xdata_rva as u32).to_le_bytes()); // UnwindData -> .xdata
+
+        // .xdata header: Function Length (18 bits, in 4-byte units) | Vers
+        // (2 bits, 0) | X (1 bit, 0: no exception handler) | E (1 bit, 0:
+        // epilogue scopes follow, but Epilog Count is 0 so none do) |
+        // Epilog Count (5 bits, 0) | Code Words (5 bits, 1).
+        assert!(
+            text_vsize % 4 == 0,
+            ".text size must be a multiple of 4 for ARM64 instruction alignment"
+        );
+        let function_length = text_vsize / 4;
+        assert!(
+            function_length < (1 << 18),
+            ".text exceeds the 18-bit .xdata Function Length field (~1 MiB) -- \
+             would need multiple .pdata/.xdata records to describe a program this large"
+        );
+        let code_words: u32 = 1;
+        let epilog_count: u32 = 0;
+        let e_bit: u32 = 0;
+        let x_bit: u32 = 0;
+        let vers: u32 = 0;
+        let xdata_header = (code_words << 27)
+            | (epilog_count << 22)
+            | (e_bit << 21)
+            | (x_bit << 20)
+            | (vers << 18)
+            | (function_length as u32);
+        out.extend_from_slice(&xdata_header.to_le_bytes());
+
+        // Unwind codes, byte-stream order, packed into one little-endian
+        // word: alloc_s (sub sp,sp,#64) then end. 2 bytes of zero padding
+        // fill out the word (padding bytes are unused/ignored).
+        let code_bytes = [alloc_s_unwind_code(ARM64_ENTRY_FRAME_BYTES), UNWIND_CODE_END, 0, 0];
+        out.extend_from_slice(&code_bytes);
+        debug_assert_eq!(out.len() as u64, pdata_fileoff + RUNTIME_FUNCTION_SIZE + XDATA_SIZE);
+
+        while (out.len() as u64) < pdata_fileoff + pdata_raw {
+            out.push(0);
+        }
     }
 
     (out, layout)
@@ -631,6 +774,120 @@ mod tests {
         let vsize = u32::from_le_bytes(bytes[h + 8..h + 12].try_into().unwrap()) as u64;
         let rva = u32::from_le_bytes(bytes[h + 12..h + 16].try_into().unwrap()) as u64;
         rva + vsize
+    }
+
+    #[test]
+    fn x86_64_has_no_exception_directory() {
+        // x86_64 has no equivalent hard requirement for unwind info on a
+        // simple image like this (see the module doc comment), so it
+        // shouldn't carry a .pdata section or a populated Exception
+        // Directory -- regression guard against accidentally enabling this
+        // ARM64-only path for x86_64 too.
+        let bytes = build_for(&[bfformat::Op::Output], "windows-x86_64");
+        let nsections = u16::from_le_bytes(bytes[0x46..0x48].try_into().unwrap());
+        assert_eq!(nsections, 3, "x86_64 should still be .text/.idata/.reloc only");
+        let exc_dir = u64::from_le_bytes(
+            bytes[DIRS_OFF + DIR_EXCEPTION * 8..DIRS_OFF + DIR_EXCEPTION * 8 + 8]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(exc_dir, 0, "x86_64 Exception Directory should be empty");
+    }
+
+    #[test]
+    fn arm64_exception_directory_describes_the_whole_of_text() {
+        // Regression test for "%1 is not a valid Win32 application" on real
+        // ARM64 Windows hardware: dumpbin showed an otherwise well-formed
+        // image (correct machine type, PE32+ magic, non-degenerate reloc
+        // table) rejected at the loader level because its Exception
+        // Directory was empty, even though its entry stub allocates a
+        // stack frame ("sub sp, sp, #64"). This walks the actual
+        // RUNTIME_FUNCTION + .xdata bytes this writer produces and checks
+        // they're self-consistent and cover .text, so a future edit that
+        // silently drops this (e.g. "simplify, x86_64 doesn't need this")
+        // fails loudly instead of only breaking on hardware CI doesn't
+        // otherwise exercise.
+        let bytes = build_for(&[bfformat::Op::Output], "windows-aarch64");
+
+        let nsections = u16::from_le_bytes(bytes[0x46..0x48].try_into().unwrap());
+        assert_eq!(nsections, 4, "ARM64 should have .text/.idata/.reloc/.pdata");
+
+        let exc_dir = u64::from_le_bytes(
+            bytes[DIRS_OFF + DIR_EXCEPTION * 8..DIRS_OFF + DIR_EXCEPTION * 8 + 8]
+                .try_into()
+                .unwrap(),
+        );
+        let (pdata_rva, pdata_size) = ((exc_dir & 0xFFFF_FFFF) as u32, (exc_dir >> 32) as u32);
+        assert_eq!(pdata_size, 8, "exactly one 8-byte RUNTIME_FUNCTION entry");
+        assert_ne!(pdata_rva, 0, "Exception Directory must not be empty on ARM64");
+
+        // Map pdata_rva -> file offset via the section table (4th section
+        // on ARM64: .text, .idata, .reloc, .pdata).
+        let mut pdata_file_off = None;
+        let mut text_rva = None;
+        let mut text_vsize = None;
+        for i in 0..4u64 {
+            let h = 0x148 + 40 * i as usize;
+            let mut name = [0u8; 8];
+            name.copy_from_slice(&bytes[h..h + 8]);
+            let vsize = u32::from_le_bytes(bytes[h + 8..h + 12].try_into().unwrap()) as u64;
+            let rva = u32::from_le_bytes(bytes[h + 12..h + 16].try_into().unwrap()) as u64;
+            let raw = u32::from_le_bytes(bytes[h + 20..h + 24].try_into().unwrap()) as u64;
+            if &name[..5] == b".text" {
+                text_rva = Some(rva);
+                text_vsize = Some(vsize);
+            }
+            if pdata_rva as u64 >= rva && (pdata_rva as u64) < rva + vsize.max(1) {
+                pdata_file_off = Some(raw + (pdata_rva as u64 - rva));
+            }
+        }
+        let pos = pdata_file_off.expect("Exception Directory RVA maps into some section");
+        let text_rva = text_rva.expect(".text section present");
+        let text_vsize = text_vsize.expect(".text section present");
+
+        // RUNTIME_FUNCTION: BeginAddress RVA, then UnwindData RVA (since
+        // Flag==0 in the low 2 bits means "points at .xdata", not packed).
+        let begin_rva =
+            u32::from_le_bytes(bytes[pos as usize..pos as usize + 4].try_into().unwrap()) as u64;
+        let unwind_data_rva = u32::from_le_bytes(
+            bytes[pos as usize + 4..pos as usize + 8].try_into().unwrap(),
+        );
+        assert_eq!(begin_rva, text_rva, "RUNTIME_FUNCTION must cover .text from its start");
+        assert_eq!(unwind_data_rva & 0x3, 0, "Flag must be 0 (.xdata pointer, not packed)");
+
+        // .xdata header word.
+        let xdata_pos = pos + (unwind_data_rva as u64 - pdata_rva as u64);
+        let header = u32::from_le_bytes(
+            bytes[xdata_pos as usize..xdata_pos as usize + 4].try_into().unwrap(),
+        );
+        let function_length = header & 0x3FFFF; // bits [17:0]
+        let vers = (header >> 18) & 0x3;
+        let x_bit = (header >> 20) & 0x1;
+        let e_bit = (header >> 21) & 0x1;
+        let epilog_count = (header >> 22) & 0x1F;
+        let code_words = (header >> 27) & 0x1F;
+        assert_eq!(vers, 0, "only unwind-info version 0 is defined");
+        assert_eq!(x_bit, 0, "no exception handler in this minimal record");
+        assert_eq!(epilog_count, 0, "entry point never executes a normal return");
+        assert_eq!(code_words, 1, "alloc_s + end fit in exactly one word");
+        assert_eq!(
+            function_length as u64 * 4,
+            text_vsize,
+            "Function Length (in 4-byte units) must cover the whole of .text, \
+             since sp is never restored until the process exits"
+        );
+        let _ = e_bit; // documented as 0 above; no epilogue-scope array to walk
+
+        // Unwind codes word: alloc_s (sub sp,sp,#64) then end.
+        let codes_pos = xdata_pos + 4;
+        let codes = &bytes[codes_pos as usize..codes_pos as usize + 4];
+        assert_eq!(codes[0] & 0xE0, 0, "alloc_s tag bits must be 000");
+        assert_eq!(
+            (codes[0] & 0x1F) as u32 * 16,
+            ARM64_ENTRY_FRAME_BYTES,
+            "alloc_s must encode the entry stub's actual frame size"
+        );
+        assert_eq!(codes[1], UNWIND_CODE_END, "sequence must terminate with end (0xE4)");
     }
 }
 
