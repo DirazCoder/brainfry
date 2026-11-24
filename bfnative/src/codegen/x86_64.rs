@@ -628,6 +628,10 @@ fn emit_output_windows(e: &mut Emitter, rt: &Rt) {
     mov64(e, RCX, RBX);
     mov64(e, RDX, CELL);
     mov_r32_imm32(e, 8, 1);
+    mov_qword_rsp(e, 56, 0); // &written: zero the full qword first.
+    // WriteFile only writes the low 32 bits; a prior call's stale high
+    // bits in this reused stack slot would otherwise corrupt the 64-bit
+    // compare below on the second and later calls through this code.
     lea_r9_rsp(e, 56); // &written
     mov_qword_rsp(e, 32, 0); // lpOverlapped = NULL
     call_got(e, IAT_WRITEFILE);
@@ -642,6 +646,8 @@ fn emit_input_windows(e: &mut Emitter, rt: &Rt) {
     mov64(e, RCX, R15);
     mov64(e, RDX, CELL);
     mov_r32_imm32(e, 8, 1);
+    mov_qword_rsp(e, 56, 0); // &written: zero the full qword first (see
+    // emit_output_windows for why — ReadFile only writes the low 32 bits).
     lea_r9_rsp(e, 56);
     mov_qword_rsp(e, 32, 0);
     call_got(e, IAT_READFILE);

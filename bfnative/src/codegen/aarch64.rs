@@ -644,6 +644,11 @@ fn emit_output_windows(e: &mut Emitter, rt: &Rt) {
     mov_reg(e, X0, X22);
     mov_reg(e, X1, CELL);
     movz(e, X2, 1);
+    // &written: zero the full 64-bit slot first. WriteFile only writes the
+    // low 32 bits, so a prior call's stale high bits in this reused stack
+    // slot would otherwise corrupt the 64-bit load/compare below.
+    mov_zr(e, X9);
+    str_imm(e, X9, 16);
     add_imm(e, X3, 31, 16); // &written = sp + 16
     mov_zr(e, X4);
     call_got(e, IAT_WRITEFILE);
@@ -664,6 +669,10 @@ fn emit_input_windows(e: &mut Emitter, rt: &Rt) {
     mov_reg(e, X0, X23);
     mov_reg(e, X1, CELL);
     movz(e, X2, 1);
+    // &written: zero first (see emit_output_windows — ReadFile only
+    // writes the low 32 bits of this reused stack slot).
+    mov_zr(e, X9);
+    str_imm(e, X9, 16);
     add_imm(e, X3, 31, 16);
     mov_zr(e, X4);
     call_got(e, IAT_READFILE);
@@ -1044,6 +1053,13 @@ fn ldr_x0_sp_8(e: &mut Emitter) {
 fn ldr_imm(e: &mut Emitter, rt: u32, imm: u32) {
     debug_assert!(imm.is_multiple_of(8) && imm / 8 < 4096);
     e.u32(0xF940_0000 | ((imm / 8) << 10) | (31 << 5) | rt);
+}
+
+/// `str Xt, [sp, #imm]` (imm multiple of 8) — same form as ldr_imm with the
+/// L bit (bit 22) cleared: F9000000 | (imm/8)<<10 | 31<<5 | Rt.
+fn str_imm(e: &mut Emitter, rt: u32, imm: u32) {
+    debug_assert!(imm.is_multiple_of(8) && imm / 8 < 4096);
+    e.u32(0xF900_0000 | ((imm / 8) << 10) | (31 << 5) | rt);
 }
 
 /// `ret` — D65F03C0.
