@@ -948,11 +948,6 @@ fn sub_reg(e: &mut Emitter, rd: u32, rn: u32, rm: u32) {
     e.u32(0xCB00_0000 | (rm << 16) | (rn << 5) | rd);
 }
 
-/// `and Xd, Xn, Xm` — 8A000000.
-fn and_reg(e: &mut Emitter, rd: u32, rn: u32, rm: u32) {
-    e.u32(0x8A00_0000 | (rm << 16) | (rn << 5) | rd);
-}
-
 /// `bic Xd, Xn, Xm` (AND NOT) — 8A200000.
 fn bic(e: &mut Emitter, rd: u32, rn: u32, rm: u32) {
     e.u32(0x8A20_0000 | (rm << 16) | (rn << 5) | rd);
@@ -1021,29 +1016,6 @@ fn mov_imm32(e: &mut Emitter, rd: u32, value: u32) {
     if value > 0xFFFF {
         movk(e, rd, value >> 16, 1);
     }
-}
-
-/// `mov Xd, sp` (ADD Xd, sp, #0) — 910003E0 | Rd.
-fn mov_sp_to(e: &mut Emitter, rd: u32) {
-    e.u32(0x9100_03E0 | rd);
-}
-
-/// `sub sp, sp, Xn` — SUB (extended register), full 64-bit: the encoding
-/// assemblers emit for this exact mnemonic is
-/// `0xCB2963FF` for Xn = x9, i.e.
-/// `0xCB200000 | Rm<<16 | 0x63FF` (option = UXTX, imm3 = 0, Rn = sp,
-/// Rd = sp).
-///
-/// Why not the plain shifted-register SUB? Because in ADD/SUB (shifted
-/// register), register field 31 in Rd/Rn reads as XZR, never SP — a word
-/// like `0xCB000000 | Rm<<16 | 31<<5 | 31` decodes as `sub xzr, xzr, Xm`,
-/// a no-op that discards its result (this is exactly the bug the
-/// Windows-entry stack alignment used to have: the emitted no-op left sp
-/// 8 mod 16 at every kernel32 call site). SP is only addressable as a
-/// destination through the extended-register form, with option = UXTX
-/// (011) and imm3 = 0 so the full 64-bit register subtracts unchanged.
-fn sub_sp_reg(e: &mut Emitter, rm: u32) {
-    e.u32(0xCB20_0000 | (rm << 16) | 0x63FF);
 }
 
 /// `str x30, [sp]` — F90003FE. Grow's return-address save: `blr` overwrites
@@ -1228,20 +1200,6 @@ mod tests {
                 .iter()
                 .any(|f| matches!(f.target, PatchTarget::Label(4)))
         );
-    }
-
-    #[test]
-    fn sub_sp_reg_encodes_the_extended_register_form() {
-        // `sub sp, sp, x9` as assemblers encode it: SUB (extended
-        // register), option UXTX, imm3 0, Rn/Rd = sp. The
-        // shifted-register form cannot target sp at all (31 reads as xzr
-        // there — the emitted word used to be a silent no-op).
-        let mut e = Emitter::new(0);
-        sub_sp_reg(&mut e, X9);
-        assert_eq!(w32(&e.code, 0), 0xCB29_63FF);
-        let mut e = Emitter::new(0);
-        sub_sp_reg(&mut e, X24);
-        assert_eq!(w32(&e.code, 0), 0xCB38_63FF);
     }
 
     #[test]
