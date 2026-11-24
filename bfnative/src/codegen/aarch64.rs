@@ -718,15 +718,19 @@ fn emit_errors_windows(e: &mut Emitter, rt: &Rt) {
 fn emit_grow(e: &mut Emitter, rt: &Rt, os: Os) {
     e.span("bf_grow: extend the tape (x0 = desired, in/out)");
     e.bind_here(rt.grow);
-    // 24 bytes (an odd multiple of 8): realigns sp to 16 for the commit
-    // call (grow is entered via `bl`, which leaves sp 8 mod 16), and holds
-    // x30 at [sp] plus the desired pointer at [sp, #8] plus one pad qword.
+    // 32-byte frame. AArch64 requires sp to be 16-byte aligned whenever it
+    // is used as a base register (Apple Silicon faults with SIGBUS
+    // otherwise), and unlike x86-64 `call`, `bl` pushes nothing: sp is
+    // still 16-aligned on entry here, so the frame must be a multiple of
+    // 16 to keep it that way for the stores below and the commit call.
+    // Holds x30 at [sp], the desired pointer at [sp, #8], and 16 bytes of
+    // padding.
     // x30 must be saved because the macOS/Windows commit path makes a real
     // call (`blr`), and ARM64 `blr` overwrites x30 — the register this
     // routine's own `ret` jumps through. x86-64 gets this for free (`call`
     // pushes the return address on the stack; nested calls can't clobber
     // it); ARM64 requires every non-leaf function to save LR explicitly.
-    sub_imm(e, 31, 31, 24); // sub sp, sp, #24
+    sub_imm(e, 31, 31, 32); // sub sp, sp, #32
     str_x30_sp(e); // str x30, [sp] — save return address
     str_x0_sp_8(e); // str x0, [sp, #8] — save desired
 
@@ -814,16 +818,16 @@ fn emit_grow(e: &mut Emitter, rt: &Rt, os: Os) {
     add_reg(e, END, BASE, X24);
     ldr_x0_sp_8(e); // ldr x0, [sp, #8] — restore desired
     ldr_x30_sp(e); // ldr x30, [sp] — restore return address
-    add_imm(e, 31, 31, 24); // add sp, sp, #24
+    add_imm(e, 31, 31, 32); // add sp, sp, #32
     ret(e);
 }
 
 /// Error exits reached from inside grow (capacity / commit failure): drop
-/// grow's 24-byte frame before jumping, mirroring the x86-64 backend's
+/// grow's 32-byte frame before jumping, mirroring the x86-64 backend's
 /// `pop rcx` on the same paths, so the error tail starts from the body's
 /// stack level.
 fn grow_error_exit(e: &mut Emitter, target: u32) {
-    add_imm(e, 31, 31, 24); // add sp, sp, #24 — undo grow's frame
+    add_imm(e, 31, 31, 32); // add sp, sp, #32 — undo grow's frame
     b_label(e, target);
 }
 
@@ -1209,16 +1213,18 @@ mod tests {
     fn grow_saves_x30_and_takes_an_aligned_frame() {
         // Any program that can grow must emit a grow routine that: (a)
         // saves x30 at [sp] — `blr` inside grow clobbers it, and grow
-        // returns afterwards; (b) uses a 24-byte frame (an odd multiple
-        // of 8) so the commit call sees 16-byte-aligned sp.
+        // returns afterwards; (b) uses a 32-byte frame (a multiple of 16)
+        // so sp stays 16-byte aligned for its stores and the commit call.
+        // `bl` pushes nothing on AArch64, so an odd-multiple-of-8 frame
+        // misaligns sp and faults with SIGBUS on Apple Silicon.
         let ops = [Op::MoveRight(40_000)];
         let m = crate::codegen::emit(
             &ops,
             crate::target::Target::from_name("macos-aarch64").unwrap(),
         );
         assert!(m.code.chunks(4).any(|w| {
-            // sub sp, sp, #24
-            u32::from_le_bytes(w.try_into().unwrap()) == 0xD100_63FF
+            // sub sp, sp, #32
+            u32::from_le_bytes(w.try_into().unwrap()) == 0xD100_83FF
         }));
         assert!(m.code.chunks(4).any(|w| {
             // str x30, [sp]
