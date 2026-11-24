@@ -53,7 +53,10 @@ const SUBSYSTEM_CUI: u16 = 3;
 const IMAGE_FILE_EXECUTABLE_IMAGE: u16 = 0x0002;
 const IMAGE_FILE_RELOCS_STRIPPED: u16 = 0x0001;
 const IMAGE_FILE_LARGE_ADDRESS_AWARE: u16 = 0x0020;
+const IMAGE_DLLCHARACTERISTICS_HIGH_ENTROPY_VA: u16 = 0x0020;
 const IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE: u16 = 0x0040;
+const IMAGE_DLLCHARACTERISTICS_NX_COMPAT: u16 = 0x0100;
+const IMAGE_DLLCHARACTERISTICS_TERMINAL_SERVER_AWARE: u16 = 0x8000;
 
 const IMAGE_SCN_CODE: u32 = 0x0000_0020;
 const IMAGE_SCN_INITIALIZED_DATA: u32 = 0x0000_0040;
@@ -239,19 +242,26 @@ pub fn build(module: &mut Module, arch: Arch) -> (Vec<u8>, Layout) {
         Arch::Aarch64 => MACHINE_ARM64,
     };
     // ARM64 Windows can't disable ASLR (the linker itself rejects
-    // /DYNAMICBASE:NO for ARM64/ARM64EC targets), so an ARM64 image
-    // without IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE and a base
-    // relocation table gets rejected outright by CreateProcess with
-    // "not a valid Win32 application" -- a loader-level refusal to even
-    // start, not a runtime fault. x86_64 has no such requirement and a
+    // /DYNAMICBASE:NO for ARM64/ARM64EC targets), so the ARM64 image
+    // stays relocatable: no RELOCS_STRIPPED, DYNAMIC_BASE, and a real
+    // base relocation table. x86_64 has no such requirement and a
     // fixed-base, no-relocations image loads there just fine.
+    //
+    // LARGE_ADDRESS_AWARE is set on both. The image is based at
+    // 0x1_4000_0000, above 4 GiB, and lld/MSVC set it on every 64-bit
+    // image. It was missing on ARM64 when Windows 11 ARM started
+    // rejecting the exe with ERROR_BAD_EXE_FORMAT ("%1 is not a valid
+    // Win32 application"); it was the only header-flag difference from
+    // lld's output for a minimal ARM64 console exe (along with the
+    // DllCharacteristics below). Suspected cause, not bisected on
+    // hardware.
     let characteristics = match arch {
         Arch::X86_64 => {
             IMAGE_FILE_EXECUTABLE_IMAGE
                 | IMAGE_FILE_RELOCS_STRIPPED
                 | IMAGE_FILE_LARGE_ADDRESS_AWARE
         }
-        Arch::Aarch64 => IMAGE_FILE_EXECUTABLE_IMAGE,
+        Arch::Aarch64 => IMAGE_FILE_EXECUTABLE_IMAGE | IMAGE_FILE_LARGE_ADDRESS_AWARE,
     };
     let number_of_sections: u16 = match arch {
         Arch::X86_64 => 3,
@@ -294,11 +304,15 @@ pub fn build(module: &mut Module, arch: Arch) -> (Vec<u8>, Layout) {
     out.extend_from_slice(&SUBSYSTEM_CUI.to_le_bytes());
     let dll_characteristics = match arch {
         // Every code address in .text is patched PC-relative (see
-        // obj::patch): ADRP/branch displacements, never an absolute VA.
-        // Nothing here actually needs fixing up if the loader rebases,
-        // so DYNAMIC_BASE + an empty .reloc section satisfies the
-        // mandatory-ASLR requirement without any real relocation work.
-        Arch::Aarch64 => IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE,
+        // obj::patch): ADRP/branch displacements, never an absolute VA,
+        // so rebasing the image is safe. The set matches what lld emits
+        // for ARM64 console executables (0x8160).
+        Arch::Aarch64 => {
+            IMAGE_DLLCHARACTERISTICS_HIGH_ENTROPY_VA
+                | IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE
+                | IMAGE_DLLCHARACTERISTICS_NX_COMPAT
+                | IMAGE_DLLCHARACTERISTICS_TERMINAL_SERVER_AWARE
+        }
         Arch::X86_64 => 0,
     };
     out.extend_from_slice(&dll_characteristics.to_le_bytes());
@@ -563,7 +577,8 @@ mod tests {
             let (lfanew, m, nsects, entry, base_low, size_of_image) = header_fields(&bytes);
             assert_eq!(lfanew, 0x40);
             assert_eq!(m, machine);
-            assert_eq!(nsects, 3);
+            // x86_64: .text/.idata/.reloc; ARM64 adds .pdata.
+            assert_eq!(nsects, if machine == MACHINE_ARM64 { 4 } else { 3 });
             assert_eq!(&bytes[0x40..0x44], b"PE\0\0");
             assert_eq!(entry, 0x1000);
             assert_eq!(base_low, 0x4000_0000); // low 32 of 0x140000000
@@ -577,6 +592,29 @@ mod tests {
             let subsystem = u16::from_le_bytes(bytes[0x58 + 68..0x58 + 70].try_into().unwrap());
             assert_eq!(subsystem, SUBSYSTEM_CUI);
         }
+    }
+
+    #[test]
+    fn windows_images_are_large_address_aware() {
+        // The image base is above 4 GiB, so both arches must say so.
+        // Missing on ARM64, Windows 11 ARM refuses to start the process
+        // (ERROR_BAD_EXE_FORMAT).
+        for name in ["windows-x86_64", "windows-aarch64"] {
+            let bytes = build_for(&[bfformat::Op::Zero], name);
+            let ch = u16::from_le_bytes(bytes[0x56..0x58].try_into().unwrap());
+            assert_ne!(ch & IMAGE_FILE_LARGE_ADDRESS_AWARE, 0, "{name}: LAA not set");
+        }
+    }
+
+    #[test]
+    fn arm64_dll_characteristics_match_lld() {
+        // Pinned to what lld-link writes for an ARM64 console exe, since
+        // that layout is known to load on Windows ARM.
+        let bytes = build_for(&[bfformat::Op::Zero], "windows-aarch64");
+        let dll_ch = u16::from_le_bytes(bytes[0x58 + 70..0x58 + 72].try_into().unwrap());
+        assert_eq!(dll_ch, 0x8160);
+        let ch = u16::from_le_bytes(bytes[0x56..0x58].try_into().unwrap());
+        assert_eq!(ch & IMAGE_FILE_RELOCS_STRIPPED, 0, "ARM64 must stay relocatable");
     }
 
     #[test]
