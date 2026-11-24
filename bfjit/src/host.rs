@@ -38,9 +38,9 @@ pub fn got_slots(os: Os) -> Vec<usize> {
 #[cfg(target_os = "macos")]
 unsafe extern "C" {
     /// `write(2)` — the generated Output op and the error tail.
-    fn write(fd: i32, buf: *const u8, count: usize) -> isize;
+    fn write(fd: i32, buf: *const core::ffi::c_void, count: usize) -> isize;
     /// `read(2)` — the generated Input op.
-    fn read(fd: i32, buf: *mut u8, count: usize) -> isize;
+    fn read(fd: i32, buf: *mut core::ffi::c_void, count: usize) -> isize;
     /// `mmap(2)` — tape reservation in the entry, and nothing else.
     fn mmap(
         addr: *mut core::ffi::c_void,
@@ -60,15 +60,13 @@ unsafe extern "C" {
 
 #[cfg(target_os = "macos")]
 fn macos_slots() -> Vec<usize> {
-    unsafe {
-        vec![
-            write as usize,
-            read as usize,
-            mmap as usize,
-            mprotect as usize,
-            _exit as usize,
-        ]
-    }
+    vec![
+        write as *const () as usize,
+        read as *const () as usize,
+        mmap as *const () as usize,
+        mprotect as *const () as usize,
+        _exit as *const () as usize,
+    ]
 }
 
 #[cfg(not(target_os = "macos"))]
