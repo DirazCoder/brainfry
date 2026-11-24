@@ -437,7 +437,7 @@ mod tests {
     }
 
     #[test]
-    fn import_table_resolves_five_kernel32_functions() {
+    fn import_table_resolves_six_kernel32_functions() {
         for name in ["windows-x86_64", "windows-aarch64"] {
             let bytes = build_for(&[bfformat::Op::Output, bfformat::Op::Input], name);
             let import_dir = u64::from_le_bytes(
@@ -524,7 +524,8 @@ mod tests {
                     "WriteFile",
                     "ReadFile",
                     "ExitProcess",
-                    "VirtualAlloc"
+                    "VirtualAlloc",
+                    "GetLastError"
                 ]
             );
         }

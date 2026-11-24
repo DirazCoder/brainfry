@@ -48,6 +48,12 @@ const IAT_WRITEFILE: u32 = 1;
 const IAT_READFILE: u32 = 2;
 const IAT_EXITPROCESS: u32 = 3;
 const IAT_VIRTUALALLOC: u32 = 4;
+const IAT_GETLASTERROR: u32 = 5;
+
+// Win32 error codes ReadFile reports instead of a clean TRUE/*n==0 EOF when
+// stdin is a pipe (see emit_input_windows).
+const ERROR_BROKEN_PIPE: u32 = 109;
+const ERROR_HANDLE_EOF: u32 = 38;
 
 /// Linux syscall numbers (x86-64 historical table).
 const SYS_READ: u32 = 0;
@@ -652,14 +658,29 @@ fn emit_input_windows(e: &mut Emitter, rt: &Rt) {
     mov_qword_rsp(e, 32, 0);
     call_got(e, IAT_READFILE);
     test_eax(e);
-    jcc(e, CC_E, rt.err_io);
+    let done = e.internal_label();
+    let check_false = e.internal_label();
+    jcc(e, CC_E, check_false);
     // TRUE with *n == 0 is EOF, and ReadFile leaves the buffer untouched —
     // bfrun's convention exactly. TRUE with *n == 1 wrote the cell.
     cmp_qword_rsp(e, 56, 1);
-    let done = e.internal_label();
     jcc(e, CC_E, done);
     cmp_qword_rsp(e, 56, 0);
     jcc(e, CC_NE, rt.err_io);
+    jmp(e, done);
+    // FALSE: on a pipe (what every test harness and `prog < file` redirect
+    // give stdin) this is how Windows actually signals EOF once the write
+    // end is closed — ReadFile returns FALSE/ERROR_BROKEN_PIPE instead of
+    // POSIX's clean "TRUE, *n == 0". A real file exhausted the same way
+    // reports ERROR_HANDLE_EOF. Either means EOF, buffer left untouched
+    // (ReadFile never wrote it); anything else is a genuine I/O error.
+    e.bind_here(check_false);
+    call_got(e, IAT_GETLASTERROR);
+    cmp_rax_imm32(e, ERROR_BROKEN_PIPE);
+    jcc(e, CC_E, done);
+    cmp_rax_imm32(e, ERROR_HANDLE_EOF);
+    jcc(e, CC_E, done);
+    jmp(e, rt.err_io);
     e.bind_here(done);
 }
 

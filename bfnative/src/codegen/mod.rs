@@ -83,6 +83,7 @@ pub fn external_symbols(os: Os) -> &'static [&'static str] {
             "ReadFile",
             "ExitProcess",
             "VirtualAlloc",
+            "GetLastError",
         ],
     }
 }
