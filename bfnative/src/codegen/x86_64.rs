@@ -669,7 +669,13 @@ fn commit_windows(e: &mut Emitter, fail: u32) {
     mov64(e, RDX, RSI); // len
     mov_r32_imm32(e, 8, MEM_COMMIT);
     mov_r32_imm32(e, 9, PAGE_READWRITE);
+    // bf_grow runs below the fixed entry frame (return address + one push),
+    // so the 32 bytes above rsp are NOT free shadow space here: VirtualAlloc
+    // would spill rcx/rdx/r8/r9 over the saved rax and grow's own return
+    // address. Reserve a fresh shadow area for this call (keeps 16-alignment).
+    e.bytes(&[0x48, 0x83, 0xEC, 0x20]); // sub rsp, 32
     call_got(e, IAT_VIRTUALALLOC);
+    e.bytes(&[0x48, 0x83, 0xC4, 0x20]); // add rsp, 32 (rax untouched)
     test_rax(e);
     jcc(e, CC_E, fail);
 }
