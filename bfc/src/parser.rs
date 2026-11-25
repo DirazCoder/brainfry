@@ -86,6 +86,25 @@ mod tests {
     }
 
     #[test]
+    fn parses_every_command_character() {
+        // The full command alphabet in one program: the other tests only
+        // ever use '+'/'-'/'['/']', so without this the '>'/'<'/'.'/','
+        // arms of the match are never taken by the in-crate test build.
+        let ops = parse("+-><.,").unwrap();
+        assert_eq!(
+            ops,
+            vec![
+                Op::Add(1),
+                Op::Sub(1),
+                Op::MoveRight(1),
+                Op::MoveLeft(1),
+                Op::Output,
+                Op::Input,
+            ]
+        );
+    }
+
+    #[test]
     fn ignores_comment_characters() {
         let ops = parse("+ hello world -").unwrap();
         assert_eq!(ops.len(), 2);

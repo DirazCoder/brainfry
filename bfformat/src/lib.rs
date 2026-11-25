@@ -414,6 +414,21 @@ mod tests {
         }
     }
 
+    #[test]
+    fn mul_add_with_offset_but_no_factor_is_truncated() {
+        // The operand-sweep test below truncates MulAdd after the tag, so
+        // only the offset read ever fails there; this file carries the
+        // full i32 offset and stops, driving the *factor* read's error
+        // path as well.
+        let mut bytes = MAGIC.to_vec();
+        bytes.push(FORMAT_VERSION);
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.push(9); // MulAdd
+        bytes.extend_from_slice(&0i32.to_le_bytes()); // offset present
+        let err = Program::read_from(&bytes[..]).unwrap_err();
+        assert!(matches!(err, FormatError::Truncated));
+    }
+
     /// A writer that succeeds for the first `n` write calls and fails
     /// every one after — sweeping `n` across a full program drives the
     /// error propagation of every `?` in `write_to`, not just the first.
@@ -472,7 +487,17 @@ mod tests {
                 "write_to must fail when write #{} fails",
                 n + 1
             );
+            // The helper implements the whole Write contract; flushing the
+            // failed sink keeps that half of the impl exercised too.
+            assert!(sink.flush().is_ok());
         }
+        // And the same helper with capacity for every write completes:
+        // the sweep only ever saw FailAfter failing, so its success
+        // return was never taken.
+        let mut sink = FailAfter {
+            remaining_ok: total_writes,
+        };
+        assert!(program.write_to(&mut sink).is_ok());
         // And a writer with enough capacity succeeds, proving the sweep
         // wasn't passing on a broken program (and flush runs too).
         let mut ok = Vec::new();

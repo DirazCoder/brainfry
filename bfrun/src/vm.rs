@@ -1,5 +1,5 @@
 use bfformat::Op;
-use std::io::{self, Read, Write};
+use std::io;
 
 /// Classic Brainfuck starting tape size. The tape grows past this
 /// automatically if a program moves further right than it can currently
@@ -51,12 +51,28 @@ impl Vm {
         }
     }
 
+    /// Runs `ops` against the process's real stdin/stdout. Locks each once
+    /// for the whole run so per-op I/O doesn't pay for repeated lock
+    /// acquisition.
     pub fn run(&mut self, ops: &[Op]) -> Result<(), RunError> {
         let stdin = io::stdin();
         let stdout = io::stdout();
         let mut stdin_lock = stdin.lock();
         let mut stdout_lock = stdout.lock();
+        self.run_io(ops, &mut stdin_lock, &mut stdout_lock)
+    }
 
+    /// The interpreter loop proper, split out from `run` so tests can drive
+    /// the I/O arms — input at EOF, a failed write, a failed final flush —
+    /// with in-memory readers and writers instead of the process's real
+    /// stdio (`bfinterp`'s `run` is generic over its I/O for the same
+    /// reason; here plain trait objects keep one monomorphization).
+    pub fn run_io(
+        &mut self,
+        ops: &[Op],
+        input: &mut dyn io::Read,
+        output: &mut dyn io::Write,
+    ) -> Result<(), RunError> {
         let mut pc = 0usize;
         while pc < ops.len() {
             match ops[pc] {
@@ -79,7 +95,7 @@ impl Vm {
                         .ok_or(RunError::PointerUnderflow)?;
                 }
                 Op::Output => {
-                    stdout_lock.write_all(&[*self.current_cell()])?;
+                    output.write_all(&[*self.current_cell()])?;
                 }
                 Op::Input => {
                     let mut byte = [0u8];
@@ -88,7 +104,7 @@ impl Vm {
                     // set 0 or -1 instead; unchanged is the safest default
                     // since it doesn't invent a value the program didn't ask
                     // for).
-                    if stdin_lock.read_exact(&mut byte).is_ok() {
+                    if input.read_exact(&mut byte).is_ok() {
                         *self.current_cell() = byte[0];
                     }
                 }
@@ -129,7 +145,7 @@ impl Vm {
             pc += 1;
         }
 
-        stdout_lock.flush()?;
+        output.flush()?;
         Ok(())
     }
 
@@ -176,6 +192,7 @@ impl Vm {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use io::Write;
 
     fn run_ops(ops: &[Op]) -> Vm {
         let mut vm = Vm::new();
@@ -201,6 +218,86 @@ mod tests {
         let mut vm = Vm::new();
         let result = vm.run(&[Op::MoveLeft(1)]);
         assert!(matches!(result, Err(RunError::PointerUnderflow)));
+    }
+
+    #[test]
+    fn move_left_lands_on_the_cell_to_its_left() {
+        // The underflow test only exercises checked_sub's failure arm;
+        // this one walks a successful left move through the assignment.
+        let mut vm = Vm::new();
+        vm.run_io(
+            &[Op::MoveRight(2), Op::MoveLeft(1), Op::Add(9)],
+            &mut io::empty(),
+            &mut io::sink(),
+        )
+        .unwrap();
+        assert_eq!(vm.pointer, 1);
+        assert_eq!(vm.tape[1], 9);
+    }
+
+    #[test]
+    fn input_reads_a_byte_and_eof_leaves_the_cell_untouched() {
+        // Both halves of the Input arm: a reader with a byte in it (the
+        // cell takes that byte) and one at EOF (the cell keeps its value).
+        let mut vm = Vm::new();
+        vm.run_io(&[Op::Input], &mut io::Cursor::new(&b"Q"[..]), &mut io::sink())
+            .unwrap();
+        assert_eq!(*vm.current_cell(), b'Q');
+
+        let mut vm = Vm::new();
+        vm.run_io(
+            &[Op::Add(5), Op::Input],
+            &mut io::Cursor::new(&b""[..]),
+            &mut io::sink(),
+        )
+        .unwrap();
+        assert_eq!(*vm.current_cell(), 5);
+    }
+
+    /// A writer whose `write` always fails — drives the Output op's error
+    /// propagation (the `?` on write_all) without needing a real broken
+    /// pipe. Its flush fails the same way.
+    struct FailingWrite;
+
+    impl io::Write for FailingWrite {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(io::Error::new(io::ErrorKind::BrokenPipe, "reader gone"))
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::new(io::ErrorKind::BrokenPipe, "reader gone"))
+        }
+    }
+
+    #[test]
+    fn a_failing_write_surfaces_as_an_io_error() {
+        let mut vm = Vm::new();
+        let mut out = FailingWrite;
+        let result = vm.run_io(&[Op::Add(1), Op::Output], &mut io::empty(), &mut out);
+        assert!(matches!(result, Err(RunError::Io(_))));
+        // The write error aborts the program before the final flush, so
+        // exercise the helper's failing flush directly as well.
+        assert!(out.flush().is_err());
+    }
+
+    /// A writer that accepts bytes but cannot flush — writes succeed, so
+    /// execution reaches the final flush, whose failure must still surface
+    /// (the `?` on output.flush).
+    struct Unflushable;
+
+    impl io::Write for Unflushable {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::new(io::ErrorKind::Other, "disk full"))
+        }
+    }
+
+    #[test]
+    fn a_failing_flush_surfaces_as_an_io_error() {
+        let mut vm = Vm::new();
+        let result = vm.run_io(&[Op::Add(1), Op::Output], &mut io::empty(), &mut Unflushable);
+        assert!(matches!(result, Err(RunError::Io(_))));
     }
 
     #[test]

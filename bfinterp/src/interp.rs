@@ -71,12 +71,14 @@ impl From<io::Error> for RunError {
 pub fn run_stdio(ops: &[Op]) -> Result<(), RunError> {
     let stdin = io::stdin();
     let stdout = io::stdout();
-    run(ops, stdin.lock(), stdout.lock())
+    run(ops, &mut stdin.lock(), &mut stdout.lock())
 }
 
-/// The interpreter proper. Generic over I/O so the unit tests can drive it
-/// with `Cursor`s; the semantics are those described in the module docs.
-pub fn run<R: Read, W: Write>(ops: &[Op], mut stdin: R, mut stdout: W) -> Result<(), RunError> {
+/// The interpreter proper. Takes I/O as trait objects so every caller —
+/// `run_stdio` with the real stdio, the tests with `Cursor`s, failing
+/// writers, and unflushable writers — exercises this one function; the
+/// semantics are those described in the module docs.
+pub fn run(ops: &[Op], stdin: &mut dyn Read, stdout: &mut dyn Write) -> Result<(), RunError> {
     let mut tape = vec![0u8; INITIAL_TAPE_SIZE];
     let mut cell = 0usize;
     let mut pc = 0usize;
@@ -187,7 +189,7 @@ mod tests {
 
     fn interp(ops: &[Op], input: &str) -> (Vec<u8>, Result<(), RunError>) {
         let mut out = Vec::new();
-        let result = run(ops, Cursor::new(input.as_bytes()), &mut out);
+        let result = run(ops, &mut Cursor::new(input.as_bytes()), &mut out);
         (out, result)
     }
 
@@ -259,6 +261,17 @@ mod tests {
         let source = "+[-]+.";
         let ops = bfc::parser::parse(source).unwrap();
         let (out, result) = interp(&ops, "");
+        assert!(result.is_ok());
+        assert_eq!(out, vec![1u8]);
+    }
+
+    #[test]
+    fn a_zero_cell_skips_the_loop_body_entirely() {
+        // Entering [-] with the cell already zero: JumpIfZero must fire
+        // and land one past the loop without running a single Sub. Every
+        // other loop test enters with a nonzero cell, so only the JNZ
+        // side of the pair was ever exercised.
+        let (out, result) = interp(&bfc::parser::parse("[-]+.").unwrap(), "");
         assert!(result.is_ok());
         assert_eq!(out, vec![1u8]);
     }
@@ -395,7 +408,7 @@ mod tests {
         // Sanity on the happy path first...
         assert!(result.is_ok());
         let mut out = FailingWrite;
-        let result = run(&[Op::Add(1), Op::Output], Cursor::new(b""), &mut out);
+        let result = run(&[Op::Add(1), Op::Output], &mut Cursor::new(b""), &mut out);
         assert!(matches!(result, Err(RunError::Io(_))));
         // The writer's own flush fails the same way.
         assert!(out.flush().is_err());
@@ -418,7 +431,7 @@ mod tests {
     #[test]
     fn a_failing_flush_surfaces_as_an_io_error() {
         let mut out = Unflushable;
-        let result = run(&[Op::Add(1), Op::Output], Cursor::new(b""), &mut out);
+        let result = run(&[Op::Add(1), Op::Output], &mut Cursor::new(b""), &mut out);
         assert!(matches!(result, Err(RunError::Io(_))));
     }
 
@@ -487,7 +500,7 @@ mod tests {
         // the tape; under a capped address space each must surface
         // GrowFailed cleanly rather than aborting.
         with_address_space_cap(|| {
-            let result = run(&[Op::MoveRight(u32::MAX)], Cursor::new(b""), &mut Vec::new());
+            let result = run(&[Op::MoveRight(u32::MAX)], &mut Cursor::new(b""), &mut Vec::new());
             assert!(matches!(result, Err(RunError::GrowFailed)));
 
             let result = run(
@@ -498,14 +511,14 @@ mod tests {
                         factor: 1,
                     },
                 ],
-                Cursor::new(b""),
+                &mut Cursor::new(b""),
                 &mut Vec::new(),
             );
             assert!(matches!(result, Err(RunError::GrowFailed)));
 
             let result = run(
                 &[Op::Add(1), Op::Scan { stride: 2_000_000_000 }],
-                Cursor::new(b""),
+                &mut Cursor::new(b""),
                 &mut Vec::new(),
             );
             assert!(matches!(result, Err(RunError::GrowFailed)));

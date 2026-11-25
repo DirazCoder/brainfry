@@ -223,6 +223,20 @@ mod tests {
         mark_executable("/nonexistent/bfnative-coverage-probe");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn mark_executable_sets_the_mode_on_a_real_file() {
+        // The missing-file test only walks the error arm; this one walks
+        // the success arm (metadata found, mode changed) end to end.
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir().join(format!("bfnative-chmod-{}", std::process::id()));
+        std::fs::write(&path, b"#!/bin/sh\n").unwrap();
+        mark_executable(path.to_str().unwrap());
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o111, 0o111, "execute bits must be set");
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn default_output_path_adds_exe_only_for_windows() {
         let input = "some/dir/program.bf";
