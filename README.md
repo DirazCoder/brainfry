@@ -272,6 +272,29 @@ the Rust compiler supports.)
 | `windows-x86_64` | **executed** | CI on `windows-latest`: `VirtualAlloc`/`VirtualProtect` + `FlushInstructionCache` |
 | `windows-aarch64` | **executed** | CI on `windows-11-arm`: same Windows path on ARM64 |
 
+## Usage: bfwasm
+
+```
+bfwasm program.bf              # writes program.wasm
+bfwasm program.bf -o out.wasm  # or pick the output name yourself
+wasmtime run program.wasm      # any WASI preview1 runtime
+```
+
+The output is a standalone WASI module, not a browser one. It does its I/O
+through `fd_read` and `fd_write`, which browsers don't provide, so running
+it on a web page means supplying a WASI shim yourself.
+
+Semantics are `bfrun`'s: 30,000 starting cells, 8-bit wrapping, EOF leaving
+the cell untouched. Moving left of cell 0 prints `runtime error: pointer
+moved left of cell 0` to stderr and exits with status 1 (through WASI's
+`proc_exit`), same as every other backend.
+
+Two failures can't do that. If `memory.grow` is refused (the tape is capped
+at 1 GiB, same as `bfnative`) or a WASI read or write returns an error, the
+module hits a wasm trap, which has no text to print. What a trap turns into
+(exit status, any message) is up to the runtime, and the differential
+harness doesn't exercise either path.
+
 ## Benchmarks (mandelbrot.b)
 
 Four execution strategies, one program, byte-identical output (6,240
@@ -392,13 +415,24 @@ not something this doc is deciding.
 
 Every target now runs for real. `.github/workflows/test.yml` builds all
 six on a native GitHub-hosted runner (same OS and architecture, no
-emulation) and runs `scripts/differential_test_all.py`: 26 programs (the
-25-program corpus plus `mandelbrot.b`) through `bfinterp`,
-`bfinterp --optimize`, `bfrun`, `bfnative` and `bfjit`, with stdout,
-stderr and exit status required to be byte-identical to `bfrun`. The
-corpus covers hello world, six-deep nesting, multiplication loops, tape
-growth to 200k cells, wraparound, EOF semantics, stdin echo, and every
-runtime-error path.
+emulation) and runs `scripts/differential_test_all.py`: 31 programs (the
+25-program corpus, five regression programs for folded scans and multiply
+loops, plus `mandelbrot.b`) through `bfinterp`, `bfinterp --optimize`,
+`bfrun`, `bfnative`, `bfjit` and `bfwasm`, with stdout, stderr and exit
+status required to be byte-identical to `bfrun`. The corpus covers hello
+world, six-deep nesting, multiplication loops, tape growth to 200k cells,
+wraparound, EOF semantics, stdin echo, and every runtime-error path.
+
+`bfwasm` was the last backend added to the harness, and its first runs
+found two real bugs. The optimizer's folded scan and multiply-add ops lose
+their loop's zero check, and `bfwasm` hadn't put it back, so `[<]` on a
+zero cell stepped left anyway and `mandelbrot.b` died at the left edge.
+Separately, left-of-cell-0 was a bare trap with no message instead of
+`bfrun`'s error and exit status 1. Both are fixed and both have small
+regression programs in the corpus. The module runs under `wasmtime` through
+its Python package, which CI installs with pip. If that install fails on a
+runner, the lane is skipped with a warning rather than failing the build,
+so check the job's annotations before assuming wasm is covered there.
 
 | Target | Status | Runner | Also checked statically |
 |---|---|---|---|
@@ -431,6 +465,10 @@ verify.
 CI runs the differential harness, not `cargo test`. The unit tests
 (PE and Mach-O header checks, instruction encoders) only run when someone
 runs `cargo test` locally, so a failing one can sit red unnoticed.
+
+`bfwasm` is only ever run under `wasmtime`. The module should work on any
+WASI preview1 runtime, but CI doesn't try `wasmer`, Node or a browser shim,
+and runtimes differ on what a trap does (see Usage: bfwasm).
 
 Each target is exercised on one runner image (listed above). Other
 Windows and macOS releases, or older Linux distributions, aren't covered.
