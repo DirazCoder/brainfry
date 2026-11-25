@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Four-way differential test harness: bfinterp vs bfrun vs bfnative vs bfjit.
+"""Five-way differential test harness: bfinterp vs bfrun vs bfnative vs bfjit
+vs bfwasm.
 
-Every program in the corpus is run through four execution strategies fed by
+Every program in the corpus is run through five execution strategies fed by
 one shared parser/optimizer front end:
 
   1. `bfinterp`         — naive raw-source interpreter (default, no optimizer)
@@ -9,6 +10,11 @@ one shared parser/optimizer front end:
   3. `bfrun`            — bytecode VM (via bfc; the project's ground truth)
   4. `bfnative`         — ahead-of-time native executable
   5. `bfjit`            — JIT: same codegen as bfnative, executed in memory
+  6. `bfwasm`           — compiles to a standalone .wasm, run under wasmtime
+
+bfwasm is a soft dependency: if the `wasmtime` Python package isn't
+installed, that lane is skipped (with a note) rather than failing the run,
+since it's an external runtime rather than something `cargo build` produces.
 
 stdout, stderr, and exit status must be byte-identical across all of them.
 The corpus is the 25-program set from differential_test.py (deep nesting,
@@ -52,7 +58,14 @@ BFRUN = os.path.join(ROOT, "target", "release", "bfrun" + EXE)
 BFNATIVE = os.path.join(ROOT, "target", "release", "bfnative" + EXE)
 BFINTERP = os.path.join(ROOT, "target", "release", "bfinterp" + EXE)
 BFJIT = os.path.join(ROOT, "target", "release", "bfjit" + EXE)
+BFWASM = os.path.join(ROOT, "target", "release", "bfwasm" + EXE)
 MANDELBROT = os.path.join(ROOT, "tests", "mandelbrot.b")
+
+try:
+    import wasmtime
+    HAVE_WASMTIME = True
+except ImportError:
+    HAVE_WASMTIME = False
 
 QEMU_AARCH64 = os.environ.get("QEMU_AARCH64", "")
 BFJIT_AARCH64 = os.environ.get("BFJIT_AARCH64", "")
@@ -198,6 +211,60 @@ def run_native(source, stdin):
         return run_cmd([exe], stdin, td)
 
 
+def run_wasm(source, stdin):
+    """bfwasm -> execute the produced module under wasmtime's WASI preview1.
+
+    stdin/stdout/stderr are backed by real files rather than pipes: the
+    `wasmtime` embedding API takes WASI file paths, not in-memory streams.
+    """
+    with tempfile.TemporaryDirectory() as td:
+        src = os.path.join(td, "p.bf")
+        wasm_path = os.path.join(td, "p.wasm")
+        stdin_path = os.path.join(td, "stdin")
+        stdout_path = os.path.join(td, "stdout")
+        stderr_path = os.path.join(td, "stderr")
+        with open(src, "w") as f:
+            f.write(source)
+        c = subprocess.run([BFWASM, src, "-o", wasm_path], capture_output=True)
+        if c.returncode != 0:
+            return c.returncode, c.stdout, c.stderr
+
+        with open(stdin_path, "w") as f:
+            f.write(stdin)
+
+        engine = wasmtime.Engine()
+        module = wasmtime.Module.from_file(engine, wasm_path)
+        linker = wasmtime.Linker(engine)
+        linker.define_wasi()
+
+        wasi = wasmtime.WasiConfig()
+        wasi.stdin_file = stdin_path
+        wasi.stdout_file = stdout_path
+        wasi.stderr_file = stderr_path
+
+        store = wasmtime.Store(engine)
+        store.set_wasi(wasi)
+        instance = linker.instantiate(store, module)
+        start = instance.exports(store)["_start"]
+        try:
+            start(store)
+            exit_code = 0
+        except wasmtime.ExitTrap as trap:
+            exit_code = trap.code
+        except wasmtime.Trap:
+            # Any other trap (unreachable, out-of-bounds memory access, ...)
+            # has no real exit code — 134 mirrors the SIGABRT a native
+            # equivalent would raise, keeping it in the same ballpark as
+            # bfnative's trap handling for comparison purposes.
+            exit_code = 134
+
+        with open(stdout_path, "rb") as f:
+            out = f.read()
+        with open(stderr_path, "rb") as f:
+            err = f.read()
+        return exit_code, out, err
+
+
 def run_emulated(binary, emulator, source, stdin):
     """An aarch64 tool binary under qemu-aarch64-static."""
     with tempfile.TemporaryDirectory() as td:
@@ -236,11 +303,15 @@ def run_emulated_bfrun(binary, emulator, source, stdin):
 
 
 def main() -> int:
-    tools = [BFC, BFRUN, BFNATIVE, BFINTERP, BFJIT]
+    tools = [BFC, BFRUN, BFNATIVE, BFINTERP, BFJIT, BFWASM]
     missing = [t for t in tools if not os.path.exists(t)]
     if missing:
         print(f"missing {missing[0]} — run `cargo build --release` first")
         return 1
+
+    if not HAVE_WASMTIME:
+        print("note: `wasmtime` Python package not installed — "
+              "skipping the bfwasm lane (pip install wasmtime)\n")
 
     corpus = CORPUS + load_mandelbrot()
 
@@ -269,6 +340,8 @@ def main() -> int:
             ("bfnative", run_native(source, stdin)),
             ("bfjit", run_source_tool(BFJIT, source, stdin)),
         ]
+        if HAVE_WASMTIME:
+            results.append(("bfwasm", run_wasm(source, stdin)))
         for lane, path in aarch64_lanes:
             if lane == "bfrun":
                 results.append((f"{lane}(qemu)",
