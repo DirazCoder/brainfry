@@ -408,7 +408,7 @@ unsafe fn alloc_region(len: usize) -> Result<JitRegion, String> {
         let base = VirtualAlloc(core::ptr::null_mut(), len, ty, windows::PAGE_READWRITE);
         if base.is_null() {
             return Err(format!(
-                "VirtualAlloc failed for JIT memory ({} bytes): {}",
+                "failed to map JIT memory ({} bytes): {}",
                 len,
                 std::io::Error::last_os_error()
             ));
