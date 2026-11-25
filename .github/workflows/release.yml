@@ -50,6 +50,12 @@ jobs:
         run: |
           cargo build --release --target ${{ matrix.target }} -p bfc -p bfrun -p bfnative -p bfinterp -p bfjit -p bfwasm
 
+      - name: install 7-Zip (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y 7zip
+
       - name: package (unix)
         if: runner.os != 'Windows'
         shell: bash
@@ -63,7 +69,8 @@ jobs:
           cp target/${{ matrix.target }}/release/bfjit "$staging/"
           cp target/${{ matrix.target }}/release/bfwasm "$staging/"
           cp README.md "$staging/"
-          zip -r "Brainfry-0.1.0-${{ matrix.archive_name }}.zip" "$staging"
+          sevenzip="$(command -v 7z || command -v 7zz)"
+          "$sevenzip" a -mx=9 "Brainfry-0.1.0-${{ matrix.archive_name }}.7z" "$staging"
 
       - name: package (windows)
         if: runner.os == 'Windows'
@@ -78,11 +85,12 @@ jobs:
           Copy-Item "target/${{ matrix.target }}/release/bfjit.exe" $staging/
           Copy-Item "target/${{ matrix.target }}/release/bfwasm.exe" $staging/
           Copy-Item README.md $staging/
-          Compress-Archive -Path $staging -DestinationPath "Brainfry-0.1.0-${{ matrix.archive_name }}.zip"
+          $sevenZip = Join-Path $env:ProgramFiles "7-Zip\7z.exe"
+          & $sevenZip a -mx=9 "Brainfry-0.1.0-${{ matrix.archive_name }}.7z" $staging
 
       - uses: actions/upload-artifact@v7
         with:
-          path: Brainfry-0.1.0-${{ matrix.archive_name }}.zip
+          path: Brainfry-0.1.0-${{ matrix.archive_name }}.7z
           archive: false
 
   release:
@@ -97,4 +105,4 @@ jobs:
 
       - uses: softprops/action-gh-release@v3
         with:
-          files: artifacts/*.zip
+          files: artifacts/*.7z
