@@ -136,16 +136,24 @@ fn a_broken_stdout_pipe_is_a_clean_io_error() {
     // standard "runtime error: I/O error" exit, not a crash. This run
     // writes a single buffered byte, so the failure lands on the final
     // flush.
+    //
+    // A single-byte write can complete before the parent gets around to
+    // closing its end of the stdout pipe, since nothing stops the child
+    // from reaching Output immediately after exec. So the program first
+    // blocks on Input: the child can't reach Output until the parent
+    // closes stdin (sending EOF), and by then stdout has already been
+    // closed too, making the race deterministic.
     let dir = temp_dir("broken-pipe-flush");
-    let path = write_bfry(&dir, vec![Op::Add(65), Op::Output]);
+    let path = write_bfry(&dir, vec![Op::Input, Op::Add(65), Op::Output]);
     let mut child = Command::new(env!("CARGO_BIN_EXE_bfrun"))
         .arg(&path)
-        .stdin(Stdio::null())
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .expect("running bfrun");
     drop(child.stdout.take()); // reader gone before the program runs
+    drop(child.stdin.take()); // EOF: release the child to reach Output
     let output = child.wait_with_output().expect("waiting for bfrun");
     assert_eq!(output.status.code(), Some(1));
     assert!(
@@ -158,18 +166,24 @@ fn a_broken_stdout_pipe_is_a_clean_io_error() {
 #[test]
 fn a_failing_write_on_a_broken_pipe_is_a_clean_io_error() {
     // Same setup, but enough output to overflow the line buffer so the
-    // failure lands on write itself rather than the flush.
+    // failure lands on write itself rather than the flush. Leads with
+    // Input for the same reason as the test above: it stops the child
+    // from writing anything until the parent has closed both ends it
+    // holds, so filling (and then overflowing) the pipe buffer can't
+    // race ahead of the parent closing its read end.
     let dir = temp_dir("broken-pipe-write");
-    let ops: Vec<Op> = (0..2048).map(|_| Op::Output).collect();
+    let mut ops = vec![Op::Input];
+    ops.extend((0..2048).map(|_| Op::Output));
     let path = write_bfry(&dir, ops);
     let mut child = Command::new(env!("CARGO_BIN_EXE_bfrun"))
         .arg(&path)
-        .stdin(Stdio::null())
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .expect("running bfrun");
     drop(child.stdout.take());
+    drop(child.stdin.take());
     let output = child.wait_with_output().expect("waiting for bfrun");
     assert_eq!(output.status.code(), Some(1));
     assert!(
