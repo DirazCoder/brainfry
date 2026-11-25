@@ -96,6 +96,7 @@ const SECTION_FUNCTION: u8 = 3;
 const SECTION_MEMORY: u8 = 5;
 const SECTION_EXPORT: u8 = 7;
 const SECTION_CODE: u8 = 10;
+const SECTION_DATA: u8 = 11;
 
 const TYPE_FUNC: u8 = 0x60;
 const VALTYPE_I32: u8 = 0x7f;
@@ -124,6 +125,7 @@ const OP_I32_MUL: u8 = 0x6c;
 const OP_MEMORY_SIZE: u8 = 0x3f;
 const OP_MEMORY_GROW: u8 = 0x40;
 const OP_I32_DIV_U: u8 = 0x6e;
+const OP_DROP: u8 = 0x1a;
 const OPCODE_IF: u8 = 0x04;
 
 /// WASI import slots, in the order they're declared in the import section —
@@ -131,6 +133,23 @@ const OPCODE_IF: u8 = 0x04;
 /// [`Body::call_wasi_io`]'s callers have to agree with it.
 const WASI_FD_WRITE: u32 = 0;
 const WASI_FD_READ: u32 = 1;
+const WASI_PROC_EXIT: u32 = 2;
+
+/// Locally-defined functions come after the three imports in the function
+/// index space.
+const FN_START: u32 = 3;
+const FN_UNDERFLOW: u32 = 4;
+
+/// Type-section slot for `(i32) -> ()`, which is `proc_exit`'s signature.
+const TYPE_EXIT: u32 = 2;
+
+/// Exactly what bfrun and bfnative print when the pointer walks left of
+/// cell 0; the differential harness compares stderr byte for byte.
+const UNDERFLOW_MSG: &str = "runtime error: pointer moved left of cell 0\n";
+
+/// Lives in the reserved I/O page, past the iovec (16 bytes) and the
+/// one-byte data buffer, so it can't collide with the tape.
+const UNDERFLOW_MSG_OFFSET: u32 = IO_SCRATCH_OFFSET + 32;
 
 /// Converts a `MoveRight`/`MoveLeft` magnitude to a signed cell delta.
 /// `Op`'s move counts are `u32`, but every address in this backend is a
@@ -140,7 +159,7 @@ const WASI_FD_READ: u32 = 1;
 /// should be. `MAX_PAGES` caps the tape at 1 GiB either way, so no
 /// well-behaved program's single move ever approaches this; clamping to
 /// `i32::MAX` here just guarantees a single `.bf` file with billions of
-/// consecutive `>`/`<` fails the ordinary bounds-check trap in `move_ptr`
+/// consecutive `>`/`<` fails the ordinary bounds check in `move_ptr`
 /// instead of silently miscompiling.
 fn move_delta(magnitude: u32) -> i32 {
     magnitude.min(i32::MAX as u32) as i32
@@ -166,18 +185,24 @@ pub fn compile(ops: &[Op]) -> Vec<u8> {
     section(&mut module, SECTION_FUNCTION, &function_section());
     section(&mut module, SECTION_MEMORY, &memory_section());
     section(&mut module, SECTION_EXPORT, &export_section());
-    section(&mut module, SECTION_CODE, &code_section(&body.code));
+    section(
+        &mut module,
+        SECTION_CODE,
+        &code_section(&body.code, &underflow_function_body()),
+    );
+    section(&mut module, SECTION_DATA, &data_section());
 
     module
 }
 
-/// Two function types: `(i32, i32, i32, i32) -> i32` for the WASI imports
+/// Three function types: `(i32, i32, i32, i32) -> i32` for the WASI imports
 /// (every `fd_write`/`fd_read` signature, regardless of how many args a
 /// given call site actually varies), and `() -> ()` for `_start`, the
-/// signature the WASI convention requires for the entry point.
+/// signature the WASI convention requires for the entry point, and
+/// `(i32) -> ()` for `proc_exit`.
 fn type_section() -> Vec<u8> {
     let mut out = Vec::new();
-    uleb(&mut out, 2);
+    uleb(&mut out, 3);
 
     out.push(TYPE_FUNC);
     uleb(&mut out, 4);
@@ -191,14 +216,20 @@ fn type_section() -> Vec<u8> {
     uleb(&mut out, 0);
     uleb(&mut out, 0);
 
+    out.push(TYPE_FUNC);
+    uleb(&mut out, 1);
+    out.push(VALTYPE_I32);
+    uleb(&mut out, 0);
+
     out
 }
 
 fn import_section() -> Vec<u8> {
     let mut out = Vec::new();
-    uleb(&mut out, 2);
+    uleb(&mut out, 3);
     import_func(&mut out, "wasi_snapshot_preview1", "fd_write", 0);
     import_func(&mut out, "wasi_snapshot_preview1", "fd_read", 0);
+    import_func(&mut out, "wasi_snapshot_preview1", "proc_exit", TYPE_EXIT);
     out
 }
 
@@ -209,9 +240,11 @@ fn import_func(out: &mut Vec<u8>, module: &str, name: &str, type_index: u32) {
     uleb(out, type_index as u64);
 }
 
-/// One locally-defined function (`_start`), using type index 1.
+/// Two locally-defined functions, `_start` and the underflow helper, both
+/// `() -> ()` (type index 1).
 fn function_section() -> Vec<u8> {
     let mut out = Vec::new();
+    uleb(&mut out, 2);
     uleb(&mut out, 1);
     uleb(&mut out, 1);
     out
@@ -238,7 +271,7 @@ fn memory_section() -> Vec<u8> {
 fn export_section() -> Vec<u8> {
     let mut out = Vec::new();
     uleb(&mut out, 2);
-    export_entry(&mut out, "_start", 0x00, 2); // function index 2: imports take 0 and 1
+    export_entry(&mut out, "_start", 0x00, FN_START);
     export_entry(&mut out, "memory", 0x02, 0);
     out
 }
@@ -249,11 +282,53 @@ fn export_entry(out: &mut Vec<u8>, name: &str, kind: u8, index: u32) {
     uleb(out, index as u64);
 }
 
-fn code_section(function_body: &[u8]) -> Vec<u8> {
+fn code_section(start_body: &[u8], underflow_body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    uleb(&mut out, 2);
+    for body in [start_body, underflow_body] {
+        uleb(&mut out, body.len() as u64);
+        out.extend_from_slice(body);
+    }
+    out
+}
+
+/// Writes `UNDERFLOW_MSG` to stderr and exits with status 1 through
+/// `proc_exit`. A bare `unreachable` trap gave the host no way to tell
+/// this apart from a codegen bug (exit status and stderr both differed
+/// from every other backend), so underflow goes through here instead.
+fn underflow_function_body() -> Vec<u8> {
+    let mut body = Body { code: Vec::new() };
+    uleb(&mut body.code, 0); // no locals
+
+    body.const_i32(IO_SCRATCH_OFFSET as i32);
+    body.const_i32(UNDERFLOW_MSG_OFFSET as i32);
+    body.code.push(OP_I32_STORE); // iovec.buf
+    body.mem_arg(2, 0);
+    body.const_i32(IO_SCRATCH_OFFSET as i32);
+    body.const_i32(UNDERFLOW_MSG.len() as i32);
+    body.code.push(OP_I32_STORE); // iovec.len
+    body.mem_arg(2, 4);
+
+    body.call_wasi_io(2, WASI_FD_WRITE);
+    body.code.push(OP_DROP); // a failed stderr write can't be reported anywhere
+
+    body.const_i32(1);
+    body.code.push(OP_CALL);
+    uleb(&mut body.code, WASI_PROC_EXIT as u64);
+    body.finish();
+    body.code
+}
+
+/// One active segment copying `UNDERFLOW_MSG` into the I/O page at
+/// instantiation time.
+fn data_section() -> Vec<u8> {
     let mut out = Vec::new();
     uleb(&mut out, 1);
-    uleb(&mut out, function_body.len() as u64);
-    out.extend_from_slice(function_body);
+    uleb(&mut out, 0); // flag 0: active, memory 0
+    out.push(OP_I32_CONST);
+    sleb(&mut out, UNDERFLOW_MSG_OFFSET as i64);
+    out.push(OP_END);
+    byte_vec(&mut out, UNDERFLOW_MSG.as_bytes());
     out
 }
 
@@ -462,12 +537,12 @@ impl Body {
     }
 
     /// Moves `$ptr` by `delta` cells (delta already carries its sign), then
-    /// checks the new position: underflow traps immediately, since there's
-    /// no sane fallback for walking left of cell 0; a position past the
+    /// checks the new position: underflow reports bfrun's error and exits
+    /// with status 1 (see `underflow_function_body`), since there's no
+    /// sane fallback for walking left of cell 0; a position past the
     /// currently-committed memory grows first. Matches
     /// `bfnative::codegen`'s per-op bounds check rather than deferring to a
-    /// single boundary check per program — see the module doc comment for
-    /// why a wasm trap is this backend's version of that error path.
+    /// single boundary check per program.
     fn move_ptr(&mut self, delta: i32) {
         self.code.push(OP_LOCAL_GET);
         uleb(&mut self.code, 0);
@@ -478,19 +553,31 @@ impl Body {
 
         self.const_i32(0);
         self.code.push(OP_I32_LT_S);
-        self.trap_if();
+        self.underflow_if();
 
         if delta > 0 {
             self.emit_grow_check_for(0); // $ptr
         }
     }
 
-    /// `if (cond) { unreachable }` — the trap idiom every bounds check in
-    /// this file uses. Deliberately not a `br_if` to a shared trap label:
-    /// a wasm function body has no implicit outer label to branch to, and
-    /// giving every trap site its own tiny `block` just to have somewhere
-    /// to `br_if` into would be more ceremony than an inline `unreachable`
-    /// guarded by an `if`. Consumes the i32 condition on the stack.
+    /// `if (cond) { call $underflow }`: consumes an i32 condition and, if
+    /// set, reports the left-of-cell-0 error and exits instead of trapping.
+    fn underflow_if(&mut self) {
+        self.code.push(OPCODE_IF);
+        self.code.push(BLOCKTYPE_EMPTY);
+        self.code.push(OP_CALL);
+        uleb(&mut self.code, FN_UNDERFLOW as u64);
+        self.code.push(OP_END);
+    }
+
+    /// `if (cond) { unreachable }` — the trap idiom for the failures that
+    /// have no message to print (`memory.grow` failing, a nonzero WASI
+    /// errno); left-of-cell-0 goes through `underflow_if` instead.
+    /// Deliberately not a `br_if` to a shared trap label: a wasm function
+    /// body has no implicit outer label to branch to, and giving every
+    /// trap site its own tiny `block` just to have somewhere to `br_if`
+    /// into would be more ceremony than an inline `unreachable` guarded
+    /// by an `if`. Consumes the i32 condition on the stack.
     fn trap_if(&mut self) {
         self.code.push(OPCODE_IF);
         self.code.push(BLOCKTYPE_EMPTY);
@@ -653,7 +740,7 @@ impl Body {
 
         self.const_i32(0);
         self.code.push(OP_I32_LT_S);
-        self.trap_if();
+        self.underflow_if();
 
         if offset > 0 {
             self.emit_grow_check_for(2); // $target, not $ptr
@@ -677,6 +764,14 @@ impl Body {
     /// see `bfnative::codegen::{x86_64,aarch64}::emit_mul_add`'s matching
     /// comment, which this backend didn't follow the first time around.
     fn emit_mul_add(&mut self, offset: i32, factor: u8) {
+        // The loop this replaced never ran when the source cell was zero,
+        // so the target must not even be bounds-checked then: a folded
+        // `[-<<+>>]` near cell 0 is fine as long as the source is empty.
+        // bfrun and bfnative both guard on the source value the same way.
+        self.load_cell();
+        self.code.push(OPCODE_IF);
+        self.code.push(BLOCKTYPE_EMPTY);
+
         self.bounds_checked_target(offset); // stack: [target_addr]
 
         self.code.push(OP_LOCAL_GET);
@@ -690,6 +785,8 @@ impl Body {
         self.code.push(OP_I32_ADD);
         self.code.push(OP_I32_STORE8);
         self.mem_arg(0, 0);
+
+        self.code.push(OP_END); // if
     }
 
     /// `[>]`/`[<]`-style fold: step `$ptr` by `stride` cells until landing
@@ -701,6 +798,13 @@ impl Body {
     /// `move_ptr`'s underflow/grow checks so a scan can't walk past the
     /// tape bounds any move sequence would've been stopped at.
     fn emit_scan(&mut self, stride: i32) {
+        // `[<]` on a zero cell must not move at all. The loop below steps
+        // before it tests, so without this guard a scan starting on zero
+        // walks one cell anyway (off the left edge, for mandelbrot.b).
+        self.load_cell();
+        self.code.push(OPCODE_IF);
+        self.code.push(BLOCKTYPE_EMPTY);
+
         self.code.push(OP_LOOP);
         self.code.push(BLOCKTYPE_EMPTY);
 
@@ -713,7 +817,7 @@ impl Body {
 
         self.const_i32(0);
         self.code.push(OP_I32_LT_S);
-        self.trap_if();
+        self.underflow_if();
         if stride > 0 {
             self.emit_grow_check_for(0); // $ptr
         }
@@ -723,6 +827,7 @@ impl Body {
         uleb(&mut self.code, 0); // still nonzero: keep scanning
 
         self.code.push(OP_END); // loop
+        self.code.push(OP_END); // if
     }
 }
 
@@ -751,6 +856,14 @@ mod tests {
         assert!(text.contains("wasi_snapshot_preview1"));
         assert!(text.contains("fd_write"));
         assert!(text.contains("fd_read"));
+    }
+
+    #[test]
+    fn module_imports_proc_exit_and_embeds_underflow_message() {
+        let module = compile(&[]);
+        let text = String::from_utf8_lossy(&module);
+        assert!(text.contains("proc_exit"));
+        assert!(text.contains(UNDERFLOW_MSG));
     }
 
     #[test]

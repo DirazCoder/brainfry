@@ -139,6 +139,24 @@ CORPUS = [
     ("many-small-loops",
      "+[>+[>+<-]<-]>",  # idiom stress
      ""),
+    # Loops folded into Scan/MulAdd lose their own zero check, so these
+    # pin down that the folded forms still skip a zero cell entirely
+    # (no move, no bounds check) rather than stepping once first.
+    ("scan-left-on-zero-cell",
+     "[<]+.",
+     ""),
+    ("scan-right-on-zero-cell",
+     "[>]+.",
+     ""),
+    ("scan-stops-on-zero",
+     "+>+>+<<[>]+.",
+     ""),
+    ("fold-negative-offset-zero-source",
+     "[-<+>]+.",
+     ""),
+    ("fold-negative-offset-nonzero-source",
+     ">+++[-<+>]<.",
+     ""),
     # Runtime-error cases: every tool must reproduce bfrun's message and
     # exit status exactly.
     ("underflow-immediate",
@@ -229,8 +247,8 @@ def run_wasm(source, stdin):
         if c.returncode != 0:
             return c.returncode, c.stdout, c.stderr
 
-        with open(stdin_path, "w") as f:
-            f.write(stdin)
+        with open(stdin_path, "wb") as f:
+            f.write(stdin.encode())
 
         engine = wasmtime.Engine()
         module = wasmtime.Module.from_file(engine, wasm_path)
