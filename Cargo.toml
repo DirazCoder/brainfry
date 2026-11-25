@@ -3,9 +3,12 @@ resolver = "2"
 members = ["bfformat", "bfc", "bfrun", "bfnative", "bfinterp", "bfjit", "bfwasm"]
 
 [profile.release]
-opt-level = 3
-lto = "fat"
-codegen-units = 1
-strip = "symbols"
-panic = "abort"
-overflow-checks = false
+opt-level = 3              
+lto = "fat"                
+codegen-units = 1         
+panic = "abort"          
+strip = "symbols"       
+overflow-checks = false    
+debug = false               
+debug-assertions = false    
+incremental = false       
