@@ -428,6 +428,9 @@ status required to be byte-identical to `bfrun`. The corpus covers hello
 world, six-deep nesting, multiplication loops, tape growth to 200k cells,
 wraparound, EOF semantics, stdin echo, and every runtime-error path.
 
+The Rust workspace has 100% verified test coverage, measured with
+`cargo-llvm-cov`.
+
 `bfwasm` was the last backend added to the harness, and its first runs
 found two real bugs. The optimizer's folded scan and multiply-add ops lose
 their loop's zero check, and `bfwasm` hadn't put it back, so `[<]` on a
