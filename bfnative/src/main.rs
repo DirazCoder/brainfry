@@ -240,7 +240,8 @@ mod tests {
     #[test]
     fn default_output_path_adds_exe_only_for_windows() {
         let input = "some/dir/program.bf";
-        assert_eq!(default_output_path(input, Target::host()), "some/dir/program");
+        let linux = Target::from_name("linux-x86_64").unwrap();
+        assert_eq!(default_output_path(input, linux), "some/dir/program");
         let windows = Target::from_name("windows-x86_64").unwrap();
         assert_eq!(default_output_path(input, windows), "some/dir/program.exe");
     }
