@@ -123,3 +123,44 @@ pub(crate) fn align_up(value: u64, align: u64) -> u64 {
     debug_assert!(align.is_power_of_two());
     (value + align - 1) & !(align - 1)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A module with hand-set labels and one fixup, so a range violation can
+    /// be constructed without emitting two gigabytes of code.
+    fn synthetic_module() -> Module {
+        Module {
+            code: vec![0; 8],
+            labels: vec![0, 0x8000_0008], // label 1 sits past +2^31 from pos 0
+            fixups: vec![Fixup {
+                pos: 0,
+                kind: PatchKind::X86Rel32,
+                target: PatchTarget::Label(1),
+            }],
+            rodata: Vec::new(),
+            spans: Vec::new(),
+        }
+    }
+
+    fn layout() -> Layout {
+        Layout {
+            code_vaddr: 0,
+            rodata_vaddr: 0,
+            got_vaddr: 0,
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "x86 rel32 branch out of range")]
+    fn x86_rel32_out_of_range_panics_rather_than_wrapping() {
+        // The object writers assert (rather than return errors) because a
+        // branch that can't reach its target is a codegen bug, and a
+        // silently wrapped displacement would be a miscompile. This drives
+        // the range check for real: label 1 past +2^31 bytes is unreachable
+        // from fixup position 0 in a signed 32-bit displacement.
+        let mut module = synthetic_module();
+        patch(&mut module, &layout());
+    }
+}

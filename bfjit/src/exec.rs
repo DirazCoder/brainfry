@@ -109,6 +109,14 @@ impl JitRegion {
     ///
     /// The entry never returns: it runs the program and terminates the
     /// process with the program's exit status, so this call has type `!`.
+    // coverage(off) (nightly coverage runs only — the attribute is unstable,
+    // so it is cfg-gated): these lines execute *after* the final coverage
+    // counter dump by construction — main() flushes the profile immediately
+    // before jumping here because the generated entry exits via raw
+    // syscall, skipping the atexit-based writer. No profile can ever
+    // contain these lines; the behavior itself is pinned by the e2e suite
+    // (every successful run goes through here).
+    #[cfg_attr(coverage_nightly, coverage(off))]
     pub unsafe fn enter(&self) -> ! {
         // macOS-ARM64 special case: the generated entry assumes dyld's
         // LC_MAIN stack alignment (sp 16-byte aligned at entry) and calls
@@ -451,6 +459,52 @@ mod tests {
 
             // Leave it writable: the test never executes it, and the real
             // binary never frees either (see the type docs).
+        }
+    }
+
+    #[test]
+    fn an_impossible_allocation_maps_to_an_error() {
+        // usize::MAX can never be mapped; the result must be a clean Err
+        // (the CLI prints it and exits), never an abort.
+        unsafe {
+            let result = JitRegion::alloc(usize::MAX);
+            let message = result.err().expect("usize::MAX must fail");
+            assert!(
+                message.contains("failed to map JIT memory"),
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn w_x_flip_succeeds_on_a_well_formed_region() {
+        unsafe {
+            let region = JitRegion::alloc(0x1000).expect("alloc");
+            region.write_bytes(0, b"int3");
+            protect_exec(region.base, region.len)
+                .expect("aligned mprotect must succeed");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mprotect_failure_is_reported_not_ignored() {
+        // mprotect rejects a non-page-aligned address with EINVAL, which is
+        // the one deterministic way to make the W^X flip fail; the error
+        // must carry the OS message, and the region must be unaffected.
+        unsafe {
+            let region = JitRegion::alloc(0x1000).expect("alloc");
+            let message = protect_exec(region.base.add(1), 0x1000)
+                .err()
+                .expect("unaligned mprotect must fail");
+            assert!(
+                message.contains("failed to make JIT memory executable"),
+                "{message}"
+            );
+            // The failed flip leaves the region writable: prove the bytes
+            // are still there and mutable.
+            region.write_bytes(0, b"still writable");
+            assert_eq!(*region.base, b's');
         }
     }
 }

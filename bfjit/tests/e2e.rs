@@ -139,6 +139,84 @@ fn unmatched_brackets_fail_before_jitting() {
 }
 
 #[test]
+fn help_flag_prints_usage_and_succeeds() {
+    let dir = std::env::temp_dir().join("bfjit-e2e-help");
+    fs::create_dir_all(&dir).expect("creating temp dir");
+    let source_path = dir.join("program.bf");
+    fs::write(&source_path, HELLO_WORLD).expect("writing test program");
+    let out = Command::new(env!("CARGO_BIN_EXE_bfjit"))
+        .arg(&source_path)
+        .arg("--help")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("running bfjit");
+    assert_eq!(out.status.code(), Some(0));
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("usage: bfjit"),
+        "{:?}",
+        out.stdout
+    );
+}
+
+#[test]
+fn unreadable_input_fails_cleanly() {
+    let out = Command::new(env!("CARGO_BIN_EXE_bfjit"))
+        .arg("/nonexistent/bfjit-e2e/nope.bf")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("running bfjit");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("couldn't read"),
+        "{:?}",
+        out.stderr
+    );
+}
+
+#[test]
+fn unknown_option_fails_before_compiling() {
+    let source_path = write_source("unknown-opt", HELLO_WORLD);
+    let out = Command::new(env!("CARGO_BIN_EXE_bfjit"))
+        .arg("--wat")
+        .arg(&source_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("running bfjit");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("unknown option: --wat"),
+        "{:?}",
+        out.stderr
+    );
+}
+
+#[test]
+fn more_than_one_input_file_is_rejected() {
+    let a = write_source("two-inputs-a", HELLO_WORLD);
+    let b = write_source("two-inputs-b", HELLO_WORLD);
+    let out = Command::new(env!("CARGO_BIN_EXE_bfjit"))
+        .arg(&a)
+        .arg(&b)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("running bfjit");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("more than one input file"),
+        "{:?}",
+        out.stderr
+    );
+}
+
+#[test]
 fn cross_target_request_is_rejected() {
     // bfjit is host-only; --target must fail clearly, not JIT for a
     // foreign architecture.

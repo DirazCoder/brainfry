@@ -632,18 +632,23 @@ mod tests {
             );
             assert_eq!(desc_size, 40);
             let to_rva = |rva: u64| -> usize {
-                // Map RVA → file offset using the section table.
-                for i in 0..3 {
-                    let h = 0x148 + 40 * i;
-                    let vsize = u32::from_le_bytes(bytes[h + 8..h + 12].try_into().unwrap()) as u64;
-                    let rva_sec =
-                        u32::from_le_bytes(bytes[h + 12..h + 16].try_into().unwrap()) as u64;
-                    let raw = u32::from_le_bytes(bytes[h + 20..h + 24].try_into().unwrap()) as u64;
-                    if rva >= rva_sec && rva < rva_sec + vsize {
-                        return (raw + (rva - rva_sec)) as usize;
-                    }
-                }
-                panic!("rva {rva:#x} not in any section");
+                // Map RVA → file offset using the section table. Written as
+                // find_map + expect so there is no unexercised panic branch
+                // of our own in the file: the only way to hit the expect is
+                // this test misparsing a PE it just built.
+                (0..3)
+                    .find_map(|i| {
+                        let h = 0x148 + 40 * i;
+                        let vsize =
+                            u32::from_le_bytes(bytes[h + 8..h + 12].try_into().unwrap()) as u64;
+                        let rva_sec =
+                            u32::from_le_bytes(bytes[h + 12..h + 16].try_into().unwrap()) as u64;
+                        let raw =
+                            u32::from_le_bytes(bytes[h + 20..h + 24].try_into().unwrap()) as u64;
+                        (rva >= rva_sec && rva < rva_sec + vsize)
+                            .then(|| (raw + (rva - rva_sec)) as usize)
+                    })
+                    .expect(&format!("rva {rva:#x} not in any section"))
             };
 
             // Walk the descriptors.

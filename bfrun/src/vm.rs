@@ -219,4 +219,239 @@ mod tests {
             "failed to grow tape"
         );
     }
+
+    #[test]
+    fn display_and_conversion_cover_every_variant() {
+        // Underflow wording is likewise pinned against bfnative's
+        // MSG_UNDERFLOW; the Io arm wraps the underlying error's text.
+        assert_eq!(
+            RunError::PointerUnderflow.to_string(),
+            "pointer moved left of cell 0"
+        );
+        assert_eq!(
+            RunError::Io(io::Error::new(io::ErrorKind::Other, "pipe broke"))
+                .to_string(),
+            "I/O error: pipe broke"
+        );
+        let converted: RunError = io::Error::new(io::ErrorKind::UnexpectedEof, "eof").into();
+        assert!(matches!(converted, RunError::Io(_)));
+    }
+
+    #[test]
+    fn sub_wraps_below_zero() {
+        let mut vm = run_ops(&[Op::Sub(1), Op::Sub(1)]);
+        assert_eq!(*vm.current_cell(), 254);
+    }
+
+    #[test]
+    fn output_runs_the_full_write_path() {
+        // stdout is captured by the harness; what matters here is that the
+        // Output arm executes its write and the run reports success. Byte
+        // correctness is pinned end-to-end by tests/e2e.rs.
+        let mut vm = Vm::new();
+        let result = vm.run(&[Op::Add(65), Op::Output]);
+        assert!(result.is_ok());
+        assert_eq!(*vm.current_cell(), 65);
+    }
+
+    #[test]
+    fn jump_pairs_form_a_working_loop() {
+        // +[-] with real jumps: the JZ skips the loop when zero, the JNZ
+        // walks back while nonzero -- the naive-loop shape the optimizer
+        // would fold to Zero, driven here op by op.
+        let ops = [
+            Op::Add(3),
+            Op::JumpIfZero { target: 3 }, // cell zero -> land on op 4 (Add)
+            Op::Sub(1),
+            Op::JumpIfNonZero { target: 1 }, // nonzero -> land on op 2 (Sub)
+            Op::Add(1),
+            Op::Output,
+        ];
+        let mut vm = Vm::new();
+        let result = vm.run(&ops);
+        assert!(result.is_ok());
+        assert_eq!(*vm.current_cell(), 1);
+    }
+
+    #[test]
+    fn mul_add_spreads_value_then_zero_clears() {
+        // [->++<] followed by the trailing Zero: cell 1 gets 2 * 5.
+        let mut vm = run_ops(&[
+            Op::Add(5),
+            Op::MulAdd {
+                offset: 1,
+                factor: 2,
+            },
+            Op::Zero,
+            Op::MoveRight(1),
+        ]);
+        assert_eq!(*vm.current_cell(), 10);
+        assert_eq!(vm.tape[0], 0);
+    }
+
+    #[test]
+    fn mul_add_skips_when_the_source_cell_is_zero() {
+        // The loop MulAdd replaces never ran on a zero source, so the write
+        // (and the bounds check on a possibly-invalid target) must be
+        // skipped entirely.
+        let mut vm = run_ops(&[
+            Op::MulAdd {
+                offset: 1,
+                factor: 7,
+            },
+            Op::MoveRight(1),
+        ]);
+        assert_eq!(*vm.current_cell(), 0);
+    }
+
+    #[test]
+    fn mul_add_grows_the_tape_for_far_targets() {
+        let mut vm = run_ops(&[
+            Op::Add(2),
+            Op::MulAdd {
+                offset: 40_000,
+                factor: 3,
+            },
+            Op::MoveRight(40_000),
+        ]);
+        assert_eq!(*vm.current_cell(), 6);
+    }
+
+    #[test]
+    fn mul_add_underflow_errors_like_move_left() {
+        let mut vm = Vm::new();
+        let result = vm.run(&[Op::Add(1), Op::MulAdd { offset: -1, factor: 1 }]);
+        assert!(matches!(result, Err(RunError::PointerUnderflow)));
+    }
+
+    #[test]
+    fn scan_right_stops_on_the_next_zero_cell() {
+        let vm = run_ops(&[Op::Add(1), Op::Scan { stride: 1 }]);
+        assert_eq!(vm.pointer, 1);
+    }
+
+    #[test]
+    fn scan_left_underflows_at_cell_zero() {
+        let mut vm = Vm::new();
+        let result = vm.run(&[Op::Add(1), Op::Scan { stride: -1 }]);
+        assert!(matches!(result, Err(RunError::PointerUnderflow)));
+    }
+
+    #[test]
+    fn scan_grows_the_tape_when_it_walks_past_the_end() {
+        // One nonzero cell, then a stride that lands past 30,000: the scan
+        // both grows the tape and finds the zero at the landing spot.
+        let vm = run_ops(&[Op::Add(1), Op::Scan { stride: 40_000 }]);
+        assert_eq!(vm.pointer, 40_000);
+        assert!(vm.tape.len() > 40_000);
+    }
+
+    #[test]
+    fn jump_taken_zero_skips_the_loop_body() {
+        // Cell 0 is zero, so JumpIfZero fires: execution lands on op 3
+        // (the pc = target; pc += 1 convention), skipping the Add entirely.
+        let ops = [
+            Op::JumpIfZero { target: 2 },
+            Op::Add(1),
+            Op::Output,
+        ];
+        let mut vm = Vm::new();
+        let result = vm.run(&ops);
+        assert!(result.is_ok());
+        assert_eq!(*vm.current_cell(), 0);
+    }
+
+    /// Caps RLIMIT_AS for the duration of a closure, restoring it after —
+    /// the one deterministic, dependency-free way to make real allocation
+    /// fail in-process (a 4 GiB tape growth cannot fit under a 512 MiB
+    /// address-space cap, so try_reserve reports failure without any
+    /// multi-gigabyte attempt; the cap stays high enough that sibling
+    /// tests running in parallel keep their normal stack and heap room). Linux x86-64 only: other hosts skip the
+    /// allocation-failure tests entirely.
+    // coverage(off) (nightly coverage runs only; the attribute is unstable,
+    // so it is cfg-gated): the `get_ret == 0` guard below is the defensive
+    // half of a syscall-error check that cannot be made to fail in any
+    // real process, so its false branch is uninstrumentable by
+    // construction. This is test-support code, not product code.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[cfg_attr(coverage_nightly, coverage(off))]
+    fn with_address_space_cap<T>(body: impl FnOnce() -> T) -> T {
+        // getrlimit/setrlimit syscall numbers (x86-64) and RLIMIT_AS.
+        const GETRLIMIT: u64 = 97;
+        const SETRLIMIT: u64 = 160;
+        const RLIMIT_AS: u64 = 9;
+        // (rlim_cur, rlim_max). RLIM_INFINITY on Linux x86-64 is ~0u64.
+        let mut old: (u64, u64) = (u64::MAX, u64::MAX);
+        unsafe {
+            let get_ret: u64;
+            core::arch::asm!(
+                "syscall",
+                inlateout("rax") GETRLIMIT => get_ret,
+                in("rdi") RLIMIT_AS,
+                in("rsi") &mut old as *mut (u64, u64) as u64,
+                lateout("rcx") _,
+                lateout("r11") _,
+                options(nostack),
+            );
+            // If the syscall itself failed, `old` is untouched (still
+            // RLIM_INFINITY) and capping is a safe no-op skip below.
+            if get_ret == 0 {
+                // Cap at 64 MiB (never above the existing hard limit); the
+                // process is already mapped, so only *new* large
+                // reservations fail — exactly the failure mode under test.
+                let cap = 512u64 << 20;
+                let tight = (cap.min(old.1), old.1);
+                core::arch::asm!(
+                    "syscall",
+                    inlateout("rax") SETRLIMIT => _,
+                    in("rdi") RLIMIT_AS,
+                    in("rsi") &tight as *const (u64, u64) as u64,
+                    lateout("rcx") _,
+                    lateout("r11") _,
+                    options(nostack),
+                );
+            }
+        }
+        let result = body();
+        unsafe {
+            core::arch::asm!(
+                "syscall",
+                inlateout("rax") SETRLIMIT => _,
+                in("rdi") RLIMIT_AS,
+                in("rsi") &old as *const (u64, u64) as u64,
+                lateout("rcx") _,
+                lateout("r11") _,
+                options(nostack),
+            );
+        }
+        result
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn allocation_failure_through_every_growing_op_is_a_clean_error() {
+        // MoveRight, MulAdd's far target, and Scan's long stride all grow
+        // the tape; under a capped address space each must surface
+        // GrowFailed (mapped to bfnative's exact wording) rather than
+        // aborting — the hardening the try_reserve guard exists for.
+        with_address_space_cap(|| {
+            let mut vm = Vm::new();
+            let result = vm.run(&[Op::MoveRight(u32::MAX)]);
+            assert!(matches!(result, Err(RunError::GrowFailed)));
+
+            let mut vm = Vm::new();
+            let result = vm.run(&[
+                Op::Add(1),
+                Op::MulAdd {
+                    offset: 2_000_000_000,
+                    factor: 1,
+                },
+            ]);
+            assert!(matches!(result, Err(RunError::GrowFailed)));
+
+            let mut vm = Vm::new();
+            let result = vm.run(&[Op::Add(1), Op::Scan { stride: 2_000_000_000 }]);
+            assert!(matches!(result, Err(RunError::GrowFailed)));
+        });
+    }
 }

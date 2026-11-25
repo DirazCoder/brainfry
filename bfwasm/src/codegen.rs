@@ -1031,4 +1031,108 @@ mod tests {
         encode_uleb(&mut b, 300);
         assert_eq!(a, b);
     }
+
+    #[test]
+    fn surviving_loops_translate_to_block_and_loop() {
+        // I/O inside a loop is the one shape every folding pass refuses to
+        // touch, so `,[.,]` keeps real JumpIfZero/JumpIfNonZero ops all the
+        // way to this backend: emit_block's bracket arm, emit_loop's
+        // structured branch translation, and the nesting machinery all get
+        // exercised for real here.
+        let source = ",[.,]";
+        let ops = bfc::optimize::optimize(bfc::parser::parse(source).unwrap());
+        let loops = match_loops(&ops);
+        assert_eq!(loops.len(), 1);
+        let mut body = Body::new();
+        body.emit_block(&ops, &loops, 0, ops.len());
+        body.finish();
+        assert_eq!(
+            opens_close(&body.code),
+            -1,
+            "unbalanced block/loop/if vs end for {source:?}"
+        );
+        // The whole pipeline over the same program must agree too.
+        let module = compile(&ops);
+        assert!(!module.is_empty());
+    }
+
+    #[test]
+    fn nested_surviving_loops_keep_their_nesting() {
+        // Two nested loops, each with I/O so neither folds away.
+        let source = ",[[.,].,]";
+        let ops = bfc::optimize::optimize(bfc::parser::parse(source).unwrap());
+        let loops = match_loops(&ops);
+        assert_eq!(loops.len(), 2);
+        let mut body = Body::new();
+        body.emit_block(&ops, &loops, 0, ops.len());
+        body.finish();
+        assert_eq!(opens_close(&body.code), -1);
+    }
+
+    #[test]
+    fn sub_lowers_to_an_i32_subtract() {
+        let module = compile(&[Op::Sub(1)]);
+        assert!(!module.is_empty());
+        // The function body must contain a real i32.sub (0x6b) opcode.
+        assert!(module.contains(&0x6b), "no i32.sub in module");
+    }
+
+    #[test]
+    fn positive_offset_mul_add_emits_a_grow_check() {
+        // bounds_checked_target only guards rightward targets with a grow
+        // check; a positive offset (like a folded [->+<]) takes that path.
+        let module = compile(&[Op::MulAdd {
+            offset: 1,
+            factor: 2,
+        }]);
+        assert!(!module.is_empty());
+        // memory.grow (0x40) is the growth check the path emits.
+        assert!(module.contains(&0x40), "no memory.grow in module");
+
+        // Leftward targets get the underflow check only — no grow check —
+        // so a negative offset must take that branch.
+        let module = compile(&[Op::MulAdd {
+            offset: -1,
+            factor: 2,
+        }]);
+        assert!(!module.is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "jumps are consumed by emit_block")]
+    fn emit_op_rejects_raw_jump_ops() {
+        let mut body = Body::new();
+        body.emit_op(&Op::JumpIfZero { target: 0 });
+    }
+
+    #[test]
+    #[should_panic(expected = "outside its own loop's recursion")]
+    fn emit_block_rejects_a_bare_close_bracket() {
+        // A JumpIfNonZero with no matching open in scope: match_loops
+        // guarantees this never happens for parsed programs, and the arm is
+        // the defensive statement of that invariant.
+        let ops = [Op::JumpIfNonZero { target: 0 }];
+        let mut body = Body::new();
+        body.emit_block(&ops, &[], 0, ops.len());
+    }
+
+    #[test]
+    #[should_panic(expected = "unrecognized opcode")]
+    fn opens_close_rejects_opcodes_it_does_not_know() {
+        // Zero locals groups, then an opcode byte the decoder has no arm
+        // for: the panic is the decoder's "extend me" tripwire.
+        opens_close(&[0x00, 0xfb]);
+    }
+
+    #[test]
+    fn read_uleb_decodes_multi_byte_values() {
+        // 0x81 0x00: continuation set on the first byte, so the loop has to
+        // take the shift += 7 path before terminating.
+        let mut i = 0;
+        assert_eq!(read_uleb(&[0x81, 0x00], &mut i), 1);
+        assert_eq!(i, 2);
+        let mut i = 0;
+        assert_eq!(read_uleb(&[0xff, 0x01], &mut i), 255);
+        assert_eq!(i, 2);
+    }
 }

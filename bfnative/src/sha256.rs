@@ -134,9 +134,16 @@ impl Sha256 {
         let bit_len = self.bytes.wrapping_mul(8);
 
         // Padding: 0x80, zeros, then the 64-bit big-endian bit length.
+        // Written as 64 + 55 - (bytes % 64) so the subtraction can never
+        // underflow: for bytes % 64 in 0..=55 the result is 55 - r mod 64
+        // as required, and for 56..=63 it is 119 - r, also mod 64. (The
+        // earlier `55 - self.bytes % 64` form was mathematically the same
+        // number, but as a usize subtraction it underflowed -- and in debug
+        // builds, panicked -- exactly for the lengths where r > 55, which
+        // a 57-byte Mach-O signature page hit in practice.)
         let mut pad = Vec::with_capacity(72);
         pad.push(0x80);
-        let zeros = ((55 - self.bytes % 64) + 64) % 64; // bytes to reach 56 mod 64
+        let zeros = (64 + 55 - (self.bytes % 64)) % 64; // bytes to reach 56 mod 64
         pad.extend(std::iter::repeat_n(0u8, zeros as usize));
         pad.extend_from_slice(&bit_len.to_be_bytes());
         // pad.len() is now a multiple of 64.
@@ -255,5 +262,66 @@ mod tests {
             hex(&hasher.finish()),
             "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"
         );
+    }
+
+    #[test]
+    fn default_is_a_fresh_hasher() {
+        // Default must construct the same initial state as new(); the
+        // empty-input digest is the canonical way to observe that.
+        let via_new = digest(b"");
+        let mut via_default = Sha256::default();
+        via_default.update(b"");
+        assert_eq!(via_new, via_default.finish());
+    }
+
+    #[test]
+    fn padding_edge_lengths_hash_correctly() {
+        // Lengths where len % 64 lands in 56..=63 exercise the padding
+        // arithmetic's underflow-prone corner; every vector here is the
+        // reference SHA-256 of `b"a" * len`.
+        let cases = [
+            (0, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"),
+            (1, "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb"),
+            (
+                55,
+                "9f4390f8d30c2dd92ec9f095b65e2b9ae9b0a925a5258e241c9f1e910f734318",
+            ),
+            (
+                56,
+                "b35439a4ac6f0948b6d6f9e3c6af0f5f590ce20f1bde7090ef7970686ec6738a",
+            ),
+            (
+                57,
+                "f13b2d724659eb3bf47f2dd6af1accc87b81f09f59f2b75e5c0bed6589dfe8c6",
+            ),
+            (
+                63,
+                "7d3e74a05d7db15bce4ad9ec0658ea98e3f06eeecf16b4c6fff2da457ddc2f34",
+            ),
+            (
+                64,
+                "ffe054fe7ae0cb6dc65c3af9b61d5209f439851db43d0ba5997337df154668eb",
+            ),
+            (
+                65,
+                "635361c48bb9eab14198e76ea8ab7f1a41685d6ad62aa9146d301d4f17eb0ae0",
+            ),
+            (
+                119,
+                "31eba51c313a5c08226adf18d4a359cfdfd8d2e816b13f4af952f7ea6584dcfb",
+            ),
+            (
+                120,
+                "2f3d335432c70b580af0e8e1b3674a7c020d683aa5f73aaaedfdc55af904c21c",
+            ),
+            (
+                128,
+                "6836cf13bac400e9105071cd6af47084dfacad4e5e302c94bfed24e013afb73e",
+            ),
+        ];
+        for (len, expected) in cases {
+            let got = digest(&vec![b'a'; len]);
+            assert_eq!(hex(&got), expected, "length {len}");
+        }
     }
 }

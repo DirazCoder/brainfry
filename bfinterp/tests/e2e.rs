@@ -107,6 +107,85 @@ fn huge_left_move_is_caught_not_wrapped() {
 }
 
 #[test]
+fn help_flag_prints_usage_and_succeeds() {
+    let (code, stdout, stderr) = run_with_args("help", "+.", "", &["--help"]);
+    assert_eq!(code.code(), Some(0), "stderr: {stderr:?}");
+    assert!(
+        String::from_utf8_lossy(&stdout).contains("usage: bfinterp"),
+        "{stdout:?}"
+    );
+    assert_eq!(stderr, b"");
+}
+
+#[test]
+fn unknown_option_fails_with_usage() {
+    let (code, _, stderr) = run_with_args("unknown-opt", "+.", "", &["--nope"]);
+    assert_eq!(code.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&stderr).contains("unknown option: --nope"),
+        "{stderr:?}"
+    );
+}
+
+#[test]
+fn more_than_one_input_file_is_rejected() {
+    let dir = std::env::temp_dir().join("bfinterp-e2e-two-inputs");
+    fs::create_dir_all(&dir).expect("creating temp dir");
+    let a = dir.join("a.bf");
+    let b = dir.join("b.bf");
+    fs::write(&a, "+.").unwrap();
+    fs::write(&b, "+.").unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_bfinterp"))
+        .arg(&a)
+        .arg(&b)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("running bfinterp");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("more than one input file"),
+        "{:?}",
+        out.stderr
+    );
+}
+
+#[test]
+fn no_input_file_prints_usage_on_stderr() {
+    let out = Command::new(env!("CARGO_BIN_EXE_bfinterp"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("running bfinterp");
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(out.stdout, b"");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).starts_with("usage: bfinterp"),
+        "{:?}",
+        out.stderr
+    );
+}
+
+#[test]
+fn unreadable_input_fails_cleanly() {
+    let out = Command::new(env!("CARGO_BIN_EXE_bfinterp"))
+        .arg("/nonexistent/bfinterp-e2e/nope.bf")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("running bfinterp");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("couldn't read"),
+        "{:?}",
+        out.stderr
+    );
+}
+
+#[test]
 fn optimize_flag_agrees_with_the_naive_path() {
     // Same program, both paths, identical bytes — the flag is a comparison
     // aid, not a behavior change.

@@ -65,3 +65,33 @@ impl Op {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every variant must round through its tag: these are also the exact
+    /// values read_op matches on, so a drift here would make files written by
+    /// one version unreadable by the next.
+    #[test]
+    fn tags_are_stable_and_unique() {
+        let ops = [
+            Op::Add(0),
+            Op::Sub(0),
+            Op::MoveRight(0),
+            Op::MoveLeft(0),
+            Op::Output,
+            Op::Input,
+            Op::JumpIfZero { target: 0 },
+            Op::JumpIfNonZero { target: 0 },
+            Op::Zero,
+            Op::MulAdd {
+                offset: 0,
+                factor: 0,
+            },
+            Op::Scan { stride: 0 },
+        ];
+        let tags: Vec<u8> = ops.iter().map(Op::tag).collect();
+        assert_eq!(tags, (0..=10).collect::<Vec<u8>>());
+    }
+}

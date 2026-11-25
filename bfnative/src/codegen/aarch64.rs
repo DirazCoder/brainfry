@@ -1288,13 +1288,105 @@ mod tests {
         let op0_offset = m.labels[0];
         assert_ne!(op0_offset, u32::MAX, "label 0 must be bound");
         assert!(
-            m.fixups.iter().any(|f| match f.target {
-                PatchTarget::Label(i) => {
-                    (i as usize) < m.labels.len() && m.labels[i as usize] == op0_offset
-                }
-                _ => false,
-            }),
+            m.fixups.iter().any(|f| f
+                .target
+                .label_index()
+                .is_some_and(|i| (i as usize) < m.labels.len() && m.labels[i as usize] == op0_offset)),
             "no branch targets the scan's own start"
         );
+    }
+
+    #[test]
+    fn io_ops_emit_for_every_target_os() {
+        // Input and Output are the only per-OS ops: one `,.` program through
+        // each of the three aarch64 targets drives every emit_input_*/
+        // emit_output_* (svc calls, GOT blr sequences, kernel32 calls and
+        // stack frames). The x86_64 side of the same check lives in
+        // x86_64.rs.
+        for name in ["linux-aarch64", "macos-aarch64", "windows-aarch64"] {
+            let m = crate::codegen::emit(
+                &[Op::Input, Op::Output],
+                crate::target::Target::from_name(name).unwrap(),
+            );
+            assert!(!m.code.is_empty(), "{name}: no code emitted");
+            assert!(
+                m.code.len() % 4 == 0,
+                "{name}: aarch64 code must be word-sized"
+            );
+        }
+    }
+
+    #[test]
+    fn a_full_program_emits_for_every_target_os() {
+        // The classic hello world (with its surviving Sub ops, small
+        // MoveLefts, bracket jumps, and MulAdd folds) through each of the
+        // three aarch64 targets — the same emission surface the bfnative
+        // e2e suite drives through the CLI, mirrored here so the shared
+        // source's tests cover it in both crates that compile this file.
+        const HELLO_WORLD: &str = "++++++++[>++++[>++>+++>+++>+<<<<-]>+>+>->>+[<]<-]>>.>---.\
+                                   +++++++..+++.>>.<-.<.+++.------.--------.>>+.>++.";
+        let ops = bfc::optimize::optimize(bfc::parser::parse(HELLO_WORLD).unwrap());
+        for name in ["linux-aarch64", "macos-aarch64", "windows-aarch64"] {
+            let target = crate::target::Target::from_name(name).unwrap();
+            let m = crate::codegen::emit(&ops, target);
+            assert!(!m.code.is_empty(), "{name}: no code emitted");
+            assert!(m.code.len() % 4 == 0, "{name}: word alignment");
+            assert!(!m.fixups.is_empty(), "{name}: no fixups to resolve");
+            // Every label must be bound (emit's own invariant, checked).
+            assert!(m.labels.iter().all(|&l| l != u32::MAX));
+        }
+    }
+
+    #[test]
+    fn move_left_past_the_imm12_reach_takes_the_register_path() {
+        // Immediate operands top out at 4095; a bigger count loads into a
+        // register first. 0x8000_0000 is far past any source-level run too.
+        let ops = [Op::MoveLeft(0x8000_0000)];
+        let m = crate::codegen::emit(
+            &ops,
+            crate::target::Target::from_name("linux-aarch64").unwrap(),
+        );
+        assert!(m.code.len() > 16);
+    }
+
+    #[test]
+    fn offsets_past_the_imm12_reach_take_register_paths_both_ways() {
+        // MulAdd/Scan bounds checks share the 4095 threshold; exercise the
+        // register path for rightward *and* leftward magnitudes.
+        let ops = [
+            Op::MulAdd {
+                offset: 5000,
+                factor: 1,
+            },
+            Op::MulAdd {
+                offset: -5000,
+                factor: 1,
+            },
+            Op::Scan { stride: 5000 },
+            Op::Scan { stride: -5000 },
+        ];
+        let m = crate::codegen::emit(
+            &ops,
+            crate::target::Target::from_name("linux-aarch64").unwrap(),
+        );
+        assert!(m.code.len() > 32);
+    }
+
+    #[test]
+    #[should_panic(expected = "dispatched by emit_body")]
+    fn emit_op_refuses_io_ops() {
+        // Output/Input are handled by emit_body's per-OS dispatch before
+        // emit_op ever sees them; the arm is the defensive statement of
+        // that invariant, and this test drives it for real.
+        let rt = Rt {
+            grow: 0,
+            err_underflow: 0,
+            err_io: 0,
+            err_cap: 0,
+            err_grow: 0,
+            err_alloc: 0,
+        };
+        let mut e = Emitter::new(0);
+        emit_op(&mut e, &Op::Input, 0, &rt);
     }
 }

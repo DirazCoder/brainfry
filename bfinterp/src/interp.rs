@@ -285,4 +285,230 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(out, b"hi!");
     }
+
+    #[test]
+    fn display_and_conversion_cover_every_variant() {
+        // Error wording is pinned byte-for-byte against bfrun (see the
+        // module docs: the differential harness compares stderr exactly).
+        assert_eq!(
+            RunError::PointerUnderflow.to_string(),
+            "pointer moved left of cell 0"
+        );
+        assert_eq!(RunError::GrowFailed.to_string(), "failed to grow tape");
+        assert_eq!(
+            RunError::Io(io::Error::new(io::ErrorKind::Other, "bad fd")).to_string(),
+            "I/O error: bad fd"
+        );
+        let converted: RunError = io::Error::new(io::ErrorKind::BrokenPipe, "x").into();
+        assert!(matches!(converted, RunError::Io(_)));
+    }
+
+    #[test]
+    fn mul_add_skips_a_zero_source_cell() {
+        // The loop this op replaces never ran when the source was zero, so
+        // neither the bounds check nor the write may happen.
+        let (out, result) = interp(&[Op::MulAdd { offset: 1, factor: 9 }, Op::Output], "");
+        assert!(result.is_ok());
+        assert_eq!(out, vec![0u8]);
+    }
+
+    #[test]
+    fn mul_add_grows_the_tape_for_targets_past_the_end() {
+        let ops = [
+            Op::Add(2),
+            Op::MulAdd {
+                offset: 40_000,
+                factor: 3,
+            },
+            Op::Zero,
+            Op::MoveRight(40_000),
+            Op::Output,
+        ];
+        let (out, result) = interp(&ops, "");
+        assert!(result.is_ok());
+        assert_eq!(out, vec![6u8]);
+    }
+
+    #[test]
+    fn mul_add_underflow_errors_like_move_left() {
+        let (_, result) = interp(&[Op::Add(1), Op::MulAdd { offset: -1, factor: 1 }], "");
+        assert!(matches!(result, Err(RunError::PointerUnderflow)));
+    }
+
+    #[test]
+    fn scan_grows_the_tape_when_it_walks_past_the_end() {
+        let (out, result) = interp(&[Op::Add(1), Op::Scan { stride: 40_000 }, Op::Output], "");
+        assert!(result.is_ok());
+        assert_eq!(out, vec![0u8]); // lands on a fresh zero cell
+    }
+
+    #[test]
+    fn scan_underflow_errors_at_cell_zero() {
+        let (_, result) = interp(&[Op::Add(1), Op::Scan { stride: -1 }], "");
+        assert!(matches!(result, Err(RunError::PointerUnderflow)));
+    }
+
+    #[test]
+    fn scan_left_stops_on_a_zero_behind_the_pointer() {
+        // Cell 4 nonzero, cell 3 zero: scanning left from 4 must take one
+        // step and stop exactly on cell 3.
+        let ops = [
+            Op::MoveRight(4),
+            Op::Add(1),
+            Op::Scan { stride: -1 },
+            Op::Output,
+        ];
+        let (out, result) = interp(&ops, "");
+        assert!(result.is_ok());
+        assert_eq!(out, vec![0u8]);
+    }
+
+    #[test]
+    fn impossible_growth_is_a_clean_error_not_an_abort() {
+        // try_reserve fails instantly with a capacity overflow (no
+        // allocation is attempted) once the reservation exceeds isize::MAX
+        // bytes — the exact condition the guard maps to GrowFailed instead
+        // of letting the resize abort the process.
+        let mut tape = vec![0u8; INITIAL_TAPE_SIZE];
+        let result = grow_to_at_least(&mut tape, usize::MAX - 1);
+        assert!(matches!(result, Err(RunError::GrowFailed)));
+        assert_eq!(tape.len(), INITIAL_TAPE_SIZE);
+    }
+
+    /// A writer whose `write` always fails — drives the Output op's error
+    /// propagation (the `?` on write_all) without needing a real broken
+    /// pipe.
+    struct FailingWrite;
+
+    impl Write for FailingWrite {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(io::Error::new(io::ErrorKind::BrokenPipe, "reader gone"))
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::new(io::ErrorKind::BrokenPipe, "reader gone"))
+        }
+    }
+
+    #[test]
+    fn a_failing_writer_surfaces_as_an_io_error() {
+        let (_, result) = interp(&[Op::Add(1), Op::Output], "");
+        // Sanity on the happy path first...
+        assert!(result.is_ok());
+        let mut out = FailingWrite;
+        let result = run(&[Op::Add(1), Op::Output], Cursor::new(b""), &mut out);
+        assert!(matches!(result, Err(RunError::Io(_))));
+        // The writer's own flush fails the same way.
+        assert!(out.flush().is_err());
+    }
+
+    /// A writer that accepts bytes into its own buffer but cannot flush —
+    /// writes succeed, so execution reaches the final flush, whose failure
+    /// must still surface (the `?` on stdout.flush).
+    struct Unflushable;
+
+    impl Write for Unflushable {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::new(io::ErrorKind::Other, "disk full"))
+        }
+    }
+
+    #[test]
+    fn a_failing_flush_surfaces_as_an_io_error() {
+        let mut out = Unflushable;
+        let result = run(&[Op::Add(1), Op::Output], Cursor::new(b""), &mut out);
+        assert!(matches!(result, Err(RunError::Io(_))));
+    }
+
+    /// Caps RLIMIT_AS for the duration of a closure, restoring it after.
+    /// Twin of the same-named helper in bfrun's vm tests (the two crates
+    /// deliberately share no code); see that copy for the rationale —
+    /// in short: the one deterministic, dependency-free way to make real
+    /// allocation fail in-process. Linux x86-64 only.
+    // coverage(off) (nightly coverage runs only; the attribute is unstable,
+    // so it is cfg-gated): the `get_ret == 0` guard below is the defensive
+    // half of a syscall-error check that cannot be made to fail in any
+    // real process, so its false branch is uninstrumentable by
+    // construction. This is test-support code, not product code.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[cfg_attr(coverage_nightly, coverage(off))]
+    fn with_address_space_cap<T>(body: impl FnOnce() -> T) -> T {
+        const GETRLIMIT: u64 = 97;
+        const SETRLIMIT: u64 = 160;
+        const RLIMIT_AS: u64 = 9;
+        // (rlim_cur, rlim_max). RLIM_INFINITY on Linux x86-64 is ~0u64.
+        let mut old: (u64, u64) = (u64::MAX, u64::MAX);
+        unsafe {
+            let get_ret: u64;
+            core::arch::asm!(
+                "syscall",
+                inlateout("rax") GETRLIMIT => get_ret,
+                in("rdi") RLIMIT_AS,
+                in("rsi") &mut old as *mut (u64, u64) as u64,
+                lateout("rcx") _,
+                lateout("r11") _,
+                options(nostack),
+            );
+            if get_ret == 0 {
+                let cap = 512u64 << 20;
+                let tight = (cap.min(old.1), old.1);
+                core::arch::asm!(
+                    "syscall",
+                    inlateout("rax") SETRLIMIT => _,
+                    in("rdi") RLIMIT_AS,
+                    in("rsi") &tight as *const (u64, u64) as u64,
+                    lateout("rcx") _,
+                    lateout("r11") _,
+                    options(nostack),
+                );
+            }
+        }
+        let result = body();
+        unsafe {
+            core::arch::asm!(
+                "syscall",
+                inlateout("rax") SETRLIMIT => _,
+                in("rdi") RLIMIT_AS,
+                in("rsi") &old as *const (u64, u64) as u64,
+                lateout("rcx") _,
+                lateout("r11") _,
+                options(nostack),
+            );
+        }
+        result
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn allocation_failure_through_every_growing_op_is_a_clean_error() {
+        // MoveRight, MulAdd's far target, and Scan's long stride all grow
+        // the tape; under a capped address space each must surface
+        // GrowFailed cleanly rather than aborting.
+        with_address_space_cap(|| {
+            let result = run(&[Op::MoveRight(u32::MAX)], Cursor::new(b""), &mut Vec::new());
+            assert!(matches!(result, Err(RunError::GrowFailed)));
+
+            let result = run(
+                &[
+                    Op::Add(1),
+                    Op::MulAdd {
+                        offset: 2_000_000_000,
+                        factor: 1,
+                    },
+                ],
+                Cursor::new(b""),
+                &mut Vec::new(),
+            );
+            assert!(matches!(result, Err(RunError::GrowFailed)));
+
+            let result = run(
+                &[Op::Add(1), Op::Scan { stride: 2_000_000_000 }],
+                Cursor::new(b""),
+                &mut Vec::new(),
+            );
+            assert!(matches!(result, Err(RunError::GrowFailed)));
+        });
+    }
 }

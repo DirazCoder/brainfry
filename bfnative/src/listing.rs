@@ -103,3 +103,95 @@ pub fn render(module: &Module, target: Target, layout: &Layout) -> String {
 
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::codegen::{self, Span};
+    use crate::target::Target;
+    use bfformat::Op;
+
+    fn layout() -> Layout {
+        Layout {
+            code_vaddr: 0x4000,
+            rodata_vaddr: 0x8000,
+            got_vaddr: 0,
+        }
+    }
+
+    #[test]
+    fn render_describes_every_container_format() {
+        // The header's format line is target-specific; all three OSes must
+        // be named (the e2e suite only ever lists for the host target).
+        for (name, expected) in [
+            ("linux-x86_64", "ELF64 static executable"),
+            ("macos-x86_64", "Mach-O 64-bit PIE"),
+            ("windows-x86_64", "PE32+ executable"),
+        ] {
+            let target = Target::from_name(name).unwrap();
+            let module = codegen::emit(&[Op::Zero], target);
+            let text = render(&module, target, &layout());
+            assert!(text.contains(expected), "{name}: {text}");
+            assert!(text.contains(&format!("; target:  {target}")), "{text}");
+        }
+    }
+
+    #[test]
+    fn zero_length_spans_get_a_header_line_or_are_skipped_by_convention() {
+        // A span with no bytes and a note that doesn't start with a space is
+        // informational (structure-only): it gets a header line so the
+        // listing still shows it. A space-prefixed note (continuation of the
+        // previous span, like "  grow: call bf_grow") renders no line at
+        // all -- there are no bytes to show and the note isn't a headline.
+        let module = Module {
+            code: vec![0x90],
+            labels: vec![0],
+            fixups: Vec::new(),
+            rodata: Vec::new(),
+            spans: vec![
+                Span {
+                    off: 0,
+                    note: "real span".to_string(),
+                },
+                Span {
+                    off: 1,
+                    note: "empty informational span".to_string(),
+                },
+                Span {
+                    off: 1,
+                    note: "  skipped continuation".to_string(),
+                },
+            ],
+        };
+        let text = render(&module, Target::from_name("linux-x86_64").unwrap(), &layout());
+        assert!(
+            text.contains("empty informational span"),
+            "informational span missing: {text}"
+        );
+        assert!(
+            !text.contains("skipped continuation"),
+            "space-prefixed zero span should render nothing: {text}"
+        );
+        assert!(text.contains("real span"), "{text}");
+    }
+
+    #[test]
+    fn rodata_is_omitted_when_empty_and_rendered_when_present() {
+        let target = Target::from_name("linux-x86_64").unwrap();
+        // An empty rodata means no error messages -- a synthetic module.
+        let empty = Module {
+            code: vec![0x90],
+            labels: vec![0],
+            fixups: Vec::new(),
+            rodata: Vec::new(),
+            spans: Vec::new(),
+        };
+        assert!(!render(&empty, target, &layout()).contains("\n; read-only data at"));
+
+        // A real emission always registers the runtime error strings, so
+        // its listing has the rodata section (with printable rendering of
+        // the bytes).
+        let module = codegen::emit(&[Op::Zero], target);
+        assert!(render(&module, target, &layout()).contains("\n; read-only data at"));
+    }
+}

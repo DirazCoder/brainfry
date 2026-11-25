@@ -269,3 +269,293 @@ fn compile(
     );
     binary_path.to_path_buf()
 }
+
+// ---------------------------------------------------------------------------
+// CLI surface: every flag, error path, and default-output rule
+// ---------------------------------------------------------------------------
+
+/// Runs the bfnative binary with raw args, empty stdin.
+fn run_cli(
+    _tag: &str,
+    args: &[&std::ffi::OsStr],
+) -> (std::process::ExitStatus, String, String) {
+    let output = Command::new(env!("CARGO_BIN_EXE_bfnative"))
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("running bfnative");
+    (
+        output.status,
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+#[test]
+fn help_flag_prints_usage_and_succeeds() {
+    let dir = std::env::temp_dir().join("bfnative-e2e-help");
+    fs::create_dir_all(&dir).expect("creating temp dir");
+    let source_path = write_source(&dir, "+.");
+    let (status, stdout, stderr) = run_cli(
+        "help",
+        &[source_path.as_os_str(), "--help".as_ref()],
+    );
+    assert_eq!(status.code(), Some(0), "stderr: {stderr}");
+    assert!(stdout.contains("usage: bfnative"), "{stdout}");
+}
+
+#[test]
+fn no_input_file_fails_with_usage() {
+    let (status, _, stderr) = run_cli("no-input", &[]);
+    assert_eq!(status.code(), Some(1));
+    assert!(stderr.contains("usage: bfnative"), "{stderr}");
+    assert!(stderr.contains("no input file given"), "{stderr}");
+}
+
+#[test]
+fn unknown_option_fails() {
+    let dir = std::env::temp_dir().join("bfnative-e2e-unknown-opt");
+    fs::create_dir_all(&dir).expect("creating temp dir");
+    let source_path = write_source(&dir, "+.");
+    let (status, _, stderr) = run_cli("unknown-opt", &[source_path.as_os_str(), "--wat".as_ref()]);
+    assert_eq!(status.code(), Some(1));
+    assert!(stderr.contains("unknown option: --wat"), "{stderr}");
+}
+
+#[test]
+fn flag_without_a_value_fails() {
+    let dir = std::env::temp_dir().join("bfnative-e2e-flag-value");
+    fs::create_dir_all(&dir).expect("creating temp dir");
+    let source_path = write_source(&dir, "+.");
+    let (status, _, stderr) = run_cli("flag-value", &[source_path.as_os_str(), "--target".as_ref()]);
+    assert_eq!(status.code(), Some(1));
+    assert!(stderr.contains("--target needs a value"), "{stderr}");
+}
+
+#[test]
+fn output_flag_without_a_value_fails() {
+    let dir = std::env::temp_dir().join("bfnative-e2e-o-value");
+    fs::create_dir_all(&dir).expect("creating temp dir");
+    let source_path = write_source(&dir, "+.");
+    let (status, _, stderr) = run_cli("o-value", &[source_path.as_os_str(), "-o".as_ref()]);
+    assert_eq!(status.code(), Some(1));
+    assert!(stderr.contains("--output needs a value"), "{stderr}");
+}
+
+#[test]
+fn cc_flag_without_a_value_fails() {
+    // --cc is deprecated and ignored, but it still parses its value, and a
+    // missing one is a usage error like any other.
+    let dir = std::env::temp_dir().join("bfnative-e2e-cc-value");
+    fs::create_dir_all(&dir).expect("creating temp dir");
+    let source_path = write_source(&dir, "+.");
+    let (status, _, stderr) = run_cli("cc-value", &[source_path.as_os_str(), "--cc".as_ref()]);
+    assert_eq!(status.code(), Some(1));
+    assert!(stderr.contains("--cc needs a value"), "{stderr}");
+}
+
+#[test]
+fn more_than_one_input_file_is_rejected() {
+    let dir = std::env::temp_dir().join("bfnative-e2e-two-inputs");
+    fs::create_dir_all(&dir).expect("creating temp dir");
+    let source_path = write_source(&dir, "+.");
+    let (status, _, stderr) = run_cli("two-inputs", &[source_path.as_os_str(), source_path.as_os_str()]);
+    assert_eq!(status.code(), Some(1));
+    assert!(stderr.contains("more than one input file"), "{stderr}");
+}
+
+#[test]
+fn deprecated_flags_parse_and_warn_but_succeed() {
+    // --cc and --keep-asm are accepted for compatibility, emit a warning,
+    // and change nothing.
+    let dir = std::env::temp_dir().join("bfnative-e2e-deprecated");
+    fs::create_dir_all(&dir).expect("creating temp dir");
+    let source_path = write_source(&dir, "+.");
+    let out = dir.join("program");
+    let (status, _, stderr) = run_cli(
+        "deprecated",
+        &[
+            "--cc".as_ref(),
+            "gcc".as_ref(),
+            "--keep-asm".as_ref(),
+            source_path.as_os_str(),
+            "-o".as_ref(),
+            out.as_os_str(),
+        ],
+    );
+    assert!(status.success(), "stderr: {stderr}");
+    assert!(stderr.contains("--cc is deprecated"), "{stderr}");
+    assert!(stderr.contains("--keep-asm is deprecated"), "{stderr}");
+    assert!(out.exists());
+}
+
+#[test]
+fn unknown_target_fails_and_lists_the_valid_ones() {
+    let dir = std::env::temp_dir().join("bfnative-e2e-bad-target");
+    fs::create_dir_all(&dir).expect("creating temp dir");
+    let source_path = write_source(&dir, "+.");
+    let (status, _, stderr) = run_cli(
+        "bad-target",
+        &["--target".as_ref(), "linux-arm64".as_ref(), source_path.as_os_str()],
+    );
+    assert_eq!(status.code(), Some(1));
+    assert!(stderr.contains("unknown target `linux-arm64`"), "{stderr}");
+    assert!(stderr.contains("valid targets are"), "{stderr}");
+}
+
+#[test]
+fn unreadable_input_fails_cleanly() {
+    let (status, _, stderr) = run_cli(
+        "missing-input",
+        &["/nonexistent/bfnative-e2e/nope.bf".as_ref()],
+    );
+    assert_eq!(status.code(), Some(1));
+    assert!(stderr.contains("couldn't read"), "{stderr}");
+}
+
+#[test]
+fn parse_error_names_the_line() {
+    let dir = std::env::temp_dir().join("bfnative-e2e-parse-error");
+    fs::create_dir_all(&dir).expect("creating temp dir");
+    let source_path = write_source(&dir, "+\n[");
+    let (status, _, stderr) = run_cli("parse-error", &[source_path.as_os_str()]);
+    assert_eq!(status.code(), Some(1));
+    assert!(stderr.contains("program.bf:2:"), "{stderr}");
+    assert!(stderr.contains("unmatched '['"), "{stderr}");
+}
+
+#[test]
+fn emit_asm_writes_to_a_default_lst_next_to_the_source() {
+    // --emit-asm without -o: the default output is a .lst, not an
+    // executable-shaped basename.
+    let dir = std::env::temp_dir().join("bfnative-e2e-lst-default");
+    fs::create_dir_all(&dir).expect("creating temp dir");
+    let source_path = write_source(&dir, HELLO_WORLD);
+    let (status, stdout, stderr) = run_cli(
+        "lst-default",
+        &["--emit-asm".as_ref(), source_path.as_os_str()],
+    );
+    assert!(status.success(), "stderr: {stderr}");
+    let listing = dir.join("program.lst");
+    assert!(listing.exists(), "stdout: {stdout}");
+    let text = fs::read_to_string(&listing).expect("reading listing");
+    assert!(text.contains("generated-code listing"));
+}
+
+#[test]
+fn emit_asm_write_failure_is_clean() {
+    let dir = std::env::temp_dir().join("bfnative-e2e-lst-write-fail");
+    fs::create_dir_all(&dir).expect("creating temp dir");
+    let source_path = write_source(&dir, "+.");
+    let bad = dir.join("no-such-dir").join("program.lst");
+    let (status, _, stderr) =
+        run_cli(
+        "lst-write-fail",
+        &[
+            "--emit-asm".as_ref(),
+            source_path.as_os_str(),
+            "-o".as_ref(),
+            bad.as_os_str(),
+        ],
+    );
+    assert_eq!(status.code(), Some(1));
+    assert!(stderr.contains("couldn't write"), "{stderr}");
+}
+
+#[test]
+fn executable_write_failure_is_clean() {
+    let dir = std::env::temp_dir().join("bfnative-e2e-write-fail");
+    fs::create_dir_all(&dir).expect("creating temp dir");
+    let source_path = write_source(&dir, "+.");
+    let bad = dir.join("no-such-dir").join("program");
+    let (status, _, stderr) = run_cli(
+        "write-fail",
+        &[source_path.as_os_str(), "-o".as_ref(), bad.as_os_str()],
+    );
+    assert_eq!(status.code(), Some(1));
+    assert!(stderr.contains("couldn't write"), "{stderr}");
+}
+
+#[test]
+fn default_output_path_is_the_bare_input_stem() {
+    // No -o: a linux host target writes `program` next to `program.bf`,
+    // executable-bit set.
+    let dir = std::env::temp_dir().join("bfnative-e2e-default-out");
+    fs::create_dir_all(&dir).expect("creating temp dir");
+    let source_path = write_source(&dir, HELLO_WORLD);
+    let (status, stdout, stderr) = run_cli("default-out", &[source_path.as_os_str()]);
+    assert!(status.success(), "stderr: {stderr}");
+    let out = dir.join("program");
+    assert!(out.exists(), "stdout: {stdout}");
+    let bytes = fs::read(&out).expect("reading default output");
+    assert_eq!(&bytes[..4], b"\x7fELF");
+    use std::os::unix::fs::PermissionsExt;
+    let mode = fs::metadata(&out).expect("stat").permissions().mode();
+    assert_eq!(mode & 0o111, 0o111, "execute bit missing");
+}
+
+#[test]
+fn windows_default_output_path_gets_the_exe_suffix() {
+    let dir = std::env::temp_dir().join("bfnative-e2e-default-exe");
+    fs::create_dir_all(&dir).expect("creating temp dir");
+    let source_path = write_source(&dir, HELLO_WORLD);
+    let (status, _, stderr) = run_cli(
+        "default-exe",
+        &["--target".as_ref(), "windows-x86_64".as_ref(), source_path.as_os_str()],
+    );
+    assert!(status.success(), "stderr: {stderr}");
+    let out = dir.join("program.exe");
+    assert!(out.exists());
+    let bytes = fs::read(&out).expect("reading default exe output");
+    assert_eq!(&bytes[..2], b"MZ");
+}
+
+#[test]
+fn macho_identifiers_survive_unusual_output_names() {
+    // The ad-hoc code signature identifier is derived from the output
+    // basename; characters outside the allowed set must be sanitized, not
+    // corrupt the module. (Also: the identifier is only derived after a
+    // successful compile, so a clean exit is the observable behavior.)
+    let dir = std::env::temp_dir().join("bfnative-e2e-macho-name");
+    fs::create_dir_all(&dir).expect("creating temp dir");
+    let source_path = write_source(&dir, "+.");
+    let out = dir.join("my prog#1!");
+    let (status, _, stderr) = run_cli(
+        "macho-name",
+        &[
+            "--target".as_ref(),
+            "macos-x86_64".as_ref(),
+            source_path.as_os_str(),
+            "-o".as_ref(),
+            out.as_os_str(),
+        ],
+    );
+    assert!(status.success(), "stderr: {stderr}");
+    let bytes = fs::read(&out).expect("reading macho output");
+    assert_eq!(&bytes[..4], &[0xCF, 0xFA, 0xED, 0xFE]);
+}
+
+#[test]
+fn trailing_slash_output_fails_cleanly_at_the_write() {
+    // A path ending in `/` has an empty basename (the Mach-O sanitizer
+    // falls back to "bfnative" for the identifier) and no filename to
+    // write to, so the run must fail cleanly at the final write.
+    let dir = std::env::temp_dir().join("bfnative-e2e-trailing-slash");
+    fs::create_dir_all(&dir).expect("creating temp dir");
+    let source_path = write_source(&dir, "+.");
+    let bad = dir.join("no-such-dir").join("");
+    let (status, _, stderr) = run_cli(
+        "trailing-slash",
+        &[
+            "--target".as_ref(),
+            "macos-aarch64".as_ref(),
+            source_path.as_os_str(),
+            "-o".as_ref(),
+            bad.as_os_str(),
+        ],
+    );
+    assert_eq!(status.code(), Some(1), "stderr: {stderr}");
+    assert!(stderr.contains("couldn't write"), "{stderr}");
+}

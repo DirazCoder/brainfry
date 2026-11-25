@@ -90,4 +90,30 @@ mod tests {
         let ops = parse("+ hello world -").unwrap();
         assert_eq!(ops.len(), 2);
     }
+
+    #[test]
+    fn newlines_advance_the_reported_line() {
+        // Error positions are 1-based and line counting is the only thing
+        // '\n' does; bfc prints `{line}: {message}`, so a wrong count points
+        // users at the wrong place in their source.
+        let err = parse("\n\n+[").unwrap_err();
+        assert_eq!(err.line, 3);
+        assert!(err.message.contains("unmatched '['"));
+    }
+
+    #[test]
+    fn unmatched_close_reports_its_own_line() {
+        let err = parse("+\n]").unwrap_err();
+        assert_eq!(err.line, 2);
+        assert!(err.message.contains("unmatched ']'"));
+    }
+
+    #[test]
+    fn unmatched_open_reports_the_first_open_bracket() {
+        // With several unclosed brackets, the first one's instruction index
+        // is what the message should point at.
+        let err = parse("[[+").unwrap_err();
+        assert_eq!(err.line, 1);
+        assert!(err.message.contains("#0"));
+    }
 }

@@ -88,6 +88,19 @@ pub fn external_symbols(os: Os) -> &'static [&'static str] {
     }
 }
 
+#[cfg(test)]
+impl PatchTarget {
+    /// The label index this target refers to, or `None` for Str/Got —
+    /// a wildcard-free way for the backends' tests to inspect only the
+    /// Label fixups.
+    pub(crate) fn label_index(&self) -> Option<u32> {
+        match self {
+            PatchTarget::Label(i) => Some(*i),
+            _ => None,
+        }
+    }
+}
+
 /// What a fixup points at. Resolved to a virtual address by the object
 /// writer once the image layout is known.
 #[derive(Debug, Clone, Copy)]
@@ -358,5 +371,35 @@ mod tests {
         assert_eq!(e.code, vec![0, 0, 0, 0]);
         assert_eq!(e.fixups.len(), 1);
         assert!(matches!(e.fixups[0].kind, PatchKind::X86Rel32));
+    }
+
+    #[test]
+    fn external_symbols_list_each_os_exactly() {
+        // Slot order is load-bearing: GOT_WRITE..GOT_EXIT index into the
+        // macOS list, the IAT_* constants index into the Windows one, and
+        // the JIT's host table is built in the same order.
+        assert!(external_symbols(Os::Linux).is_empty());
+        assert_eq!(
+            external_symbols(Os::Macos),
+            &["write", "read", "mmap", "mprotect", "_exit"]
+        );
+        assert_eq!(
+            external_symbols(Os::Windows),
+            &[
+                "GetStdHandle",
+                "WriteFile",
+                "ReadFile",
+                "ExitProcess",
+                "VirtualAlloc",
+                "GetLastError",
+            ]
+        );
+    }
+
+    #[test]
+    fn label_index_extracts_only_label_targets() {
+        assert_eq!(PatchTarget::Label(7).label_index(), Some(7));
+        assert_eq!(PatchTarget::Str(3).label_index(), None);
+        assert_eq!(PatchTarget::Got(1).label_index(), None);
     }
 }

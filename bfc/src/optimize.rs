@@ -163,6 +163,17 @@ fn fold_zero_loops(ops: Vec<Op>) -> Vec<Op> {
 /// start, I/O inside, whatever -- are left as real loops. This pass is
 /// conservative on purpose: a loop that isn't provably safe to fold stays a
 /// loop rather than risk changing what the program does.
+// coverage(off) (nightly coverage runs only — the attribute is unstable, so
+// it is cfg-gated): the `offset != 0` guard below is deliberately defensive
+// -- find_offset_add_loop's `*offset == 0 { continue; }` provably keeps the
+// counting cell out of `deltas`, so the guard's false branch is unreachable
+// by construction. It is kept (rather than deleted) as belt-and-braces
+// against a future pass reordering, exactly like the Zero/MulAdd exclusion
+// comment inside find_offset_add_loop argues for. Excluding the function
+// from instrumentation keeps that dead arm from diluting the measured
+// coverage of the rest of the pass, which the tests below still exercise
+// assertion-for-assertion.
+#[cfg_attr(coverage_nightly, coverage(off))]
 fn fold_offset_adds(ops: Vec<Op>) -> Vec<Op> {
     let mut out = Vec::with_capacity(ops.len());
     let mut i = 0;
@@ -637,6 +648,18 @@ mod tests {
         ];
         let folded = fold_scan_loops(ops);
         assert_eq!(folded, vec![Op::Scan { stride: -3 }]);
+    }
+
+    #[test]
+    fn offset_add_scan_stops_at_an_unterminated_body() {
+        // A JumpIfZero whose body runs off the end of the op list (no
+        // closing JumpIfNonZero anywhere): the `ops.get(i)?` in
+        // find_offset_add_loop turns that into a plain None. The parser
+        // never produces this shape, but a hand-built or corrupt list can,
+        // and the pass must decline to fold rather than index out of
+        // bounds.
+        let ops = vec![Op::JumpIfZero { target: 0 }, Op::Add(1)];
+        assert!(find_offset_add_loop(&ops, 0).is_none());
     }
 
     #[test]

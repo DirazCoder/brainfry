@@ -1,3 +1,8 @@
+// Enables the unstable `coverage(off)` attribute for nightly coverage runs
+// only (cargo-llvm-cov sets `coverage_nightly`); see the note on the test
+// helper in vm.rs for why it is used.
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
+
 mod vm;
 
 use bfformat::Program;

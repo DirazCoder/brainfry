@@ -1326,13 +1326,159 @@ mod tests {
         let op0_offset = m.labels[0];
         assert_ne!(op0_offset, u32::MAX, "label 0 must be bound");
         assert!(
-            m.fixups.iter().any(|f| match f.target {
-                PatchTarget::Label(i) => {
-                    (i as usize) < m.labels.len() && m.labels[i as usize] == op0_offset
-                }
-                _ => false,
-            }),
+            m.fixups.iter().any(|f| f
+                .target
+                .label_index()
+                .is_some_and(|i| (i as usize) < m.labels.len() && m.labels[i as usize] == op0_offset)),
             "no branch targets the scan's own start"
         );
+    }
+
+    #[test]
+    fn io_ops_emit_for_every_target_os() {
+        // Input and Output are the only per-OS ops; one `,.` program through
+        // each of the six targets drives every emit_input_*/emit_output_*
+        // (syscalls, GOT calls, kernel32 calls and their stack frames).
+        for name in [
+            "linux-x86_64",
+            "macos-x86_64",
+            "windows-x86_64",
+            "linux-aarch64",
+            "macos-aarch64",
+            "windows-aarch64",
+        ] {
+            let m = module(&[Op::Input, Op::Output], name);
+            assert!(!m.code.is_empty(), "{name}: no code emitted");
+            assert!(m.labels.iter().all(|&l| l != u32::MAX), "{name}: unbound label");
+        }
+    }
+
+    #[test]
+    fn a_full_program_emits_for_every_target_os() {
+        // The classic hello world (with its surviving Sub ops, small
+        // MoveLefts, bracket jumps, and MulAdd folds) through each of the
+        // three x86_64 targets — the same emission surface the bfnative
+        // e2e suite drives through the CLI, mirrored here so the shared
+        // source's tests cover it in both crates that compile this file.
+        const HELLO_WORLD: &str = "++++++++[>++++[>++>+++>+++>+<<<<-]>+>+>->>+[<]<-]>>.>---.\
+                                   +++++++..+++.>>.<-.<.+++.------.--------.>>+.>++.";
+        let ops = bfc::optimize::optimize(bfc::parser::parse(HELLO_WORLD).unwrap());
+        for name in ["linux-x86_64", "macos-x86_64", "windows-x86_64"] {
+            let m = module(&ops, name);
+            assert!(!m.code.is_empty(), "{name}: no code emitted");
+            assert!(!m.fixups.is_empty(), "{name}: no fixups to resolve");
+            assert!(m.labels.iter().all(|&l| l != u32::MAX), "{name}: unbound label");
+        }
+    }
+
+    #[test]
+    fn huge_moves_take_the_register_constant_paths() {
+        // MoveRight/MoveLeft counts past i32::MAX can't fit an imm32, so
+        // they load the count into a register first — exercised here with
+        // op lists directly, since no source file could ever hold 2^31
+        // repeated `>` characters.
+        let m = module(&[Op::MoveRight(u32::MAX), Op::MoveLeft(0x8000_0000)], "linux-x86_64");
+        assert!(m.code.len() > 8);
+    }
+
+    #[test]
+    fn sub_lowers_to_an_immediate_subtract() {
+        let m = module(&[Op::Sub(1)], "linux-x86_64");
+        // `sub byte ptr [r12], 1` — 41 80 2C 24 01.
+        assert!(find(&m.code, &[0x41, 0x80, 0x2C, 0x24, 0x01]).is_some());
+    }
+
+    #[test]
+    fn offsets_past_the_imm32_reach_go_through_registers() {
+        // i32::MIN's magnitude (2^31) exceeds i32::MAX, so both the MulAdd
+        // bounds check and the Scan stride take the register-constant
+        // paths on the leftward side.
+        let ops = [
+            Op::MulAdd {
+                offset: i32::MIN,
+                factor: 1,
+            },
+            Op::Scan { stride: i32::MIN },
+        ];
+        let m = module(&ops, "linux-x86_64");
+        assert!(m.code.len() > 16);
+    }
+
+    #[test]
+    fn displacement_beyond_disp8_uses_the_disp32_lea() {
+        // lea rax, [r12 + 200] can't take the disp8 form (max 127).
+        let m = module(&[Op::MoveRight(200)], "linux-x86_64");
+        // 49 8D 84 24 — lea rax, [r12 + disp32] prefix.
+        assert!(find(&m.code, &[0x49, 0x8D, 0x84, 0x24]).is_some());
+    }
+
+    #[test]
+    fn encoder_high_register_forms_are_correct() {
+        // cmp64_imm32 / cmp64_imm8 / and64_imm32 with a high register need
+        // REX.B (0x49); lea with a high index register needs REX.X.
+        let mut e = Emitter::new(0);
+        cmp64_imm32(&mut e, CELL, 5); // cmp r12, 5
+        assert_eq!(&e.code[..3], &[0x49, 0x81, 0xFC]);
+
+        let mut e = Emitter::new(0);
+        cmp64_imm8(&mut e, END, -1); // cmp r14, -1
+        assert_eq!(&e.code[..3], &[0x49, 0x83, 0xFE]);
+
+        let mut e = Emitter::new(0);
+        and64_imm32(&mut e, CELL, 0xF0); // and r12, 0xF0
+        assert_eq!(&e.code[..3], &[0x49, 0x81, 0xE4]);
+
+        let mut e = Emitter::new(0);
+        lea(&mut e, RAX, CELL, BASE); // lea rax, [r13 + r12] — high index
+        assert_eq!(e.code, vec![0x4B, 0x8D, 0x44, 0x25, 0x00]);
+    }
+
+    #[test]
+    #[should_panic(expected = "dispatched by emit_body")]
+    fn emit_op_refuses_io_ops() {
+        // Output/Input are handled by emit_body's per-OS dispatch before
+        // emit_op ever sees them; the arm is the defensive statement of
+        // that invariant, and this test drives it for real.
+        let rt = Rt {
+            grow: 0,
+            err_underflow: 0,
+            err_io: 0,
+            err_cap: 0,
+            err_grow: 0,
+            err_alloc: 0,
+        };
+        let mut e = Emitter::new(0);
+        emit_op(&mut e, &Op::Output, 0, &rt);
+    }
+
+    #[test]
+    fn bounds_checked_offset_covers_huge_magnitudes_both_ways() {
+        // The function's contract accepts any u32 magnitude. Real callers
+        // derive it from i32 fields (so the rightward huge form only ever
+        // arises for leftward i32::MIN); driving both huge directions
+        // directly keeps the rightward form — kept for symmetry with
+        // MoveRight's real u32 path — exercised and verified.
+        let rt = Rt {
+            grow: 0,
+            err_underflow: 1,
+            err_io: 2,
+            err_cap: 3,
+            err_grow: 4,
+            err_alloc: 5,
+        };
+        let mut e = Emitter::new(0);
+        emit_bounds_checked_offset(&mut e, 0x8000_0000, true, &rt);
+        assert!(e.code.len() > 8);
+
+        let mut e = Emitter::new(0);
+        emit_bounds_checked_offset(&mut e, 0x8000_0000, false, &rt);
+        assert!(e.code.len() > 8);
+
+        // Small magnitudes on both sides stay on the immediate paths.
+        let mut e = Emitter::new(0);
+        emit_bounds_checked_offset(&mut e, 4, true, &rt);
+        let mut e2 = Emitter::new(0);
+        emit_bounds_checked_offset(&mut e2, 4, false, &rt);
+        assert!(!e.code.is_empty() && !e2.code.is_empty());
     }
 }

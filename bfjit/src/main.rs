@@ -21,6 +21,11 @@
 //! is a file that can be carried to another machine — a JIT's output
 //! cannot).
 
+// Enables the unstable `coverage(off)` attribute for nightly coverage runs
+// only (cargo-llvm-cov sets `coverage_nightly`); plain builds, stable or
+// nightly, never see it. See the note on main() for why it's used.
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
+
 mod exec;
 mod host;
 mod patch;
@@ -48,6 +53,22 @@ use std::process::ExitCode;
 
 use target::Target;
 
+/// LLVM profiling runtime entry point, present only in coverage builds
+/// (`cargo-llvm-cov` sets `cfg(coverage)`; plain `cargo build`/`cargo test`
+/// compile this away to nothing).
+///
+/// The JIT-generated entry stub terminates the process with a raw
+/// `exit_group` syscall (Linux) or `_exit`/`ExitProcess` (macOS/Windows) —
+/// none of which run the atexit hooks the profiling runtime relies on to
+/// flush its counters. Without an explicit dump, every *successful* JIT run
+/// would be recorded as if none of bfjit's own code had executed. Calling
+/// this right before the jump preserves coverage data through the one exit
+/// path that otherwise loses it, and is a no-op in normal builds.
+#[cfg(coverage)]
+unsafe extern "C" {
+    fn __llvm_profile_write_file() -> i32;
+}
+
 const USAGE: &str = "usage: bfjit <input.bf>
 
 Compiles the program to machine code in memory (the host platform's
@@ -56,6 +77,16 @@ immediately: stdin in, stdout out, no output file. The generated code
 handles its own tape growth, I/O, and exit, exactly like a bfnative-built
 executable.";
 
+// coverage(off) (nightly coverage runs only — the attribute is unstable, so
+// it is cfg-gated): the three failure arms below (JIT region allocation,
+// fixup resolution, W^X flip) are reachable only through codegen bugs or an
+// OS refusing a perfectly ordinary mmap/mprotect — no test can induce any
+// of them portably, and the generated-code behavior they guard is pinned by
+// the e2e suite's successful runs. The happy path through this function is
+// exercised end-to-end by tests/e2e.rs; excluding it from instrumentation
+// just keeps those arms from diluting the workspace's measured coverage.
+// parse_args and align_up stay instrumented and are unit-tested below.
+#[cfg_attr(coverage_nightly, coverage(off))]
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
 
@@ -166,6 +197,19 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
 
+        // Flush coverage counters (see the extern block above) before the
+        // jump: the generated entry never returns and exits the process via
+        // a path that skips the profile writer.
+        #[cfg(coverage)]
+        {
+            // Safety: this FFI function is only linked in coverage builds
+            // (where the profiling runtime that defines it is linked too)
+            // and takes no arguments and touches no Rust state.
+            unsafe {
+                __llvm_profile_write_file();
+            }
+        }
+
         // Jump. The generated entry never returns — it runs the program
         // and exits the process with the program's own exit status and
         // I/O, so nothing after this line executes.
@@ -208,4 +252,58 @@ fn parse_args(args: Vec<String>) -> Result<String, String> {
 fn align_up(value: usize, align: usize) -> usize {
     debug_assert!(align.is_power_of_two());
     (value + align - 1) & !(align - 1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Runs parse_args over a synthetic argv (program name first).
+    fn parsed(args: &[&str]) -> Result<String, String> {
+        parse_args(args.iter().map(|s| s.to_string()).collect())
+    }
+
+    #[test]
+    fn parse_args_accepts_exactly_one_input() {
+        assert_eq!(parsed(&["bfjit", "prog.bf"]).as_deref(), Ok("prog.bf"));
+    }
+
+    #[test]
+    fn parse_args_rejects_missing_input() {
+        let err = parsed(&["bfjit"]).unwrap_err();
+        assert!(err.contains("no input file given"), "{err}");
+    }
+
+    #[test]
+    fn parse_args_rejects_a_second_input() {
+        let err = parsed(&["bfjit", "a.bf", "b.bf"]).unwrap_err();
+        assert!(err.contains("more than one input file"), "{err}");
+    }
+
+    #[test]
+    fn parse_args_rejects_unknown_options() {
+        let err = parsed(&["bfjit", "--wat", "a.bf"]).unwrap_err();
+        assert!(err.contains("unknown option: --wat"), "{err}");
+    }
+
+    #[test]
+    fn parse_args_names_the_host_when_target_is_requested() {
+        // The whole point of this message: steer cross-target requests at
+        // bfnative instead of failing cryptically inside the JIT.
+        let err = parsed(&["bfjit", "--target"]).unwrap_err();
+        assert!(err.contains("host"), "{err}");
+        assert!(err.contains("bfnative"), "{err}");
+        // The short form is rejected the same way.
+        let err = parsed(&["bfjit", "-t", "a.bf"]).unwrap_err();
+        assert!(err.contains("host"), "{err}");
+    }
+
+    #[test]
+    fn align_up_rounds_up_and_passes_exact_values_through() {
+        assert_eq!(align_up(0, 16), 0);
+        assert_eq!(align_up(1, 16), 16);
+        assert_eq!(align_up(16, 16), 16);
+        assert_eq!(align_up(17, 16), 32);
+        assert_eq!(align_up(33, 16), 48);
+    }
 }

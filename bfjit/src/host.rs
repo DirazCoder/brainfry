@@ -135,11 +135,24 @@ mod tests {
         assert!(got_slots(Os::Linux).is_empty());
     }
 
-    #[cfg(target_os = "linux")]
+    // The macOS/Windows tables can only be requested by a host/OS mismatch
+    // that cannot happen (Target::host() derives from the same cfg!s the
+    // table selection compiles on). Their unreachable!() guards are the
+    // statement of that invariant, and these tests pin both the guard and
+    // the message by actually driving the non-host arms on a Linux host.
+    // (On a real macOS/Windows host the table exists, so the tests are
+    // compiled out there.)
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
     #[test]
-    fn non_host_tables_are_unreachable() {
-        // On a Linux host the macOS/Windows tables can never be produced —
-        // got_slots only ever sees the host OS.
-        assert!(got_slots(Os::Linux).is_empty());
+    #[should_panic(expected = "macOS GOT slots requested on a non-macOS host")]
+    fn macos_slots_are_unreachable_on_this_host() {
+        let _ = got_slots(Os::Macos);
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    #[should_panic(expected = "Windows IAT slots requested on a non-Windows host")]
+    fn windows_slots_are_unreachable_on_this_host() {
+        let _ = got_slots(Os::Windows);
     }
 }

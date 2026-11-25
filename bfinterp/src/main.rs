@@ -11,6 +11,11 @@
 //! with `bfrun` (or any other tool) — only the parser front end is shared,
 //! the same one every other backend uses.
 
+// Enables the unstable `coverage(off)` attribute for nightly coverage runs
+// only (cargo-llvm-cov sets `coverage_nightly`); see the note on the test
+// helper in interp.rs for why it is used.
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
+
 mod interp;
 
 use bfc::parser;

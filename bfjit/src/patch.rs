@@ -191,7 +191,7 @@ mod tests {
                 },
             };
             patch(&mut module, &layout)
-                .unwrap_or_else(|e| panic!("{name}: patch failed: {e}"));
+                .expect(&format!("{name}: patch failed"));
 
             // Sanity: every 4-byte word is still a decodable branch or data
             // word — here it's enough that the pass didn't error and the
@@ -233,6 +233,137 @@ mod tests {
             rodata_vaddr: 0x2000,
             got_vaddr: 0,
         };
-        assert!(patch(&mut module, &layout).is_err());
+        let err = patch(&mut module, &layout).unwrap_err();
+        assert!(err.contains("unbound label 0"), "{err}");
+    }
+
+    #[test]
+    fn unknown_label_is_reported() {
+        let mut module = codegen::Module {
+            code: vec![0; 8],
+            labels: vec![0], // only label 0 exists
+            fixups: vec![codegen::Fixup {
+                pos: 0,
+                kind: PatchKind::X86Rel32,
+                target: PatchTarget::Label(1),
+            }],
+            rodata: Vec::new(),
+            spans: Vec::new(),
+        };
+        let layout = Layout {
+            code_vaddr: 0,
+            rodata_vaddr: 0,
+            got_vaddr: 0,
+        };
+        let err = patch(&mut module, &layout).unwrap_err();
+        assert!(err.contains("unknown label 1"), "{err}");
+    }
+
+    /// A module with hand-set labels and one fixup, so range and alignment
+    /// violations can be constructed without emitting megabytes of code.
+    fn synthetic_module(kind: PatchKind, target: PatchTarget, labels: Vec<u32>) -> Module {
+        Module {
+            code: vec![0; 8],
+            fixups: vec![codegen::Fixup {
+                pos: 0,
+                kind,
+                target,
+            }],
+            labels,
+            rodata: Vec::new(),
+            spans: Vec::new(),
+        }
+    }
+
+    fn zero_layout() -> Layout {
+        Layout {
+            code_vaddr: 0,
+            rodata_vaddr: 0,
+            got_vaddr: 0,
+        }
+    }
+
+    #[test]
+    fn x86_rel32_out_of_range_is_reported() {
+        // Label 1 sits past +2^31 (the field ends at pos+4), farther than a
+        // rel32 can reach from fixup position 0.
+        let mut module = synthetic_module(
+            PatchKind::X86Rel32,
+            PatchTarget::Label(1),
+            vec![0, 0x8000_0008],
+        );
+        let err = patch(&mut module, &zero_layout()).unwrap_err();
+        assert!(err.contains("x86 rel32 branch out of range"), "{err}");
+    }
+
+    #[test]
+    fn arm_b_out_of_range_is_reported() {
+        // +-128 MiB is B/BL's reach; 512 MiB is well past it.
+        let mut module =
+            synthetic_module(PatchKind::ArmB, PatchTarget::Label(1), vec![0, 0x3000_0000]);
+        let err = patch(&mut module, &zero_layout()).unwrap_err();
+        assert!(err.contains("ARM64 b/bl out of range"), "{err}");
+    }
+
+    #[test]
+    fn arm_conditional_out_of_range_is_reported() {
+        // +-2 MiB (19-bit * 4) is CBZ/B.cond's reach; 4 MiB is past it.
+        let mut module =
+            synthetic_module(PatchKind::ArmCond, PatchTarget::Label(1), vec![0, 0x40_0000]);
+        let err = patch(&mut module, &zero_layout()).unwrap_err();
+        assert!(err.contains("conditional branch out of range"), "{err}");
+    }
+
+    #[test]
+    fn arm_branch_misalignment_is_reported() {
+        // Label 1 at byte 2: off = 2, not a multiple of 4.
+        let mut module =
+            synthetic_module(PatchKind::ArmB, PatchTarget::Label(1), vec![0, 2]);
+        let err = patch(&mut module, &zero_layout()).unwrap_err();
+        assert!(err.contains("misaligned"), "{err}");
+        // The conditional-branch form shares the check and its own message.
+        let mut module =
+            synthetic_module(PatchKind::ArmCond, PatchTarget::Label(1), vec![0, 2]);
+        let err = patch(&mut module, &zero_layout()).unwrap_err();
+        assert!(err.contains("misaligned"), "{err}");
+    }
+
+    #[test]
+    fn adrp_out_of_range_is_reported() {
+        // ADRP reaches +-4 GiB (2^20 pages); rodata 8 GiB away is past it.
+        let mut module = synthetic_module(
+            PatchKind::ArmAdrp {
+                pair: ArmAdrpPair::Add,
+            },
+            PatchTarget::Str(0),
+            vec![0],
+        );
+        let layout = Layout {
+            code_vaddr: 0x1000,
+            rodata_vaddr: 0x2_0000_1000,
+            got_vaddr: 0,
+        };
+        let err = patch(&mut module, &layout).unwrap_err();
+        assert!(err.contains("ADRP out of range"), "{err}");
+    }
+
+    #[test]
+    fn misaligned_got_slot_is_reported() {
+        // got_vaddr +0x004: off12 = 4, not 8-byte aligned, so the Ldr pair
+        // must refuse rather than encode a broken immediate.
+        let mut module = synthetic_module(
+            PatchKind::ArmAdrp {
+                pair: ArmAdrpPair::Ldr,
+            },
+            PatchTarget::Got(0),
+            vec![0],
+        );
+        let layout = Layout {
+            code_vaddr: 0x1000,
+            rodata_vaddr: 0x2000,
+            got_vaddr: 0x2004,
+        };
+        let err = patch(&mut module, &layout).unwrap_err();
+        assert!(err.contains("not 8-byte aligned"), "{err}");
     }
 }

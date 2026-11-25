@@ -246,13 +246,16 @@ mod tests {
         let program = Program {
             ops: vec![
                 Op::Add(5),
+                Op::Sub(3),
                 Op::MoveRight(3),
+                Op::MoveLeft(1),
+                Op::Input,
                 // A mutually-paired bracket (JZ -> JNZ -> back), the only
                 // shape the loader's jump validation accepts -- and the
                 // only shape bfc ever writes.
-                Op::JumpIfZero { target: 4 },
+                Op::JumpIfZero { target: 7 },
                 Op::Output,
-                Op::JumpIfNonZero { target: 2 },
+                Op::JumpIfNonZero { target: 5 },
                 Op::Zero,
                 Op::MulAdd {
                     offset: 2,
@@ -294,10 +297,9 @@ mod tests {
     #[test]
     fn rejects_bad_magic() {
         let bytes = b"NOPE".to_vec();
-        match Program::read_from(&bytes[..]) {
-            Err(FormatError::BadMagic) => {}
-            other => panic!("expected BadMagic, got {other:?}"),
-        }
+        let err = Program::read_from(&bytes[..]).unwrap_err();
+        assert!(matches!(err, FormatError::BadMagic));
+        assert_eq!(err.to_string(), "not a bfry bytecode file");
     }
 
     #[test]
@@ -305,10 +307,177 @@ mod tests {
         let mut bytes = MAGIC.to_vec();
         bytes.push(FORMAT_VERSION + 1);
         bytes.extend_from_slice(&0u32.to_le_bytes());
-        match Program::read_from(&bytes[..]) {
-            Err(FormatError::UnsupportedVersion(v)) => assert_eq!(v, FORMAT_VERSION + 1),
-            other => panic!("expected UnsupportedVersion, got {other:?}"),
+        let err = Program::read_from(&bytes[..]).unwrap_err();
+        assert!(matches!(err, FormatError::UnsupportedVersion(_)));
+        assert_eq!(
+            err.to_string(),
+            "bytecode format version 2 is not supported by this runtime"
+        );
+    }
+
+    #[test]
+    fn io_errors_convert_into_format_errors() {
+        let err: FormatError = io::Error::new(io::ErrorKind::Other, "disk fell off").into();
+        assert!(matches!(err, FormatError::Io(_)));
+        assert_eq!(err.to_string(), "I/O error: disk fell off");
+    }
+
+    #[test]
+    fn display_names_every_variant_specifically() {
+        // Error wording is load-bearing: bfrun prints `couldn't load {path}:
+        // {err}`, and the differential harness compares stderr byte for
+        // byte, so each variant's exact text is pinned here.
+        let cases = [
+            (
+                FormatError::BadMagic,
+                "not a bfry bytecode file".to_string(),
+            ),
+            (
+                FormatError::UnsupportedVersion(7),
+                "bytecode format version 7 is not supported by this runtime".to_string(),
+            ),
+            (
+                FormatError::Truncated,
+                "bytecode file is truncated or corrupt".to_string(),
+            ),
+            (
+                FormatError::UnknownOpTag(11),
+                "unknown instruction tag 11 in bytecode".to_string(),
+            ),
+            (
+                FormatError::InvalidJumpTarget {
+                    target: 9,
+                    len: 3,
+                },
+                "jump target 9 is out of range (program has 3 instructions)".to_string(),
+            ),
+            (
+                FormatError::UnbalancedJumps { op_index: 4 },
+                "jump at instruction 4 does not pair with a matching bracket".to_string(),
+            ),
+        ];
+        for (err, expected) in cases {
+            assert_eq!(err.to_string(), expected, "{err:?}");
         }
+    }
+
+    #[test]
+    fn empty_input_is_truncated_not_bad_magic() {
+        // Zero bytes can't even satisfy the magic read, which must report
+        // Truncated rather than misreading garbage as a magic mismatch.
+        let err = Program::read_from(&[][..]).unwrap_err();
+        assert!(matches!(err, FormatError::Truncated));
+    }
+
+    #[test]
+    fn magic_without_a_version_byte_is_truncated() {
+        let err = Program::read_from(&MAGIC[..]).unwrap_err();
+        assert!(matches!(err, FormatError::Truncated));
+    }
+
+    #[test]
+    fn header_without_the_count_is_truncated() {
+        let mut bytes = MAGIC.to_vec();
+        bytes.push(FORMAT_VERSION);
+        let err = Program::read_from(&bytes[..]).unwrap_err();
+        assert!(matches!(err, FormatError::Truncated));
+    }
+
+    #[test]
+    fn rejects_unknown_op_tag() {
+        let mut bytes = MAGIC.to_vec();
+        bytes.push(FORMAT_VERSION);
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.push(11); // no tag 11 exists
+        let err = Program::read_from(&bytes[..]).unwrap_err();
+        assert!(matches!(err, FormatError::UnknownOpTag(11)));
+    }
+
+    #[test]
+    fn rejects_truncated_op_operands() {
+        fn with_body(tag: u8) -> Vec<u8> {
+            let mut bytes = MAGIC.to_vec();
+            bytes.push(FORMAT_VERSION);
+            bytes.extend_from_slice(&1u32.to_le_bytes());
+            bytes.push(tag);
+            bytes
+        }
+        // Every operand-carrying tag, each with its operand missing: Add's
+        // u8, Sub's u8, MoveRight's u32, MoveLeft's u32, both jump targets'
+        // u32, MulAdd's i32, and Scan's i32.
+        for tag in [0u8, 1, 2, 3, 6, 7, 9, 10] {
+            let err = Program::read_from(&with_body(tag)[..]).unwrap_err();
+            assert!(
+                matches!(err, FormatError::Truncated),
+                "tag {tag}: {err:?}"
+            );
+        }
+    }
+
+    /// A writer that succeeds for the first `n` write calls and fails
+    /// every one after — sweeping `n` across a full program drives the
+    /// error propagation of every `?` in `write_to`, not just the first.
+    struct FailAfter {
+        remaining_ok: usize,
+    }
+
+    impl Write for FailAfter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if self.remaining_ok == 0 {
+                Err(io::Error::new(io::ErrorKind::Other, "planned failure"))
+            } else {
+                self.remaining_ok -= 1;
+                Ok(buf.len())
+            }
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn write_to_propagates_a_failure_at_every_call_site() {
+        // One op of every operand shape, so the write sequence touches all
+        // nine write sites: magic, version, count, and each operand kind.
+        let program = Program {
+            ops: vec![
+                Op::Add(1),
+                Op::Sub(1),
+                Op::MoveRight(1),
+                Op::MoveLeft(1),
+                Op::Output,
+                Op::Input,
+                Op::JumpIfZero { target: 7 },
+                Op::JumpIfNonZero { target: 6 },
+                Op::Zero,
+                Op::MulAdd {
+                    offset: -1,
+                    factor: 2,
+                },
+                Op::Scan { stride: -1 },
+            ],
+        };
+
+        // 4 header writes + 11 tag bytes + 8 operands = 23 write calls;
+        // failing at each position in turn covers every `?` (the n =
+        // total_writes case is the all-succeed sanity below).
+        let total_writes = 4 + 11 + 8;
+        for n in 0..total_writes {
+            let mut sink = FailAfter {
+                remaining_ok: n,
+            };
+            assert!(
+                program.write_to(&mut sink).is_err(),
+                "write_to must fail when write #{} fails",
+                n + 1
+            );
+        }
+        // And a writer with enough capacity succeeds, proving the sweep
+        // wasn't passing on a broken program (and flush runs too).
+        let mut ok = Vec::new();
+        assert!(program.write_to(&mut ok).is_ok());
+        assert!(ok.flush().is_ok());
     }
 
     #[test]
@@ -323,10 +492,8 @@ mod tests {
             bytes.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
             bytes
         };
-        match Program::read_from(&bytes[..]) {
-            Err(FormatError::Truncated) => {}
-            other => panic!("expected Truncated, got {other:?}"),
-        }
+        let err = Program::read_from(&bytes[..]).unwrap_err();
+        assert!(matches!(err, FormatError::Truncated));
     }
 
     #[test]
@@ -359,12 +526,12 @@ mod tests {
         let mut bytes = Vec::new();
         program.write_to(&mut bytes).unwrap();
 
-        match Program::read_from(&bytes[..]) {
-            Err(FormatError::InvalidJumpTarget { target, len }) => {
-                assert_eq!((target, len), (99, 2));
-            }
-            other => panic!("expected InvalidJumpTarget, got {other:?}"),
-        }
+        let err = Program::read_from(&bytes[..]).unwrap_err();
+        assert!(matches!(err, FormatError::InvalidJumpTarget { .. }));
+        assert_eq!(
+            err.to_string(),
+            "jump target 99 is out of range (program has 2 instructions)"
+        );
     }
 
     #[test]
@@ -381,10 +548,12 @@ mod tests {
         let mut bytes = Vec::new();
         program.write_to(&mut bytes).unwrap();
 
-        match Program::read_from(&bytes[..]) {
-            Err(FormatError::UnbalancedJumps { op_index }) => assert_eq!(op_index, 0),
-            other => panic!("expected UnbalancedJumps, got {other:?}"),
-        }
+        let err = Program::read_from(&bytes[..]).unwrap_err();
+        assert!(matches!(err, FormatError::UnbalancedJumps { .. }));
+        assert_eq!(
+            err.to_string(),
+            "jump at instruction 0 does not pair with a matching bracket"
+        );
     }
 
     #[test]
@@ -401,9 +570,7 @@ mod tests {
         let mut bytes = Vec::new();
         program.write_to(&mut bytes).unwrap();
 
-        match Program::read_from(&bytes[..]) {
-            Err(FormatError::UnbalancedJumps { .. }) => {}
-            other => panic!("expected UnbalancedJumps, got {other:?}"),
-        }
+        let err = Program::read_from(&bytes[..]).unwrap_err();
+        assert!(matches!(err, FormatError::UnbalancedJumps { .. }));
     }
 }

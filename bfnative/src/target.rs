@@ -105,25 +105,45 @@ impl Target {
     /// The target this bfnative binary itself is running on, i.e. what a bare
     /// `bfnative program.bf` compiles for.
     pub fn host() -> Target {
-        let os = if cfg!(target_os = "linux") {
-            Os::Linux
-        } else if cfg!(target_os = "macos") {
-            Os::Macos
-        } else if cfg!(target_os = "windows") {
-            Os::Windows
-        } else {
-            panic!("bfnative doesn't know how to pick a default target on this host OS")
-        };
+        Target {
+            arch: arch_from_flags(
+                cfg!(target_arch = "x86_64"),
+                cfg!(target_arch = "aarch64"),
+            ),
+            os: os_from_flags(
+                cfg!(target_os = "linux"),
+                cfg!(target_os = "macos"),
+                cfg!(target_os = "windows"),
+            ),
+        }
+    }
+}
 
-        let arch = if cfg!(target_arch = "x86_64") {
-            Arch::X86_64
-        } else if cfg!(target_arch = "aarch64") {
-            Arch::Aarch64
-        } else {
-            panic!("bfnative doesn't know how to pick a default target on this host CPU")
-        };
+/// Pure decision function behind [`Target::host`]'s OS pick, taking the
+/// cfg! booleans as arguments so every branch (including the "impossible
+/// host" panics) is directly unit-testable instead of only ever taking the
+/// one branch the current build host selects.
+fn os_from_flags(is_linux: bool, is_macos: bool, is_windows: bool) -> Os {
+    if is_linux {
+        Os::Linux
+    } else if is_macos {
+        Os::Macos
+    } else if is_windows {
+        Os::Windows
+    } else {
+        panic!("bfnative doesn't know how to pick a default target on this host OS")
+    }
+}
 
-        Target { arch, os }
+/// Pure decision function behind [`Target::host`]'s arch pick, same
+/// rationale as [`os_from_flags`].
+fn arch_from_flags(is_x86_64: bool, is_aarch64: bool) -> Arch {
+    if is_x86_64 {
+        Arch::X86_64
+    } else if is_aarch64 {
+        Arch::Aarch64
+    } else {
+        panic!("bfnative doesn't know how to pick a default target on this host CPU")
     }
 }
 
@@ -149,5 +169,38 @@ mod tests {
         let err = Target::from_name("linux-arm64").unwrap_err();
         assert!(err.contains("linux-aarch64"));
         assert!(err.contains("windows-aarch64"));
+    }
+
+    #[test]
+    fn os_from_flags_selects_every_supported_os() {
+        assert_eq!(os_from_flags(true, false, false), Os::Linux);
+        assert_eq!(os_from_flags(false, true, false), Os::Macos);
+        assert_eq!(os_from_flags(false, false, true), Os::Windows);
+    }
+
+    #[test]
+    #[should_panic(expected = "doesn't know how to pick a default target on this host OS")]
+    fn os_from_flags_panics_on_an_unknown_host() {
+        os_from_flags(false, false, false);
+    }
+
+    #[test]
+    fn arch_from_flags_selects_both_architectures() {
+        assert_eq!(arch_from_flags(true, false), Arch::X86_64);
+        assert_eq!(arch_from_flags(false, true), Arch::Aarch64);
+    }
+
+    #[test]
+    #[should_panic(expected = "doesn't know how to pick a default target on this host CPU")]
+    fn arch_from_flags_panics_on_an_unknown_host() {
+        arch_from_flags(false, false);
+    }
+
+    #[test]
+    fn host_agrees_with_the_build_cfgs() {
+        // host() is a thin wrapper over the two pure selectors fed the real
+        // cfg! values, so on any supported build host it must land on one of
+        // the six known targets.
+        assert!(ALL_TARGETS.contains(&Target::host()));
     }
 }
