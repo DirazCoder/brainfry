@@ -65,6 +65,19 @@ jobs:
           EOF
           codesign --sign - --options runtime --entitlements /tmp/bfjit.entitlements --force "$BIN/bfjit"
 
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.x"
+
+      - name: install wasmtime (bfwasm lane runtime)
+        shell: bash
+        run: |
+          # Soft dependency: the harness skips the bfwasm lane if this is
+          # missing. Warn loudly instead of failing, since not every
+          # runner arch necessarily has a wasmtime wheel.
+          python3 -m pip install wasmtime \
+            || echo "::warning::wasmtime wheel unavailable on ${{ matrix.target }}, bfwasm lane will be skipped"
+
       - name: run differential test harness
         shell: bash
         run: |
@@ -78,7 +91,7 @@ jobs:
           [[ "${{ matrix.target }}" == *windows* ]] && EXE=".exe"
           SRC="target/${{ matrix.target }}/release"
           mkdir -p target/release
-          for bin in bfc bfrun bfnative bfinterp bfjit; do
+          for bin in bfc bfrun bfnative bfinterp bfjit bfwasm; do
             cp "$SRC/$bin$EXE" "target/release/$bin$EXE"
           done
           python3 scripts/differential_test_all.py .
