@@ -442,11 +442,11 @@ so check the job's annotations before assuming wasm is covered there.
 | Target | Status | Runner | Also checked statically |
 |---|---|---|---|
 | `linux-x86_64` | **executed** | `ubuntu-latest` | `cargo test` end-to-end suite |
-| `linux-aarch64` | **executed** | `ubuntu-26.04-arm` | earlier run under `qemu-aarch64-static` (user mode, real Linux syscalls): 50/50 executions matched `bfrun` |
-| `macos-x86_64` | **executed** | `macos-26-intel` | load-command table, segment congruence and bind stream decoded by `llvm-objdump --macho`; ad-hoc signature page hashes re-verified by an independent unit test; format cross-checked against real ld64-produced binaries |
-| `macos-aarch64` | **executed** | `macos-latest` | same, plus 16 KiB-page layout checks |
-| `windows-x86_64` | **executed** | `windows-latest` | full header/import/section parse by GNU `objdump` (`pei-x86-64`), IAT slot layout and entry disassembly |
-| `windows-aarch64` | **executed** | `windows-11-arm` | headers walked field-by-field by unit tests, machine code disassembled by `llvm-objdump` |
+| `linux-aarch64` | **executed** | `ubuntu-26.04-arm` | `cargo test` end-to-end suite; earlier run under `qemu-aarch64-static` (user mode, real Linux syscalls): 50/50 executions matched `bfrun` |
+| `macos-x86_64` | **executed** | `macos-26-intel` | `cargo test` end-to-end suite; load-command table, segment congruence and bind stream decoded by `llvm-objdump --macho`; ad-hoc signature page hashes re-verified by an independent unit test; format cross-checked against real ld64-produced binaries |
+| `macos-aarch64` | **executed** | `macos-latest` | `cargo test` end-to-end suite; same, plus 16 KiB-page layout checks |
+| `windows-x86_64` | **executed** | `windows-latest` | `cargo test` end-to-end suite; full header/import/section parse by GNU `objdump` (`pei-x86-64`), IAT slot layout and entry disassembly |
+| `windows-aarch64` | **executed** | `windows-11-arm` | `cargo test` end-to-end suite; headers walked field-by-field by unit tests, machine code disassembled by `llvm-objdump` |
 
 Static validation was the only evidence for the macOS and Windows targets
 for a long time, and it wasn't enough on its own. The signature,
@@ -467,9 +467,9 @@ an actual loop — the two folding passes are conservative by design and
 fall back to a real loop rather than guess at a pattern they can't fully
 verify.
 
-CI runs the differential harness, not `cargo test`. The unit tests
-(PE and Mach-O header checks, instruction encoders) only run when someone
-runs `cargo test` locally, so a failing one can sit red unnoticed.
+CI now runs `cargo test` on all six targets, alongside the differential
+harness, so the unit tests (PE and Mach-O header checks, instruction
+encoders) are no longer only checked locally.
 
 `bfwasm` is only ever run under `wasmtime`. The module should work on any
 WASI preview1 runtime, but CI doesn't try `wasmer`, Node or a browser shim,

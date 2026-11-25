@@ -48,6 +48,11 @@ jobs:
         run: |
           cargo build --release --target ${{ matrix.target }} -p bfc -p bfrun -p bfnative -p bfinterp -p bfwasm -p bfjit
 
+      - name: cargo test
+        shell: bash
+        run: |
+          cargo test --release --target ${{ matrix.target }}
+
       - name: codesign bfjit for JIT entitlement (macOS)
         if: runner.os == 'macOS'
         shell: bash
