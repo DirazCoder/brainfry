@@ -40,20 +40,20 @@ fn fold_runs(ops: &[Op]) -> Vec<Op> {
                 push_add_sub(&mut out, total, false);
             }
             Op::MoveRight(_) => {
-                let mut total: u32 = 0;
+                let mut total: u64 = 0;
                 while i < ops.len() && matches!(ops[i], Op::MoveRight(_)) {
                     total += 1;
                     i += 1;
                 }
-                out.push(Op::MoveRight(total));
+                push_move(&mut out, total, true);
             }
             Op::MoveLeft(_) => {
-                let mut total: u32 = 0;
+                let mut total: u64 = 0;
                 while i < ops.len() && matches!(ops[i], Op::MoveLeft(_)) {
                     total += 1;
                     i += 1;
                 }
-                out.push(Op::MoveLeft(total));
+                push_move(&mut out, total, false);
             }
             other => {
                 out.push(other);
@@ -82,18 +82,48 @@ fn push_add_sub(out: &mut Vec<Op>, total: u32, is_add: bool) {
     }
 }
 
+/// Move counts are u32 in the format, so a run longer than that (4+ billion
+/// `>` in a row -- a multi-gigabyte source, but nothing stops it) is chunked
+/// into multiple ops instead of overflowing. The old accumulator was a plain
+/// u32 `+`, which panicked on overflow in debug builds and silently wrapped
+/// -- a miscompile -- in release ones.
+fn push_move(out: &mut Vec<Op>, total: u64, is_right: bool) {
+    let mut remaining = total;
+    while remaining > 0 {
+        let chunk = remaining.min(u32::MAX as u64) as u32;
+        out.push(if is_right {
+            Op::MoveRight(chunk)
+        } else {
+            Op::MoveLeft(chunk)
+        });
+        remaining -= chunk as u64;
+    }
+}
+
 /// Replaces the `[-]` / `[+]` idiom (a loop whose entire body is one
 /// decrement or increment, meaning "clear this cell") with a single `Zero`
 /// instruction. This is by far the most common non-trivial pattern in real
 /// Brainfuck code, and running it as an actual loop means up to 255 wasted
 /// iterations just to reach zero.
+///
+/// The step count must be **odd**. Reaching 0 by repeatedly adding `n` has
+/// a solution for every starting value exactly when `n` is a unit mod 256,
+/// which (256 being a power of two) means odd. An even step from an odd
+/// cell never lands on 0 at all -- `[++]` with the cell holding 3 stays odd
+/// forever -- so the real loop diverges, and folding it to `Zero` would
+/// silently turn that infinite loop into termination: a miscompile. Odd
+/// steps (1 for the classic idioms, 3, 5, ... ) reach 0 from any start, so
+/// only those fold.
 fn fold_zero_loops(ops: Vec<Op>) -> Vec<Op> {
     let mut out = Vec::with_capacity(ops.len());
     let mut i = 0;
 
     while i < ops.len() {
         let is_zero_loop = matches!(ops[i], Op::JumpIfZero { .. })
-            && matches!(ops.get(i + 1), Some(Op::Add(_)) | Some(Op::Sub(_)))
+            && match ops.get(i + 1) {
+                Some(Op::Add(n)) | Some(Op::Sub(n)) => n % 2 == 1,
+                _ => false,
+            }
             && matches!(ops.get(i + 2), Some(Op::JumpIfNonZero { .. }));
 
         if is_zero_loop {
@@ -324,6 +354,63 @@ mod tests {
         ];
         let folded = fold_zero_loops(ops);
         assert_eq!(folded, vec![Op::Zero]);
+    }
+
+    #[test]
+    fn does_not_fold_even_step_zero_loop() {
+        // [++] from an odd cell never reaches 0 (adding 2 keeps the cell
+        // odd forever) -- the real loop diverges, so folding it to Zero
+        // would silently turn an infinite loop into termination.
+        // Differential fuzzing caught exactly this class of divergence.
+        let ops = vec![
+            Op::JumpIfZero { target: 0 },
+            Op::Add(2),
+            Op::JumpIfNonZero { target: 0 },
+        ];
+        let folded = fold_zero_loops(ops.clone());
+        assert_eq!(folded, ops);
+
+        let ops = vec![
+            Op::JumpIfZero { target: 0 },
+            Op::Sub(2),
+            Op::JumpIfNonZero { target: 0 },
+        ];
+        let folded = fold_zero_loops(ops.clone());
+        assert_eq!(folded, ops);
+    }
+
+    #[test]
+    fn folds_odd_step_zero_loop() {
+        // [+++]: 3 is a unit mod 256, so the loop reaches 0 from any
+        // starting value and the fold is sound.
+        let ops = vec![
+            Op::JumpIfZero { target: 0 },
+            Op::Add(3),
+            Op::JumpIfNonZero { target: 0 },
+        ];
+        let folded = fold_zero_loops(ops);
+        assert_eq!(folded, vec![Op::Zero]);
+
+        let ops = vec![
+            Op::JumpIfZero { target: 0 },
+            Op::Sub(255),
+            Op::JumpIfNonZero { target: 0 },
+        ];
+        let folded = fold_zero_loops(ops);
+        assert_eq!(folded, vec![Op::Zero]);
+    }
+
+    #[test]
+    fn push_move_chunks_counts_that_exceed_u32() {
+        // A >4 billion `>` run used to overflow a u32 accumulator (panic
+        // in debug, silent wrap -- a miscompile -- in release).
+        let mut out = Vec::new();
+        push_move(&mut out, u32::MAX as u64 + 5, true);
+        assert_eq!(out, vec![Op::MoveRight(u32::MAX), Op::MoveRight(5)]);
+
+        let mut out = Vec::new();
+        push_move(&mut out, 3, false);
+        assert_eq!(out, vec![Op::MoveLeft(3)]);
     }
 
     #[test]

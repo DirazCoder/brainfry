@@ -1029,13 +1029,17 @@ fn ldr_x30_sp(e: &mut Emitter) {
     e.u32(0xF940_03FE);
 }
 
-/// `str x0, [sp, #8]` — F9000BE0. Grow parks the desired pointer one slot
-/// past the saved x30.
+/// `str x0, [sp, #8]` — F90007E0 (imm12=1: 8/8, Rn=31/SP, Rt=0). Grow
+/// parks the desired pointer one slot past the saved x30. The comment
+/// here used to claim F9000BE0, which decodes to [sp, #16] — the emitted
+/// bytes were always the correct [sp, #8], matching `ldr_x0_sp_8` and the
+/// frame layout ([sp]=x30, [sp,#8]=desired); only the documented hex was
+/// wrong.
 fn str_x0_sp_8(e: &mut Emitter) {
     e.u32(0xF900_07E0);
 }
 
-/// `ldr x0, [sp, #8]` — F9400BE0.
+/// `ldr x0, [sp, #8]` — F94007E0 (same imm12/Rn/Rt as the store above).
 fn ldr_x0_sp_8(e: &mut Emitter) {
     e.u32(0xF940_07E0);
 }

@@ -39,6 +39,8 @@ pub enum RunError {
     /// The pointer moved left of cell 0. No way to grow in that direction,
     /// so it's a real error — same as `bfrun`.
     PointerUnderflow,
+    /// The tape couldn't be grown (allocation failure) — same as `bfrun`.
+    GrowFailed,
     Io(io::Error),
 }
 
@@ -51,6 +53,7 @@ impl std::fmt::Display for RunError {
             RunError::PointerUnderflow => {
                 write!(f, "pointer moved left of cell 0")
             }
+            RunError::GrowFailed => write!(f, "failed to grow tape"),
             RunError::Io(err) => write!(f, "I/O error: {err}"),
         }
     }
@@ -87,7 +90,7 @@ pub fn run<R: Read, W: Write>(ops: &[Op], mut stdin: R, mut stdout: W) -> Result
                 // Grow to exactly the cell we just landed on — bfrun's
                 // grow-if-needed policy, not a doubling scheme.
                 if cell >= tape.len() {
-                    tape.resize(cell + 1, 0);
+                    grow_to_at_least(&mut tape, cell)?;
                 }
             }
             Op::MoveLeft(n) => {
@@ -132,7 +135,7 @@ pub fn run<R: Read, W: Write>(ops: &[Op], mut stdin: R, mut stdout: W) -> Result
                 if value != 0 {
                     let target = offset_cell(cell, offset)?;
                     if target >= tape.len() {
-                        tape.resize(target + 1, 0);
+                        grow_to_at_least(&mut tape, target)?;
                     }
                     tape[target] = tape[target].wrapping_add(value.wrapping_mul(factor));
                 }
@@ -141,7 +144,7 @@ pub fn run<R: Read, W: Write>(ops: &[Op], mut stdin: R, mut stdout: W) -> Result
                 while tape[cell] != 0 {
                     cell = offset_cell(cell, stride)?;
                     if cell >= tape.len() {
-                        tape.resize(cell + 1, 0);
+                        grow_to_at_least(&mut tape, cell)?;
                     }
                 }
             }
@@ -162,6 +165,19 @@ fn offset_cell(cell: usize, offset: i32) -> Result<usize, RunError> {
     } else {
         Ok(new_cell as usize)
     }
+}
+
+/// Grows the tape to cover `index`, failing cleanly on allocation failure
+/// instead of aborting the process — the same hardening `bfrun`'s VM got:
+/// an unguarded `resize` on a huge move count was a SIGABRT, not a runtime
+/// error. `try_reserve` first means the resize itself can no longer fail.
+fn grow_to_at_least(tape: &mut Vec<u8>, index: usize) -> Result<(), RunError> {
+    debug_assert!(index >= tape.len());
+    let additional = index + 1 - tape.len();
+    tape.try_reserve(additional)
+        .map_err(|_| RunError::GrowFailed)?;
+    tape.resize(index + 1, 0);
+    Ok(())
 }
 
 #[cfg(test)]

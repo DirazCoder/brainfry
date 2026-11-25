@@ -13,6 +13,16 @@ pub const MAGIC: [u8; 4] = *b"BFRY";
 /// guessing at a format it doesn't understand.
 pub const FORMAT_VERSION: u8 = 1;
 
+/// Upper bound on how many ops `read_from` pre-allocates before reading
+/// the body. The file's declared op count is attacker-controlled input:
+/// trusting it for `Vec::with_capacity` let a 9-byte file with
+/// count = 0xFFFFFFFF abort the process on a 34 GB allocation attempt
+/// before the body (which wasn't there) could even report `Truncated`.
+/// Programs bigger than this still load fine — the Vec just grows
+/// amortized as ops actually stream in, exactly as if the count were
+/// unknown.
+const MAX_PREALLOC_OPS: usize = 64 * 1024;
+
 #[derive(Debug)]
 pub enum FormatError {
     Io(io::Error),
@@ -20,6 +30,12 @@ pub enum FormatError {
     UnsupportedVersion(u8),
     Truncated,
     UnknownOpTag(u8),
+    /// A jump op's target index falls outside the instruction list.
+    InvalidJumpTarget { target: u32, len: u32 },
+    /// A `JumpIfZero`/`JumpIfNonZero` pair doesn't point at each other.
+    /// The compiler only ever emits mutually paired brackets, so anything
+    /// else is a corrupt or hand-crafted file, not a program variant.
+    UnbalancedJumps { op_index: u32 },
 }
 
 impl From<io::Error> for FormatError {
@@ -41,6 +57,14 @@ impl std::fmt::Display for FormatError {
             }
             FormatError::Truncated => write!(f, "bytecode file is truncated or corrupt"),
             FormatError::UnknownOpTag(t) => write!(f, "unknown instruction tag {t} in bytecode"),
+            FormatError::InvalidJumpTarget { target, len } => write!(
+                f,
+                "jump target {target} is out of range (program has {len} instructions)"
+            ),
+            FormatError::UnbalancedJumps { op_index } => write!(
+                f,
+                "jump at instruction {op_index} does not pair with a matching bracket"
+            ),
         }
     }
 }
@@ -104,13 +128,56 @@ impl Program {
             .map_err(|_| FormatError::Truncated)?;
         let count = u32::from_le_bytes(count_bytes) as usize;
 
-        let mut ops = Vec::with_capacity(count);
+        let mut ops = Vec::with_capacity(count.min(MAX_PREALLOC_OPS));
         for _ in 0..count {
             ops.push(read_op(&mut input)?);
         }
 
+        validate_jumps(&ops)?;
+
         Ok(Program { ops })
     }
+}
+
+/// Rejects jump ops whose target is out of range or whose bracket pair
+/// doesn't point back at them. `bfc` (the only writer of this format)
+/// always emits mutually paired, in-range jumps, so a violation means a
+/// corrupt or hand-crafted file — and previously such a file wasn't just
+/// accepted, it *silently misexecuted*: an out-of-range target makes the
+/// VM's `pc < ops.len()` loop condition false on the next tick, so the
+/// program quietly "finishes" with exit 0 instead of erroring.
+fn validate_jumps(ops: &[Op]) -> Result<(), FormatError> {
+    let len = ops.len() as u32;
+    for (i, op) in ops.iter().enumerate() {
+        let is_open = matches!(op, Op::JumpIfZero { .. });
+        let target = match op {
+            Op::JumpIfZero { target } | Op::JumpIfNonZero { target } => *target,
+            _ => continue,
+        };
+
+        if target >= len {
+            return Err(FormatError::InvalidJumpTarget { target, len });
+        }
+
+        // An opening bracket (JumpIfZero) must be closed by the
+        // JumpIfNonZero at its target, and that close must point back —
+        // and vice versa. The two kinds never pair with their own kind.
+        let back = match (is_open, &ops[target as usize]) {
+            (true, Op::JumpIfNonZero { target: back })
+            | (false, Op::JumpIfZero { target: back }) => *back,
+            _ => {
+                return Err(FormatError::UnbalancedJumps {
+                    op_index: i as u32,
+                })
+            }
+        };
+        if back as usize != i {
+            return Err(FormatError::UnbalancedJumps {
+                op_index: i as u32,
+            });
+        }
+    }
+    Ok(())
 }
 
 fn read_op<R: Read>(input: &mut R) -> Result<Op, FormatError> {
@@ -180,9 +247,12 @@ mod tests {
             ops: vec![
                 Op::Add(5),
                 Op::MoveRight(3),
+                // A mutually-paired bracket (JZ -> JNZ -> back), the only
+                // shape the loader's jump validation accepts -- and the
+                // only shape bfc ever writes.
                 Op::JumpIfZero { target: 4 },
                 Op::Output,
-                Op::JumpIfNonZero { target: 1 },
+                Op::JumpIfNonZero { target: 2 },
                 Op::Zero,
                 Op::MulAdd {
                     offset: 2,
@@ -238,6 +308,102 @@ mod tests {
         match Program::read_from(&bytes[..]) {
             Err(FormatError::UnsupportedVersion(v)) => assert_eq!(v, FORMAT_VERSION + 1),
             other => panic!("expected UnsupportedVersion, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_huge_declared_count_without_allocating_it() {
+        // A 9-byte file whose header claims 4 billion ops used to abort the
+        // process on a ~34 GB Vec::with_capacity before the missing body
+        // could report Truncated. The loader must pre-reserve a bounded
+        // amount and let the actual (missing) body drive the error.
+        let bytes = {
+            let mut bytes = MAGIC.to_vec();
+            bytes.push(FORMAT_VERSION);
+            bytes.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+            bytes
+        };
+        match Program::read_from(&bytes[..]) {
+            Err(FormatError::Truncated) => {}
+            other => panic!("expected Truncated, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn loads_a_program_larger_than_the_pre_allocation_cap() {
+        // More ops than MAX_PREALLOC_OPS, so read_from's bounded
+        // pre-reservation has to grow dynamically. Both plain ops and a
+        // well-formed bracket pair are included so validation also runs
+        // over a >cap program.
+        let mut ops: Vec<Op> = (0..70_000)
+            .map(|i| if i % 2 == 0 { Op::Add(1) } else { Op::MoveRight(1) })
+            .collect();
+        ops.push(Op::JumpIfZero { target: 70_002 });
+        ops.push(Op::Sub(1));
+        ops.push(Op::JumpIfNonZero { target: 70_000 });
+
+        let program = Program { ops };
+        let mut bytes = Vec::new();
+        program.write_to(&mut bytes).unwrap();
+
+        let restored = Program::read_from(&bytes[..]).unwrap();
+        assert_eq!(restored.ops.len(), program.ops.len());
+        assert_eq!(restored.ops, program.ops);
+    }
+
+    #[test]
+    fn rejects_jump_target_out_of_range() {
+        let program = Program {
+            ops: vec![Op::Add(1), Op::JumpIfZero { target: 99 }],
+        };
+        let mut bytes = Vec::new();
+        program.write_to(&mut bytes).unwrap();
+
+        match Program::read_from(&bytes[..]) {
+            Err(FormatError::InvalidJumpTarget { target, len }) => {
+                assert_eq!((target, len), (99, 2));
+            }
+            other => panic!("expected InvalidJumpTarget, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_jump_targeting_a_non_bracket_op() {
+        // The JumpIfZero points at an Add instead of its closing
+        // JumpIfNonZero -- corrupt pairing must not load.
+        let program = Program {
+            ops: vec![
+                Op::JumpIfZero { target: 1 },
+                Op::Add(1),
+                Op::JumpIfNonZero { target: 0 },
+            ],
+        };
+        let mut bytes = Vec::new();
+        program.write_to(&mut bytes).unwrap();
+
+        match Program::read_from(&bytes[..]) {
+            Err(FormatError::UnbalancedJumps { op_index }) => assert_eq!(op_index, 0),
+            other => panic!("expected UnbalancedJumps, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_bracket_pair_that_does_not_point_back() {
+        // Both brackets are in range and of the opposite kind, but the
+        // close doesn't point back at the open.
+        let program = Program {
+            ops: vec![
+                Op::Add(1),
+                Op::JumpIfZero { target: 2 },
+                Op::JumpIfNonZero { target: 2 }, // should be 1
+            ],
+        };
+        let mut bytes = Vec::new();
+        program.write_to(&mut bytes).unwrap();
+
+        match Program::read_from(&bytes[..]) {
+            Err(FormatError::UnbalancedJumps { .. }) => {}
+            other => panic!("expected UnbalancedJumps, got {other:?}"),
         }
     }
 }

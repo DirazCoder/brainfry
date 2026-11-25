@@ -133,6 +133,13 @@ CORPUS = [
     ("zero-idiom-nested",
      "++[+++[-]+[-]]++.",
      ""),
+    # Even-step zero loop: must NOT fold to Zero (an even step from an odd
+    # cell never reaches 0, so folding would turn a diverging loop into a
+    # terminating one). From an even cell it terminates on every lane by
+    # executing the real loop, which is what makes this testable at all.
+    ("zero-loop-even-step",
+     "++[--].",
+     ""),
     ("nested-zero-in-loop",
      ",[.[-],]",
      "roundtrip"),

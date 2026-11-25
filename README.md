@@ -325,7 +325,12 @@ times the bytecode runtime's dispatch loop spins on repetitive source and
 produces noticeably shorter assembly out of `bfnative` too. Zero-loop
 folding takes `[-]` and `[+]` — a loop that does nothing but drive the
 current cell to zero — and collapses it into a single `Zero` instruction
-instead of actually looping up to 255 times.
+instead of actually looping up to 255 times. It only fires when the
+per-iteration step is odd: an odd step reaches 0 from any starting value
+(it's a unit mod 256), while an even step from an odd cell never lands on
+0 at all — `[++]` with the cell holding 3 stays odd forever — so folding
+that would silently turn a diverging loop into a terminating one.
+Even-step loops stay real loops.
 
 Offset-add folding targets the `[->+<]` idiom and its relatives: a loop
 that decrements the current cell by 1 per iteration while adding to one or
@@ -381,9 +386,9 @@ kernels alike without querying the page size.
 
 The one visible limit: a program that walks past the full 1 GiB gets
 `runtime error: tape limit exceeded (1073741824 bytes)` and exit status 1,
-not a crash. That's the single documented divergence from `bfrun`, whose
-tape is genuinely unbounded (`bfrun` would OOM eventually too, it just
-doesn't know how to say so). Left-of-zero underflow produces `bfrun`'s
+not a crash. `bfrun`'s tape has no fixed cap, but it reports a failed
+growth the same way (`runtime error: failed to grow tape`, exit 1) when
+the allocation fails. Left-of-zero underflow produces `bfrun`'s
 exact message and exit code on every platform, same as EOF-on-input
 leaving the cell untouched.
 

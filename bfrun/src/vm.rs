@@ -13,6 +13,10 @@ pub enum RunError {
     /// in that direction, so this is a real error rather than something to
     /// paper over.
     PointerUnderflow,
+    /// The tape couldn't be grown (allocation failure). Matches
+    /// `bfnative`'s MSG_GROW wording so error-path differential runs keep
+    /// comparing equal across backends.
+    GrowFailed,
     Io(io::Error),
 }
 
@@ -22,6 +26,7 @@ impl std::fmt::Display for RunError {
             RunError::PointerUnderflow => {
                 write!(f, "pointer moved left of cell 0")
             }
+            RunError::GrowFailed => write!(f, "failed to grow tape"),
             RunError::Io(err) => write!(f, "I/O error: {err}"),
         }
     }
@@ -65,7 +70,7 @@ impl Vm {
                 }
                 Op::MoveRight(n) => {
                     self.pointer += n as usize;
-                    self.grow_if_needed();
+                    self.grow_if_needed()?;
                 }
                 Op::MoveLeft(n) => {
                     self.pointer = self
@@ -109,7 +114,7 @@ impl Vm {
                     let value = *self.current_cell();
                     if value != 0 {
                         let target = self.offset_pointer(offset)?;
-                        self.grow_to_at_least(target);
+                        self.grow_to_at_least(target)?;
                         self.tape[target] =
                             self.tape[target].wrapping_add(value.wrapping_mul(factor));
                     }
@@ -117,7 +122,7 @@ impl Vm {
                 Op::Scan { stride } => {
                     while *self.current_cell() != 0 {
                         self.pointer = self.offset_pointer(stride)?;
-                        self.grow_if_needed();
+                        self.grow_if_needed()?;
                     }
                 }
             }
@@ -132,16 +137,28 @@ impl Vm {
         &mut self.tape[self.pointer]
     }
 
-    fn grow_if_needed(&mut self) {
+    fn grow_if_needed(&mut self) -> Result<(), RunError> {
         if self.pointer >= self.tape.len() {
-            self.tape.resize(self.pointer + 1, 0);
+            self.grow_to_at_least(self.pointer)?;
         }
+        Ok(())
     }
 
-    fn grow_to_at_least(&mut self, index: usize) {
+    /// Grows the tape to cover `index`, failing cleanly on allocation
+    /// failure instead of aborting the process. A crafted .bfry file can
+    /// request a single MoveRight of up to 4 billion cells; an unguarded
+    /// `resize` there was a SIGABRT ("memory allocation of N bytes failed")
+    /// rather than a runtime error. `try_reserve` first means the resize
+    /// itself can no longer fail.
+    fn grow_to_at_least(&mut self, index: usize) -> Result<(), RunError> {
         if index >= self.tape.len() {
+            let additional = index + 1 - self.tape.len();
+            self.tape
+                .try_reserve(additional)
+                .map_err(|_| RunError::GrowFailed)?;
             self.tape.resize(index + 1, 0);
         }
+        Ok(())
     }
 
     /// Applies a signed offset to the current pointer, erroring on underflow
@@ -190,5 +207,16 @@ mod tests {
     fn zero_clears_current_cell() {
         let mut vm = run_ops(&[Op::Add(9), Op::Zero]);
         assert_eq!(*vm.current_cell(), 0);
+    }
+
+    #[test]
+    fn grow_failed_message_matches_bfnative_wording() {
+        // bfnative's MSG_GROW is "runtime error: failed to grow tape\n" and
+        // bfrun's main prints "runtime error: {err}" -- the differential
+        // harness compares stderr byte for byte, so the two must line up.
+        assert_eq!(
+            RunError::GrowFailed.to_string(),
+            "failed to grow tape"
+        );
     }
 }
