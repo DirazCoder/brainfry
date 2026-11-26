@@ -50,15 +50,36 @@ the same x86_64 bfrun ground truth (Brainfuck I/O is byte-level, so outputs
 are architecture-independent). Provide any subset.
 """
 
+from contextlib import contextmanager
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = sys.argv[1] if len(sys.argv) > 1 else os.path.dirname(HERE)
 
 EXE = ".exe" if os.name == "nt" else ""
+
+
+@contextmanager
+def temporary_directory():
+    """Create a temp directory, retrying transient Windows executable locks."""
+    td = tempfile.mkdtemp()
+    try:
+        yield td
+    finally:
+        for attempt in range(8):
+            try:
+                shutil.rmtree(td)
+                break
+            except PermissionError:
+                if os.name != "nt" or attempt == 7:
+                    raise
+                time.sleep(min(0.1 * (2 ** attempt), 1.0))
+
 
 BFC = os.path.join(ROOT, "target", "release", "bfc" + EXE)
 BFRUN = os.path.join(ROOT, "target", "release", "bfrun" + EXE)
@@ -354,7 +375,7 @@ def run_js(source, stdin):
 
 def run_c(source, stdin):
     """bf2c -> compile the produced C99 with the host cc, then execute."""
-    with tempfile.TemporaryDirectory() as td:
+    with temporary_directory() as td:
         src = os.path.join(td, "p.bf")
         c_path = os.path.join(td, "p.c")
         exe = os.path.join(td, "p")

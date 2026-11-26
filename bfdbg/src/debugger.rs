@@ -1575,7 +1575,7 @@ mod tests {
             Op::MulAdd { offset: 2, factor: 3 },
             Op::Scan { stride: 1 },
         ];
-        let mut d = Debugger::new(ops.to_vec(), "z".into(), DEFAULT_UNDO_LIMIT);
+        let d = Debugger::new(ops.to_vec(), "z".into(), DEFAULT_UNDO_LIMIT);
         for (i, want) in [
             "Add(1)",
             "Sub(1)",

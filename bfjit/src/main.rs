@@ -53,17 +53,17 @@ use std::process::ExitCode;
 
 use target::Target;
 
-/// LLVM profiling runtime entry point, present only in coverage builds
-/// (`cargo-llvm-cov` sets `cfg(coverage)`; plain `cargo build`/`cargo test`
-/// compile this away to nothing).
-///
-/// The JIT-generated entry stub terminates the process with a raw
-/// `exit_group` syscall (Linux) or `_exit`/`ExitProcess` (macOS/Windows) —
-/// none of which run the atexit hooks the profiling runtime relies on to
-/// flush its counters. Without an explicit dump, every *successful* JIT run
-/// would be recorded as if none of bfjit's own code had executed. Calling
-/// this right before the jump preserves coverage data through the one exit
-/// path that otherwise loses it, and is a no-op in normal builds.
+// LLVM profiling runtime entry point, present only in coverage builds
+// (`cargo-llvm-cov` sets `cfg(coverage)`; plain `cargo build`/`cargo test`
+// compile this away to nothing).
+//
+// The JIT-generated entry stub terminates the process with a raw
+// `exit_group` syscall (Linux) or `_exit`/`ExitProcess` (macOS/Windows) —
+// none of which run the atexit hooks the profiling runtime relies on to
+// flush its counters. Without an explicit dump, every *successful* JIT run
+// would be recorded as if none of bfjit's own code had executed. Calling
+// this right before the jump preserves coverage data through the one exit
+// path that otherwise loses it, and is a no-op in normal builds.
 #[cfg(coverage)]
 unsafe extern "C" {
     fn __llvm_profile_write_file() -> i32;
@@ -205,9 +205,7 @@ fn main() -> ExitCode {
             // Safety: this FFI function is only linked in coverage builds
             // (where the profiling runtime that defines it is linked too)
             // and takes no arguments and touches no Rust state.
-            unsafe {
-                __llvm_profile_write_file();
-            }
+            __llvm_profile_write_file();
         }
 
         // Jump. The generated entry never returns — it runs the program
