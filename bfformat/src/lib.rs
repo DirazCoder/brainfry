@@ -595,4 +595,29 @@ mod tests {
         let err = Program::read_from(&bytes[..]).unwrap_err();
         assert!(matches!(err, FormatError::UnbalancedJumps { .. }));
     }
+
+    #[test]
+    fn rejects_unbalanced_closing_brackets() {
+        let out_of_range = [Op::JumpIfNonZero { target: 1 }];
+        assert!(matches!(
+            validate_jumps(&out_of_range),
+            Err(FormatError::InvalidJumpTarget { target: 1, len: 1 })
+        ));
+
+        let wrong_kind = [Op::JumpIfNonZero { target: 0 }];
+        assert!(matches!(
+            validate_jumps(&wrong_kind),
+            Err(FormatError::UnbalancedJumps { op_index: 0 })
+        ));
+
+        let non_reciprocal = [
+            Op::JumpIfZero { target: 1 },
+            Op::JumpIfNonZero { target: 0 },
+            Op::JumpIfNonZero { target: 0 },
+        ];
+        assert!(matches!(
+            validate_jumps(&non_reciprocal),
+            Err(FormatError::UnbalancedJumps { op_index: 2 })
+        ));
+    }
 }

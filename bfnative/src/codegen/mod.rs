@@ -397,6 +397,42 @@ mod tests {
     }
 
     #[test]
+    fn movement_and_offset_boundaries_emit_for_every_target() {
+        let ops = [
+            Op::MoveRight(4095),
+            Op::MoveRight(4096),
+            Op::MoveRight(u32::MAX),
+            Op::MoveLeft(4095),
+            Op::MoveLeft(4096),
+            Op::MoveLeft(u32::MAX),
+            Op::MulAdd {
+                offset: i32::MAX,
+                factor: 2,
+            },
+            Op::MulAdd {
+                offset: i32::MIN,
+                factor: 2,
+            },
+            Op::Scan { stride: i32::MAX },
+            Op::Scan { stride: i32::MIN },
+        ];
+
+        for target in crate::target::ALL_TARGETS {
+            let module = emit(&ops, target);
+            assert!(
+                !module.code.is_empty(),
+                "{}: no code emitted",
+                target.name()
+            );
+            assert!(
+                module.labels.iter().all(|&label| label != u32::MAX),
+                "{}: unbound label",
+                target.name()
+            );
+        }
+    }
+
+    #[test]
     fn label_index_extracts_only_label_targets() {
         assert_eq!(PatchTarget::Label(7).label_index(), Some(7));
         assert_eq!(PatchTarget::Str(3).label_index(), None);

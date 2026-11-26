@@ -217,6 +217,15 @@ mod tests {
     }
 
     #[test]
+    fn impossible_tape_growth_returns_grow_failed() {
+        let mut tape = vec![0u8; INITIAL_TAPE_SIZE];
+        assert!(matches!(
+            grow_to_at_least(&mut tape, usize::MAX - 1),
+            Err(RunError::GrowFailed)
+        ));
+    }
+
+    #[test]
     fn move_left_past_zero_is_an_error() {
         let (_, result) = interp(&[Op::MoveLeft(1)], "");
         assert!(matches!(result, Err(RunError::PointerUnderflow)));
@@ -359,6 +368,45 @@ mod tests {
     }
 
     #[test]
+    fn mul_add_and_scan_cover_growth_and_underflow() {
+        let (_, mul_add_growth) = interp(
+            &[
+                Op::Add(1),
+                Op::MulAdd {
+                    offset: INITIAL_TAPE_SIZE as i32,
+                    factor: 2,
+                },
+                Op::MoveRight(INITIAL_TAPE_SIZE as u32),
+                Op::Output,
+            ],
+            "",
+        );
+        assert!(mul_add_growth.is_ok());
+
+        let (_, scan_growth) = interp(
+            &[
+                Op::Add(1),
+                Op::Scan {
+                    stride: INITIAL_TAPE_SIZE as i32,
+                },
+            ],
+            "",
+        );
+        assert!(scan_growth.is_ok());
+
+        for op in [
+            Op::MulAdd {
+                offset: -1,
+                factor: 1,
+            },
+            Op::Scan { stride: -1 },
+        ] {
+            let (_, result) = interp(&[Op::Add(1), op], "");
+            assert!(matches!(result, Err(RunError::PointerUnderflow)));
+        }
+    }
+
+    #[test]
     fn mul_add_grows_the_tape_for_targets_past_the_end() {
         let ops = [
             Op::Add(2),
@@ -482,11 +530,10 @@ mod tests {
     /// deliberately share no code); see that copy for the rationale —
     /// in short: the one deterministic, dependency-free way to make real
     /// allocation fail in-process. Linux x86-64 only.
-    // coverage(off) (nightly coverage runs only; the attribute is unstable,
-    // so it is cfg-gated): the `get_ret == 0` guard below is the defensive
-    // half of a syscall-error check that cannot be made to fail in any
-    // real process, so its false branch is uninstrumentable by
-    // construction. This is test-support code, not product code.
+    // coverage(off) in coverage runs: the `get_ret == 0` guard below is
+    // the defensive half of a syscall-error check that cannot be made to
+    // fail in any real process, so its false branch is uninstrumentable
+    // by construction. This is test-support code, not product code.
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[cfg_attr(coverage_nightly, coverage(off))]
     fn with_address_space_cap<T>(body: impl FnOnce() -> T) -> T {

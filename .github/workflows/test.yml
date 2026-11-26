@@ -71,6 +71,8 @@ jobs:
           if [[ "${{ matrix.target }}" == "aarch64-pc-windows-msvc" ]]; then
             export CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_LINKER=rust-lld
           fi
+          # Keep debug-only invariants instrumented in the release coverage build.
+          export CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS=true
           REPORT="coverage-${{ matrix.archive_name }}"
           cargo +nightly llvm-cov --branch --release --workspace --all-targets \
             --target "${{ matrix.target }}" \

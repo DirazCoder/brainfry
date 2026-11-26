@@ -1079,21 +1079,46 @@ mod tests {
     fn positive_offset_mul_add_emits_a_grow_check() {
         // bounds_checked_target only guards rightward targets with a grow
         // check; a positive offset (like a folded [->+<]) takes that path.
-        let module = compile(&[Op::MulAdd {
-            offset: 1,
-            factor: 2,
-        }]);
-        assert!(!module.is_empty());
-        // memory.grow (0x40) is the growth check the path emits.
-        assert!(module.contains(&0x40), "no memory.grow in module");
+        let mut positive = Body::new();
+        positive.emit_mul_add(1, 2);
 
         // Leftward targets get the underflow check only — no grow check —
         // so a negative offset must take that branch.
-        let module = compile(&[Op::MulAdd {
-            offset: -1,
-            factor: 2,
-        }]);
-        assert!(!module.is_empty());
+        let mut negative = Body::new();
+        negative.emit_mul_add(-1, 2);
+        assert!(
+            positive.code.len() > negative.code.len(),
+            "positive offset must emit an additional growth check"
+        );
+
+        assert!(
+            !compile(&[Op::MulAdd {
+                offset: 1,
+                factor: 2,
+            }])
+            .is_empty()
+        );
+        assert!(
+            !compile(&[Op::MulAdd {
+                offset: -1,
+                factor: 2,
+            }])
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn scan_growth_check_depends_on_stride_direction() {
+        let mut right = Body::new();
+        right.emit_scan(1);
+
+        let mut left = Body::new();
+        left.emit_scan(-1);
+
+        assert!(
+            right.code.len() > left.code.len(),
+            "positive scan must emit an additional growth check"
+        );
     }
 
     #[test]

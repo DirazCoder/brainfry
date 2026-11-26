@@ -39,13 +39,16 @@ instruction, so every step maps to an exact line/column in the .bf file.
 Commands come from stdin, program output goes to stdout, debugger
 messages to stderr. `help` inside the session lists the commands.";
 
-fn main() -> ExitCode {
-    let args: Vec<String> = env::args().collect();
-    if args
-        .iter()
+fn has_help_flag(args: &[String]) -> bool {
+    args.iter()
         .skip(1)
         .any(|arg| arg == "-h" || arg == "--help")
-    {
+}
+
+fn main() -> ExitCode {
+    let args: Vec<String> = env::args().collect();
+
+    if has_help_flag(&args) {
         println!("{USAGE}");
         return ExitCode::SUCCESS;
     }
@@ -241,6 +244,13 @@ mod tests {
     use super::*;
     use bfc::parser;
     use std::io::Cursor;
+
+    #[test]
+    fn help_flag_is_recognized() {
+        assert!(has_help_flag(&["bfdbg".into(), "-h".into()]));
+        assert!(has_help_flag(&["bfdbg".into(), "--help".into()]));
+        assert!(!has_help_flag(&["bfdbg".into(), "program.bf".into()]));
+    }
 
     /// A reader whose every read fails — the stdin-is-broken arm, which a
     /// real pipe can't be made to produce.

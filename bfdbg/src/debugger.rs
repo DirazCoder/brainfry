@@ -984,6 +984,16 @@ mod tests {
         assert_eq!(d.steps(), 4);
     }
 
+    #[test]
+    fn a_zero_cell_takes_the_open_loop_jump() {
+        // The opening bracket skips the empty loop body, then execution
+        // continues with the increment after the closing bracket.
+        let mut d = dbg_for("[]+");
+        assert_eq!(d.run(&mut Vec::new()), Stop::Finished);
+        assert_eq!(d.cell_at(0), 1);
+        assert_eq!(d.steps(), 2);
+    }
+
     // ---- time travel ----
 
     #[test]

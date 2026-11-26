@@ -201,6 +201,15 @@ mod tests {
     }
 
     #[test]
+    fn impossible_tape_growth_returns_grow_failed() {
+        let mut vm = Vm::new();
+        assert!(matches!(
+            vm.grow_to_at_least(usize::MAX - 1),
+            Err(RunError::GrowFailed)
+        ));
+    }
+
+    #[test]
     fn add_and_sub_wrap_at_cell_boundary() {
         let mut vm = run_ops(&[Op::Add(255), Op::Add(1)]);
         assert_eq!(*vm.current_cell(), 0);
@@ -471,11 +480,10 @@ mod tests {
     /// multi-gigabyte attempt; the cap stays high enough that sibling
     /// tests running in parallel keep their normal stack and heap room). Linux x86-64 only: other hosts skip the
     /// allocation-failure tests entirely.
-    // coverage(off) (nightly coverage runs only; the attribute is unstable,
-    // so it is cfg-gated): the `get_ret == 0` guard below is the defensive
-    // half of a syscall-error check that cannot be made to fail in any
-    // real process, so its false branch is uninstrumentable by
-    // construction. This is test-support code, not product code.
+    // coverage(off) in coverage runs: the `get_ret == 0` guard below is
+    // the defensive half of a syscall-error check that cannot be made to
+    // fail in any real process, so its false branch is uninstrumentable
+    // by construction. This is test-support code, not product code.
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[cfg_attr(coverage_nightly, coverage(off))]
     fn with_address_space_cap<T>(body: impl FnOnce() -> T) -> T {

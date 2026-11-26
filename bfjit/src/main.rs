@@ -21,9 +21,7 @@
 //! is a file that can be carried to another machine — a JIT's output
 //! cannot).
 
-// Enables the unstable `coverage(off)` attribute for nightly coverage runs
-// only (cargo-llvm-cov sets `coverage_nightly`); plain builds, stable or
-// nightly, never see it. See the note on main() for why it's used.
+// coverage(off) is used by exec and host only for coverage runs.
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 
 mod exec;
@@ -77,16 +75,6 @@ immediately: stdin in, stdout out, no output file. The generated code
 handles its own tape growth, I/O, and exit, exactly like a bfnative-built
 executable.";
 
-// coverage(off) (nightly coverage runs only — the attribute is unstable, so
-// it is cfg-gated): the three failure arms below (JIT region allocation,
-// fixup resolution, W^X flip) are reachable only through codegen bugs or an
-// OS refusing a perfectly ordinary mmap/mprotect — no test can induce any
-// of them portably, and the generated-code behavior they guard is pinned by
-// the e2e suite's successful runs. The happy path through this function is
-// exercised end-to-end by tests/e2e.rs; excluding it from instrumentation
-// just keeps those arms from diluting the workspace's measured coverage.
-// parse_args and align_up stay instrumented and are unit-tested below.
-#[cfg_attr(coverage_nightly, coverage(off))]
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
 

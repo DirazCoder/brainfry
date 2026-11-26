@@ -1,7 +1,9 @@
-// Enables the unstable `coverage(off)` attribute for nightly coverage runs
-// only (cargo-llvm-cov sets `coverage_nightly`); see the note on the test
-// helper in vm.rs for why it is used.
-#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
+// Only the Linux x86-64 test helpers use coverage(off); keep the unstable
+// feature gate off other targets and the non-test binary.
+#![cfg_attr(
+    all(coverage_nightly, test, target_os = "linux", target_arch = "x86_64"),
+    feature(coverage_attribute)
+)]
 
 mod vm;
 

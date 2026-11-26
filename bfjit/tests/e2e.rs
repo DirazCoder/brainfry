@@ -1,12 +1,11 @@
-//! End-to-end execution tests for the JIT: compile real programs, execute
-//! the generated machine code in-process, and check stdout / stderr / exit
-//! status. A JIT is defined by "the process didn't crash and produced
-//! correct output", so every test here actually runs generated code —
-//! static inspection of the emitted bytes is the unit tests' job.
+//! End-to-end JIT tests: Linux execution cases run generated machine code
+//! and check stdout / stderr / exit status, while CLI validation cases run
+//! on every host without entering generated code. Static inspection of the
+//! emitted bytes is the unit tests' job.
 //!
-//! Runs on any Linux host (x86_64 or aarch64) since the JIT always targets
-//! the host it runs on. The aarch64 variant can be exercised from an
-//! x86_64 host under QEMU by setting BFJIT_AARCH64 (path to an
+//! Generated-code execution cases run on Linux hosts; CLI validation cases
+//! run on every host. The aarch64 variant can be exercised from an x86_64
+//! host under QEMU by setting BFJIT_AARCH64 (path to an
 //! aarch64-unknown-linux-gnu build of this binary) and QEMU_AARCH64 (path
 //! to qemu-aarch64-static) — mirroring the bfnative differential harness's
 //! QEMU_AARCH64 convention.
@@ -16,9 +15,8 @@
 //! harness in `scripts/differential_test_all.py` is the authority for
 //! cross-tool agreement.
 
-#![cfg(target_os = "linux")]
-
 use std::fs;
+#[cfg(target_os = "linux")]
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -27,11 +25,13 @@ const HELLO_WORLD: &str = "++++++++[>++++[>++>+++>+++>+<<<<-]>+>+>->>+[<]<-]>>.>
                            +++++++..+++.>>.<-.<.+++.------.--------.>>+.>++.";
 
 #[test]
+#[cfg(target_os = "linux")]
 fn hello_world_matches_expected_output() {
     run("hello-world", HELLO_WORLD, "", "Hello World!\n");
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn cells_wrap_at_256() {
     // 256 increments fold to Add(255) + Add(1) and wrap to 0; the 8-bit ALU
     // op in the generated code wraps for free.
@@ -39,6 +39,7 @@ fn cells_wrap_at_256() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn negative_cells_wrap_to_255() {
     // Raw byte 255, not the UTF-8 encoding of U+00FF — Brainfuck output is
     // bytes, so the expectation is pinned with run_bytes.
@@ -46,12 +47,14 @@ fn negative_cells_wrap_to_255() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn eof_leaves_the_cell_unchanged() {
     run("eof-unchanged", ",+.", "", "\x01");
     run("eof-byte", ",.", "AB", "A");
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn echo_stdin_until_eof() {
     run(
         "echo",
@@ -62,6 +65,7 @@ fn echo_stdin_until_eof() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn pointer_walks_past_the_initial_tape() {
     // 40,000 cells out is past the initial 30,000 — the generated grow
     // routine must commit more pages of the tape reservation from JITed
@@ -70,6 +74,7 @@ fn pointer_walks_past_the_initial_tape() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn tape_growth_through_several_commit_granules() {
     // 200,000 cells forces repeated growth (30000 -> 65536 -> 131072 ->
     // 262144) and lands past the first 64 KiB commit exactly.
@@ -82,6 +87,7 @@ fn tape_growth_through_several_commit_granules() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn tape_write_then_read_back_across_a_commit_boundary() {
     // Write 3 at cell 65,600 (across the first 64 KiB commit), walk back to
     // cell 0, print it: 0. The value printed isn't the point — surviving
@@ -96,6 +102,7 @@ fn tape_write_then_read_back_across_a_commit_boundary() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn deeply_nested_loops_six_levels() {
     // 6*5*4*3*2*2 = 1440; 1440 mod 256 = 160. Verified against bfrun.
     let source = "++++++[>+++++[>++++[>+++[>++[>++[>+<-]<-]<-]<-]<-]<-]>>>>>>.";
@@ -103,6 +110,7 @@ fn deeply_nested_loops_six_levels() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn nested_loops_and_the_zero_idiom() {
     // 6 * 6 = 36, +1 = 37 = '%'. Verified against bfrun.
     let source = "++++++[>++++++<-]>[<+>-]<+.";
@@ -110,17 +118,20 @@ fn nested_loops_and_the_zero_idiom() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn zero_loop_folding_and_runs() {
     run("zero-loop", "++++++++++[-]+.", "", "\x01");
     run("zero-loop-inc", "++[+++[-]+[-]]++.", "", "\x02");
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn io_inside_loops() {
     run("io-in-loop", ",[.[-],]", "hi!", "hi!");
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn pointer_underflow_is_a_clean_error() {
     // bfrun's exact message and exit code, emitted by the generated error
     // path — not a crash.
@@ -134,6 +145,7 @@ fn pointer_underflow_is_a_clean_error() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn huge_left_move_is_caught_not_wrapped() {
     let source = format!("{}{}", ">".repeat(10), "<".repeat(1_000_000));
     let (code, _, stderr) = run_raw("huge-left", &source, "");
@@ -142,6 +154,7 @@ fn huge_left_move_is_caught_not_wrapped() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn untouched_excursion_in_an_offset_add_candidate_loop_still_underflows() {
     // +[<>-] and +[-<>]: the loop body visits cell -1 without ever writing
     // it. The optimizer used to fold exactly these shapes to a plain Zero
@@ -162,10 +175,15 @@ fn untouched_excursion_in_an_offset_add_candidate_loop_still_underflows() {
 }
 
 #[test]
-fn unmatched_brackets_fail_before_jitting() {
-    let (code, _, stderr) = run_raw("unmatched", "[+", "");
-    assert_eq!(code.code(), Some(1));
-    assert!(String::from_utf8_lossy(&stderr).contains("unmatched '['"));
+fn unmatched_brackets_fail_before_jitting_on_every_host() {
+    let source_path = write_source("unmatched", "[+");
+    let out = Command::new(env!("CARGO_BIN_EXE_bfjit"))
+        .arg(&source_path)
+        .stdin(Stdio::null())
+        .output()
+        .expect("running bfjit");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("unmatched '['"));
 }
 
 #[test]
@@ -192,8 +210,9 @@ fn help_flag_prints_usage_and_succeeds() {
 
 #[test]
 fn unreadable_input_fails_cleanly() {
+    let missing = std::env::temp_dir().join(format!("bfjit-e2e-missing-{}.bf", std::process::id()));
     let out = Command::new(env!("CARGO_BIN_EXE_bfjit"))
-        .arg("/nonexistent/bfjit-e2e/nope.bf")
+        .arg(&missing)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -202,6 +221,20 @@ fn unreadable_input_fails_cleanly() {
     assert_eq!(out.status.code(), Some(1));
     assert!(
         String::from_utf8_lossy(&out.stderr).contains("couldn't read"),
+        "{:?}",
+        out.stderr
+    );
+}
+
+#[test]
+fn no_input_prints_usage_and_fails() {
+    let out = Command::new(env!("CARGO_BIN_EXE_bfjit"))
+        .stdin(Stdio::null())
+        .output()
+        .expect("running bfjit");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("usage: bfjit"),
         "{:?}",
         out.stderr
     );
@@ -266,6 +299,7 @@ fn cross_target_request_is_rejected() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn mandelbrot_matches_the_stored_reference_output() {
     // The real-workload case: Erik Bosman's mandelbrot.b — the same
     // differential workload the native-vs-bytecode benchmark used. Skipped
@@ -293,6 +327,7 @@ fn mandelbrot_matches_the_stored_reference_output() {
 /// under emulation, which is still a real execution of the JIT pipeline
 /// (map, patch, W^X flip, enter) — just not on real hardware.
 #[test]
+#[cfg(target_os = "linux")]
 fn aarch64_under_qemu_runs_hello_world() {
     let (qemu, binary) = match emulator_setup() {
         Some(setup) => setup,
@@ -327,6 +362,7 @@ fn aarch64_under_qemu_runs_hello_world() {
 /// Also under QEMU: the underflow error path (proves the generated error
 /// tail and exit sequence work on aarch64 too).
 #[test]
+#[cfg(target_os = "linux")]
 fn aarch64_under_qemu_reports_underflow_cleanly() {
     let (qemu, binary) = match emulator_setup() {
         Some(setup) => setup,
@@ -354,6 +390,7 @@ fn aarch64_under_qemu_reports_underflow_cleanly() {
     );
 }
 
+#[cfg(target_os = "linux")]
 fn emulator_setup() -> Option<(String, String)> {
     let qemu = std::env::var("QEMU_AARCH64").ok()?;
     let binary = std::env::var("BFJIT_AARCH64").ok()?;
@@ -369,10 +406,12 @@ fn emulator_setup() -> Option<(String, String)> {
 
 // ---------------------------------------------------------------------------
 
+#[cfg(target_os = "linux")]
 fn run(tag: &str, source: &str, stdin: &str, expected: &str) {
     run_bytes(tag, source, stdin, expected.as_bytes());
 }
 
+#[cfg(target_os = "linux")]
 fn run_bytes(tag: &str, source: &str, stdin: &str, expected: &[u8]) {
     let (code, stdout, stderr) = run_raw(tag, source, stdin);
     assert_eq!(
@@ -388,6 +427,7 @@ fn run_bytes(tag: &str, source: &str, stdin: &str, expected: &[u8]) {
     );
 }
 
+#[cfg(target_os = "linux")]
 fn run_raw(tag: &str, source: &str, stdin: &str) -> (std::process::ExitStatus, Vec<u8>, Vec<u8>) {
     let dir = std::env::temp_dir().join(format!("bfjit-e2e-{tag}"));
     fs::create_dir_all(&dir).expect("creating temp dir");

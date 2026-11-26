@@ -29,11 +29,7 @@ shared bfc optimizer. The result runs anywhere JavaScript does:
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
-    if args
-        .iter()
-        .skip(1)
-        .any(|arg| arg == "-h" || arg == "--help")
-    {
+    if has_help_flag(&args) {
         println!("{USAGE}");
         return ExitCode::SUCCESS;
     }
@@ -80,6 +76,12 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+fn has_help_flag(args: &[String]) -> bool {
+    args.iter()
+        .skip(1)
+        .any(|arg| arg == "-h" || arg == "--help")
+}
+
 fn parse_args(args: Vec<String>) -> Result<(String, Option<String>), String> {
     let mut input: Option<String> = None;
     let mut output: Option<String> = None;
@@ -110,4 +112,16 @@ fn default_output_path(input_path: &str) -> String {
         .with_extension("js")
         .to_string_lossy()
         .into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn help_flag_is_recognized() {
+        assert!(has_help_flag(&["bfjs".into(), "-h".into()]));
+        assert!(has_help_flag(&["bfjs".into(), "--help".into()]));
+        assert!(!has_help_flag(&["bfjs".into(), "program.bf".into()]));
+    }
 }

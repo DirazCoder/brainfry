@@ -48,7 +48,21 @@ fn main() -> ExitCode {
         }
     };
 
-    if let Err(err) = program.write_to(file) {
+    write_program(&program, input_path, &output_path, file)
+}
+
+fn default_output_path(input_path: &str) -> String {
+    let path = Path::new(input_path);
+    path.with_extension("bfry").to_string_lossy().into_owned()
+}
+
+fn write_program<W: std::io::Write>(
+    program: &Program,
+    input_path: &str,
+    output_path: &str,
+    writer: W,
+) -> ExitCode {
+    if let Err(err) = program.write_to(writer) {
         eprintln!("couldn't write {output_path}: {err}");
         return ExitCode::FAILURE;
     }
@@ -60,7 +74,31 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn default_output_path(input_path: &str) -> String {
-    let path = Path::new(input_path);
-    path.with_extension("bfry").to_string_lossy().into_owned()
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io;
+
+    struct FailingWriter;
+
+    impl std::io::Write for FailingWriter {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(io::Error::other("forced write failure"))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn write_failure_returns_failure() {
+        let program = Program {
+            ops: vec![bfformat::Op::Zero],
+        };
+        assert_eq!(
+            write_program(&program, "input.bf", "output.bfry", FailingWriter),
+            ExitCode::FAILURE
+        );
+    }
 }

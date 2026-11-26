@@ -70,6 +70,7 @@ fn macos_slots() -> Vec<usize> {
 }
 
 #[cfg(not(target_os = "macos"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 fn macos_slots() -> Vec<usize> {
     // Only reachable if Target::host() ever disagreed with cfg(target_os)
     // about the running OS, which cannot happen (host() is derived from the
@@ -122,6 +123,7 @@ fn windows_slots() -> Vec<usize> {
 }
 
 #[cfg(not(target_os = "windows"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 fn windows_slots() -> Vec<usize> {
     unreachable!("Windows IAT slots requested on a non-Windows host")
 }
@@ -157,14 +159,11 @@ mod tests {
         assert!(slots.iter().all(|slot| *slot != 0));
     }
 
-    // The macOS/Windows tables can only be requested by a host/OS mismatch
-    // that cannot happen (Target::host() derives from the same cfg!s the
-    // table selection compiles on). Their unreachable!() guards are the
-    // statement of that invariant, and these tests pin both the guard and
-    // the message by actually driving the non-host arms on a Linux host.
-    // (On a real macOS/Windows host the table exists, so the tests are
-    // compiled out there.)
-    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    // These guards document the invariant that Target::host() and the
+    // platform-specific slot tables are selected from the same cfgs.
+    // Exercise each fallback on hosts that do not provide that platform's
+    // table.
+    #[cfg(not(target_os = "macos"))]
     #[test]
     #[should_panic(expected = "macOS GOT slots requested on a non-macOS host")]
     fn macos_slots_are_unreachable_on_this_host() {

@@ -109,13 +109,12 @@ impl JitRegion {
     ///
     /// The entry never returns: it runs the program and terminates the
     /// process with the program's exit status, so this call has type `!`.
-    // coverage(off) (nightly coverage runs only — the attribute is unstable,
-    // so it is cfg-gated): these lines execute *after* the final coverage
-    // counter dump by construction — main() flushes the profile immediately
-    // before jumping here because the generated entry exits via raw
-    // syscall, skipping the atexit-based writer. No profile can ever
-    // contain these lines; the behavior itself is pinned by the e2e suite
-    // (every successful run goes through here).
+    // coverage(off) in coverage runs: these lines execute *after* the
+    // final coverage counter dump by construction — main() flushes the
+    // profile immediately before jumping here because the generated entry
+    // exits via raw syscall, skipping the atexit-based writer. No profile
+    // can ever contain these lines; the behavior itself is pinned by the
+    // e2e suite (every successful run goes through here).
     #[cfg_attr(coverage_nightly, coverage(off))]
     pub unsafe fn enter(&self) -> ! {
         // macOS-ARM64 special case: the generated entry assumes dyld's
@@ -480,8 +479,32 @@ mod tests {
         unsafe {
             let region = JitRegion::alloc(0x1000).expect("alloc");
             region.write_bytes(0, b"int3");
-            protect_exec(region.base, region.len).expect("aligned mprotect must succeed");
+            region
+                .make_executable()
+                .expect("a well-formed region must become executable");
         }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[test]
+    fn executable_protection_failure_is_reported() {
+        let region = JitRegion {
+            base: core::ptr::null_mut(),
+            len: 0x1000,
+        };
+        let message = unsafe { region.make_executable() }.expect_err("null region must fail");
+
+        #[cfg(target_os = "macos")]
+        assert!(
+            message.contains("failed to make JIT memory executable"),
+            "{message}"
+        );
+
+        #[cfg(target_os = "windows")]
+        assert!(
+            message.contains("VirtualProtect(PAGE_EXECUTE_READ) failed"),
+            "{message}"
+        );
     }
 
     #[cfg(target_os = "linux")]

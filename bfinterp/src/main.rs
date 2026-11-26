@@ -11,10 +11,12 @@
 //! with `bfrun` (or any other tool) — only the parser front end is shared,
 //! the same one every other backend uses.
 
-// Enables the unstable `coverage(off)` attribute for nightly coverage runs
-// only (cargo-llvm-cov sets `coverage_nightly`); see the note on the test
-// helper in interp.rs for why it is used.
-#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
+// Only the Linux x86-64 test helper uses coverage(off); keep the unstable
+// feature gate off other targets and the non-test binary.
+#![cfg_attr(
+    all(coverage_nightly, test, target_os = "linux", target_arch = "x86_64"),
+    feature(coverage_attribute)
+)]
 
 mod interp;
 
@@ -29,14 +31,16 @@ Runs a .bf source file directly on a naive interpreter (stdin in, stdout
 out; no output file). --optimize runs the shared optimizer first — the
 default is the raw, unoptimized execution path.";
 
+fn has_help_flag(args: &[String]) -> bool {
+    args.iter()
+        .skip(1)
+        .any(|arg| arg == "-h" || arg == "--help")
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
 
-    if args
-        .iter()
-        .skip(1)
-        .any(|arg| arg == "-h" || arg == "--help")
-    {
+    if has_help_flag(&args) {
         println!("{USAGE}");
         return ExitCode::SUCCESS;
     }
@@ -100,5 +104,17 @@ fn main() -> ExitCode {
             eprintln!("runtime error: {err}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn help_flag_is_recognized() {
+        assert!(has_help_flag(&["bfinterp".into(), "-h".into()]));
+        assert!(has_help_flag(&["bfinterp".into(), "--help".into()]));
+        assert!(!has_help_flag(&["bfinterp".into(), "program.bf".into()]));
     }
 }

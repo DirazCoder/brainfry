@@ -168,17 +168,6 @@ fn fold_zero_loops(ops: Vec<Op>) -> Vec<Op> {
 /// start, I/O inside, whatever -- are left as real loops. This pass is
 /// conservative on purpose: a loop that isn't provably safe to fold stays a
 /// loop rather than risk changing what the program does.
-// coverage(off) (nightly coverage runs only — the attribute is unstable, so
-// it is cfg-gated): the `offset != 0` guard below is deliberately defensive
-// -- find_offset_add_loop's `*offset == 0 { continue; }` provably keeps the
-// counting cell out of `deltas`, so the guard's false branch is unreachable
-// by construction. It is kept (rather than deleted) as belt-and-braces
-// against a future pass reordering, exactly like the Zero/MulAdd exclusion
-// comment inside find_offset_add_loop argues for. Excluding the function
-// from instrumentation keeps that dead arm from diluting the measured
-// coverage of the rest of the pass, which the tests below still exercise
-// assertion-for-assertion.
-#[cfg_attr(coverage_nightly, coverage(off))]
 fn fold_offset_adds(ops: Vec<Op>) -> Vec<Op> {
     let mut out = Vec::with_capacity(ops.len());
     let mut i = 0;
@@ -187,9 +176,7 @@ fn fold_offset_adds(ops: Vec<Op>) -> Vec<Op> {
         match find_offset_add_loop(&ops, i) {
             Some((body_end, deltas)) => {
                 for (offset, factor) in deltas {
-                    if offset != 0 {
-                        out.push(Op::MulAdd { offset, factor });
-                    }
+                    out.push(Op::MulAdd { offset, factor });
                 }
                 out.push(Op::Zero);
                 i = body_end;
@@ -374,6 +361,22 @@ mod tests {
         let ops = vec![Op::Add(1), Op::Add(1), Op::Add(1)];
         let folded = fold_runs(&ops);
         assert_eq!(folded, vec![Op::Add(3)]);
+    }
+
+    #[test]
+    fn folds_repeated_sub_and_moves() {
+        let ops = vec![
+            Op::Sub(1),
+            Op::Sub(1),
+            Op::MoveRight(1),
+            Op::MoveRight(1),
+            Op::MoveLeft(1),
+            Op::MoveLeft(1),
+        ];
+        assert_eq!(
+            fold_runs(&ops),
+            vec![Op::Sub(2), Op::MoveRight(2), Op::MoveLeft(2)]
+        );
     }
 
     #[test]
@@ -624,6 +627,20 @@ mod tests {
         ];
         let folded = fold_offset_adds(ops.clone());
         assert_eq!(folded, ops);
+    }
+
+    #[test]
+    fn does_not_fold_offset_add_with_unrepresentable_factor() {
+        let ops = vec![
+            Op::JumpIfZero { target: 0 },
+            Op::Sub(1),
+            Op::MoveRight(1),
+            Op::Add(255),
+            Op::Add(1),
+            Op::MoveLeft(1),
+            Op::JumpIfNonZero { target: 0 },
+        ];
+        assert_eq!(fold_offset_adds(ops.clone()), ops);
     }
 
     #[test]

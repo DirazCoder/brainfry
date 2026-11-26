@@ -438,6 +438,22 @@ mod tests {
     }
 
     #[test]
+    fn zero_step_and_in_range_edits_leave_the_tape_unexpanded() {
+        let (_, dbg) = script("+", &["step 0", "set cell[0] = 7", "set ptr = 1", "info"]);
+        assert!(
+            dbg.contains("stepped 0 op(s) — now op 1/1 — line 1, col 1 — Add(1)"),
+            "{dbg}"
+        );
+        assert!(dbg.contains("cell 0 = 7\n"), "{dbg}");
+        assert!(dbg.contains("ptr = 1\n"), "{dbg}");
+        assert!(
+            dbg.contains("machine: ptr 1, tape 30000 cells, 0 steps executed"),
+            "{dbg}"
+        );
+        assert!(!dbg.contains("tape grew"), "{dbg}");
+    }
+
+    #[test]
     fn quit_stops_the_session_and_help_lists_commands() {
         let (prog, dbg) = script("+.", &["help", "run", "quit", "run"]);
         assert!(dbg.contains("commands:"), "{dbg}");

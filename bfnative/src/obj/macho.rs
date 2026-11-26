@@ -718,6 +718,21 @@ mod tests {
     use crate::codegen;
     use crate::target::Target;
 
+    #[test]
+    fn signature_identifier_uses_the_portable_sanitized_basename() {
+        assert_eq!(
+            sanitize_ident("some/path/my executable?.bf"),
+            "my_executable_.bf"
+        );
+        assert_eq!(sanitize_ident(r"C:\build\brainfry.exe"), "brainfry.exe");
+    }
+
+    #[test]
+    fn signature_identifier_falls_back_when_sanitization_is_empty() {
+        assert_eq!(sanitize_ident(""), "bfnative");
+        assert_eq!(sanitize_ident("some/path/"), "bfnative");
+    }
+
     fn build_for(ops: &[bfformat::Op], name: &str) -> Vec<u8> {
         let target = Target::from_name(name).unwrap();
         let mut m = codegen::emit(ops, target);

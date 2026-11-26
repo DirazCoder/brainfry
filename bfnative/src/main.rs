@@ -40,11 +40,7 @@ struct Options {
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
-    if args
-        .iter()
-        .skip(1)
-        .any(|arg| arg == "-h" || arg == "--help")
-    {
+    if has_help_flag(&args) {
         println!("{USAGE}");
         return ExitCode::SUCCESS;
     }
@@ -212,6 +208,12 @@ fn mark_executable(path: &str) {
     }
 }
 
+fn has_help_flag(args: &[String]) -> bool {
+    args.iter()
+        .skip(1)
+        .any(|arg| arg == "-h" || arg == "--help")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -244,5 +246,12 @@ mod tests {
         assert_eq!(default_output_path(input, linux), "some/dir/program");
         let windows = Target::from_name("windows-x86_64").unwrap();
         assert_eq!(default_output_path(input, windows), "some/dir/program.exe");
+    }
+
+    #[test]
+    fn help_flag_is_recognized() {
+        assert!(has_help_flag(&["bfnative".into(), "-h".into()]));
+        assert!(has_help_flag(&["bfnative".into(), "--help".into()]));
+        assert!(!has_help_flag(&["bfnative".into(), "program.bf".into()]));
     }
 }

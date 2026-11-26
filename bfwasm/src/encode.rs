@@ -83,6 +83,13 @@ mod tests {
     }
 
     #[test]
+    fn sleb_zero_is_one_byte() {
+        let mut out = Vec::new();
+        sleb(&mut out, 0);
+        assert_eq!(out, vec![0x00]);
+    }
+
+    #[test]
     fn sleb_matches_spec_example() {
         // -123456, same worked example set as the ULEB128 test above.
         let mut out = Vec::new();
