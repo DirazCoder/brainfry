@@ -481,7 +481,7 @@ impl Debugger {
             BreakSpec::Line(line, col) => {
                 let wanted = *col;
                 for (i, pos) in self.srcmap.iter().enumerate() {
-                    if pos.line == *line && wanted.map_or(true, |c| pos.col == c) {
+                    if pos.line == *line && wanted.is_none_or(|c| pos.col == c) {
                         return Ok(i);
                     }
                 }
@@ -619,11 +619,10 @@ impl Debugger {
     }
 
     fn check_watches(&self, pre: u8) -> Option<Stop> {
-        if let Some(n) = self.watch_ptr {
-            if self.ptr == n {
+        if let Some(n) = self.watch_ptr
+            && self.ptr == n {
                 return Some(Stop::WatchPtr(n));
             }
-        }
         if let Some(n) = self.watch_cell {
             let now = self.cell_at(n);
             if now != pre {
@@ -942,7 +941,7 @@ mod tests {
 
     #[test]
     fn wraparound_is_bfinterp_semantics() {
-        let mut d = dbg_for(&"-".repeat(1));
+        let mut d = dbg_for("-");
         let mut out = Vec::new();
         d.step(&mut out);
         assert_eq!(d.cell_at(0), 255);

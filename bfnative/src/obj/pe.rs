@@ -106,7 +106,7 @@ const ARM64_ENTRY_FRAME_BYTES: u32 = 64;
 const UNWIND_CODE_END: u8 = 0xE4;
 
 const fn alloc_s_unwind_code(frame_bytes: u32) -> u8 {
-    assert!(frame_bytes % 16 == 0, "alloc_s requires a 16-byte-aligned frame size");
+    assert!(frame_bytes.is_multiple_of(16), "alloc_s requires a 16-byte-aligned frame size");
     let units = frame_bytes / 16;
     assert!(units < 32, "alloc_s's 5-bit immediate covers at most 31*16 = 496 bytes");
     units as u8 // tag bits 000 are implicitly 0 in the low 3 bits of this 5-bit value's byte
@@ -454,7 +454,7 @@ pub fn build(module: &mut Module, arch: Arch) -> (Vec<u8>, Layout) {
     out.extend_from_slice(&(reloc_page_rva as u32).to_le_bytes()); // Page RVA
     out.extend_from_slice(&(RELOC_BLOCK_SIZE as u32).to_le_bytes()); // SizeOfBlock
     const IMAGE_REL_BASED_DIR64: u16 = 10;
-    let entry = ((IMAGE_REL_BASED_DIR64 as u16) << 12) | (reloc_page_offset as u16 & 0xFFF);
+    let entry = (IMAGE_REL_BASED_DIR64 << 12) | (reloc_page_offset as u16 & 0xFFF);
     out.extend_from_slice(&entry.to_le_bytes());
     out.extend_from_slice(&0u16.to_le_bytes()); // type 0 (ABSOLUTE) pad entry, 4-byte align
     while (out.len() as u64) < reloc_fileoff + reloc_raw {
@@ -477,7 +477,7 @@ pub fn build(module: &mut Module, arch: Arch) -> (Vec<u8>, Layout) {
         // epilogue scopes follow, but Epilog Count is 0 so none do) |
         // Epilog Count (5 bits, 0) | Code Words (5 bits, 1).
         assert!(
-            text_vsize % 4 == 0,
+            text_vsize.is_multiple_of(4),
             ".text size must be a multiple of 4 for ARM64 instruction alignment"
         );
         let function_length = text_vsize / 4;
@@ -648,7 +648,7 @@ mod tests {
                         (rva >= rva_sec && rva < rva_sec + vsize)
                             .then(|| (raw + (rva - rva_sec)) as usize)
                     })
-                    .expect(&format!("rva {rva:#x} not in any section"))
+                    .unwrap_or_else(|| panic!("rva {rva:#x} not in any section"))
             };
 
             // Walk the descriptors.

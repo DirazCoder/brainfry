@@ -206,9 +206,7 @@ fn type_section() -> Vec<u8> {
 
     out.push(TYPE_FUNC);
     uleb(&mut out, 4);
-    for _ in 0..4 {
-        out.push(VALTYPE_I32);
-    }
+    out.extend([VALTYPE_I32; 4]);
     uleb(&mut out, 1);
     out.push(VALTYPE_I32);
 

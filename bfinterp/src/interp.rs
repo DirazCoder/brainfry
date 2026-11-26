@@ -333,7 +333,7 @@ mod tests {
         );
         assert_eq!(RunError::GrowFailed.to_string(), "failed to grow tape");
         assert_eq!(
-            RunError::Io(io::Error::new(io::ErrorKind::Other, "bad fd")).to_string(),
+            RunError::Io(io::Error::other("bad fd")).to_string(),
             "I/O error: bad fd"
         );
         let converted: RunError = io::Error::new(io::ErrorKind::BrokenPipe, "x").into();
@@ -448,7 +448,7 @@ mod tests {
             Ok(buf.len())
         }
         fn flush(&mut self) -> io::Result<()> {
-            Err(io::Error::new(io::ErrorKind::Other, "disk full"))
+            Err(io::Error::other("disk full"))
         }
     }
 

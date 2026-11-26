@@ -317,7 +317,7 @@ mod tests {
 
     #[test]
     fn io_errors_convert_into_format_errors() {
-        let err: FormatError = io::Error::new(io::ErrorKind::Other, "disk fell off").into();
+        let err: FormatError = io::Error::other("disk fell off").into();
         assert!(matches!(err, FormatError::Io(_)));
         assert_eq!(err.to_string(), "I/O error: disk fell off");
     }
@@ -439,7 +439,7 @@ mod tests {
     impl Write for FailAfter {
         fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
             if self.remaining_ok == 0 {
-                Err(io::Error::new(io::ErrorKind::Other, "planned failure"))
+                Err(io::Error::other("planned failure"))
             } else {
                 self.remaining_ok -= 1;
                 Ok(buf.len())

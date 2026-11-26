@@ -1310,7 +1310,7 @@ mod tests {
             );
             assert!(!m.code.is_empty(), "{name}: no code emitted");
             assert!(
-                m.code.len() % 4 == 0,
+                m.code.len().is_multiple_of(4),
                 "{name}: aarch64 code must be word-sized"
             );
         }
@@ -1330,7 +1330,7 @@ mod tests {
             let target = crate::target::Target::from_name(name).unwrap();
             let m = crate::codegen::emit(&ops, target);
             assert!(!m.code.is_empty(), "{name}: no code emitted");
-            assert!(m.code.len() % 4 == 0, "{name}: word alignment");
+            assert!(m.code.len().is_multiple_of(4), "{name}: word alignment");
             assert!(!m.fixups.is_empty(), "{name}: no fixups to resolve");
             // Every label must be bound (emit's own invariant, checked).
             assert!(m.labels.iter().all(|&l| l != u32::MAX));

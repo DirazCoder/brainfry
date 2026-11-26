@@ -2,11 +2,11 @@
 //!
 //! Same front end as every other backend in this workspace (`bfc::parser`
 //! + `bfc::optimize`); the output is a `.js` file that runs natively
-//! anywhere JavaScript runs — Node, Bun, Deno, or a browser console —
-//! with no runtime, no shim, and no external toolchain at build time or
-//! run time. See `codegen.rs` for why a `Uint8Array` tape gives
-//! Brainfuck's 8-bit semantics for free and how the host I/O layer is
-//! feature-detected.
+//!   anywhere JavaScript runs — Node, Bun, Deno, or a browser console —
+//!   with no runtime, no shim, and no external toolchain at build time or
+//!   run time. See `codegen.rs` for why a `Uint8Array` tape gives
+//!   Brainfuck's 8-bit semantics for free and how the host I/O layer is
+//!   feature-detected.
 
 mod codegen;
 

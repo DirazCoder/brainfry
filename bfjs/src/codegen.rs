@@ -130,20 +130,20 @@ const STRAIGHT_CHUNK_OPS: usize = 150;
 /// Two emission shapes, picked by size:
 ///
 /// - **Flat** (default, every normal program): one op → one statement,
-///  loops as plain nested `while` blocks, nothing else. Readable top to
-///  bottom.
+///   loops as plain nested `while` blocks, nothing else. Readable top to
+///   bottom.
 /// - **Chunked** (programs over [`CHUNK_THRESHOLD`] ops): the same
-///  statements, but each loop body and each long straight-line run moves
-///  into its own small function (`L0`, `S1`, …), leaving `while` skeletons
-///  that call them. This exists because V8 declines to optimize a single
-///  huge function: a 213 KB one-IIFE mandelbrot triggers a handful of
-///  OSRs and no full TurboFan compile (measured: 18.9 s — slower than
-///  the naive Rust interpreter), while the chunked shape fires ~400
-///  optimization events across its call tree and runs the same program
-///  in 4.0 s. The hot innermost loop bodies in real programs are short,
-///  stay inline in their parent function, and get TurboFan'd like the
-///  flat shape intends; only the cold bulk gets a function-call boundary.
-///  Small programs never see any of this.
+///   statements, but each loop body and each long straight-line run moves
+///   into its own small function (`L0`, `S1`, …), leaving `while` skeletons
+///   that call them. This exists because V8 declines to optimize a single
+///   huge function: a 213 KB one-IIFE mandelbrot triggers a handful of
+///   OSRs and no full TurboFan compile (measured: 18.9 s — slower than
+///   the naive Rust interpreter), while the chunked shape fires ~400
+///   optimization events across its call tree and runs the same program
+///   in 4.0 s. The hot innermost loop bodies in real programs are short,
+///   stay inline in their parent function, and get TurboFan'd like the
+///   flat shape intends; only the cold bulk gets a function-call boundary.
+///   Small programs never see any of this.
 pub fn compile(ops: &[Op], source_name: &str) -> String {
     let loops = match_loops(ops);
     let mut out = String::with_capacity(4096);
@@ -167,7 +167,7 @@ pub fn compile(ops: &[Op], source_name: &str) -> String {
     } else {
         emit_block(&mut out, ops, &loops, 0, ops.len(), 1);
     }
-    out.push_str(&footer());
+    out.push_str(footer());
 
     out
 }

@@ -2,13 +2,13 @@
 //!
 //! Same front end as every other backend in this workspace (`bfc::parser`
 //! + `bfc::optimize`); the output is a `.c` file you hand to a real C
-//! compiler, which is the whole point: `bfnative` emits machine code
-//! itself for exactly two architectures with a clean, verifiable
-//! baseline code generator, while `bf2c` lets GCC/Clang/MSVC spend
-//! decades of optimizer engineering (register allocation, loop
-//! unrolling, dead-store elimination, SIMD auto-vectorization) on the
-//! program — and runs anywhere a C compiler exists. See `codegen.rs`
-//! for the emitted code's shape and its pointer discipline.
+//!   compiler, which is the whole point: `bfnative` emits machine code
+//!   itself for exactly two architectures with a clean, verifiable
+//!   baseline code generator, while `bf2c` lets GCC/Clang/MSVC spend
+//!   decades of optimizer engineering (register allocation, loop
+//!   unrolling, dead-store elimination, SIMD auto-vectorization) on the
+//!   program — and runs anywhere a C compiler exists. See `codegen.rs`
+//!   for the emitted code's shape and its pointer discipline.
 
 mod codegen;
 

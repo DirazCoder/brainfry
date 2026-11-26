@@ -128,7 +128,7 @@ const SEGMENT_INDEX_DATA: u8 = 2; // __PAGEZERO=0, __TEXT=1, __DATA=2
 /// 9 u32s (magic..codeLimit) + 4 u8s (hashSize..pageSize)
 /// + 3 u32s (spare2, scatterOffset, teamOffset) + 1 u32 (spare3)
 /// + 4 u64s (codeLimit64, execSegBase, execSegLimit, execSegFlags)
-/// = 9*4 + 4*1 + 3*4 + 1*4 + 4*8 = 36 + 4 + 12 + 4 + 32 = 88.
+///   = 9*4 + 4*1 + 3*4 + 1*4 + 4*8 = 36 + 4 + 12 + 4 + 32 = 88.
 const CD_HEADER_SIZE: u64 = 88;
 
 /// Field offsets inside `segment_command_64` (for post-hoc fix-ups).
@@ -467,7 +467,7 @@ pub fn build(module: &mut Module, arch: Arch, image_name: &str) -> (Vec<u8>, Lay
     // per `rcodesign print-signature-info`, and it runs fine. Real ld64
     // ad-hoc signing does not add a CMS blob. Matching that shape here:
     // one blob (CodeDirectory), one BlobIndex entry.
-    let superblob_length = 12 + 1 * 8 + cd_length;
+    let superblob_length = 12 + 8 + cd_length;
     let datasize = align_up(superblob_length as u64, 16) as u32;
 
     // Patch LC_CODE_SIGNATURE and __LINKEDIT sizes BEFORE hashing any
@@ -510,7 +510,7 @@ pub fn build(module: &mut Module, arch: Arch, image_name: &str) -> (Vec<u8>, Lay
     // SuperBlob: a 12-byte SuperBlob header followed by one 8-byte
     // BlobIndex entry (CodeDirectory only -- see note above on why
     // there's no separate CMS slot).
-    const CD_START: u32 = 12 + 1 * 8;
+    const CD_START: u32 = 12 + 8;
     out.extend_from_slice(&CSMAGIC_EMBEDDED_SIGNATURE.to_be_bytes());
     out.extend_from_slice(&superblob_length.to_be_bytes());
     out.extend_from_slice(&1u32.to_be_bytes()); // count: CodeDirectory only

@@ -289,7 +289,7 @@ mod tests {
             Ok(buf.len())
         }
         fn flush(&mut self) -> io::Result<()> {
-            Err(io::Error::new(io::ErrorKind::Other, "disk full"))
+            Err(io::Error::other("disk full"))
         }
     }
 
@@ -326,7 +326,7 @@ mod tests {
             "pointer moved left of cell 0"
         );
         assert_eq!(
-            RunError::Io(io::Error::new(io::ErrorKind::Other, "pipe broke"))
+            RunError::Io(io::Error::other("pipe broke"))
                 .to_string(),
             "I/O error: pipe broke"
         );
