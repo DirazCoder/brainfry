@@ -42,6 +42,16 @@
 //! `bfnative`, with the same message, and left-of-zero is the same
 //! underflow error with the same exit status.
 //!
+//! ## Windows byte-exactness
+//!
+//! Windows C runtimes open the stdio streams in text mode: `\n` written
+//! through `putchar`/`fprintf` reaches the pipe as CR LF, and reads fold
+//! CR LF back to a single LF. Brainfuck I/O moves raw bytes, so `main`
+//! starts with a `#ifdef _WIN32` shim that flips stdin, stdout, and
+//! stderr to `_O_BINARY` — after which a Windows binary is byte-exact
+//! with every other backend. Everywhere else the preprocessor deletes
+//! the shim entirely, so non-Windows output is unchanged.
+//!
 //! ## Pointer discipline
 //!
 //! The generated C never computes a pointer outside the tape object:
@@ -156,6 +166,10 @@ fn header(ops: &[Op], source_name: &str, uses_grow: bool, uses_die: bool) -> Str
 #include <string.h>
 #include <stdint.h>
 #include <stddef.h>
+#ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
+#endif
 
 "#,
     );
@@ -218,6 +232,18 @@ static void grow(size_t need)
     h.push_str(
         r#"int main(void)
 {
+    /* Windows opens stdio in text mode: '\n' written through putchar or
+     * fprintf reaches the pipe as CR LF (0D 0A) and reads fold CR LF to
+     * LF. Brainfry moves raw bytes, so flip all three streams to binary
+     * mode and stay byte-exact with every other backend. Non-Windows
+     * platforms have no text mode at all, so the preprocessor deletes
+     * this whole block there. */
+#ifdef _WIN32
+    _setmode(_fileno(stdin), _O_BINARY);
+    _setmode(_fileno(stdout), _O_BINARY);
+    _setmode(_fileno(stderr), _O_BINARY);
+#endif
+
     tape = calloc(TAPE_INITIAL, 1);
     if (tape == NULL) {
         fprintf(stderr, "runtime error: failed to grow tape\n");
@@ -329,6 +355,20 @@ fn emit_op(out: &mut String, op: &Op, pad: &str) {
 mod tests {
     use super::*;
     use bfc::{optimize, parser};
+
+    /// Deletes every `#ifdef _WIN32 ... #endif` block — a stand-in for
+    /// what the preprocessor does on non-Windows targets.
+    fn strip_win32_block(c: &str) -> String {
+        let mut stripped = c.to_string();
+        while let Some(start) = stripped.find("#ifdef _WIN32") {
+            let end = stripped[start..]
+                .find("#endif")
+                .map(|i| start + i + "#endif".len())
+                .expect("closing #endif");
+            stripped.replace_range(start..end, "");
+        }
+        stripped
+    }
 
     fn compiled(source: &str) -> String {
         let ops = optimize::optimize(parser::parse(source).unwrap());
@@ -472,5 +512,59 @@ mod tests {
     fn input_eof_leaves_the_cell_untouched() {
         let c = compiled(",");
         assert!(c.contains("{ int c = getchar(); if (c != EOF) { *p = (uint8_t)c; } }"));
+    }
+
+    #[test]
+    fn windows_text_mode_is_disabled_for_byte_exact_io() {
+        // Windows C runtimes translate '\n' to CR LF in text mode — that
+        // is the whole class of Windows e2e failures (hello world ending
+        // 13,10, error messages ending 13,10). The generated program must
+        // flip all three stdio streams to binary mode under _WIN32.
+        let c = compiled("+.");
+        assert!(c.contains("#ifdef _WIN32"), "missing guard: {c}");
+        assert!(c.contains("#include <fcntl.h>"), "missing fcntl.h: {c}");
+        assert!(c.contains("#include <io.h>"), "missing io.h: {c}");
+        assert!(
+            c.contains("    _setmode(_fileno(stdin), _O_BINARY);"),
+            "stdin not binary: {c}"
+        );
+        assert!(
+            c.contains("    _setmode(_fileno(stdout), _O_BINARY);"),
+            "stdout not binary: {c}"
+        );
+        assert!(
+            c.contains("    _setmode(_fileno(stderr), _O_BINARY);"),
+            "stderr not binary: {c}"
+        );
+        // The shim runs before any byte can reach a stream — including
+        // the tape-allocation failure path — so it must open main.
+        let main_body = c.split("int main(void)").nth(1).expect("main body");
+        let shim_at = main_body
+            .find("_setmode(_fileno(stdin), _O_BINARY);")
+            .expect("shim in main");
+        let first_io_at = main_body
+            .find("fprintf(stderr")
+            .or_else(|| main_body.find("putchar"))
+            .expect("some stdio statement");
+        assert!(shim_at < first_io_at, "shim must precede all stdio: {c}");
+    }
+
+    #[test]
+    fn the_windows_shim_is_c89_clean_and_balanced() {
+        let c = compiled(".");
+        // Block comments only (MSVC's strictest modes reject //), and the
+        // preprocessor guards pair up so non-Windows compiles see nothing
+        // of the shim at all.
+        assert!(!c.contains("//"), "line comments found: {c}");
+        let ifdefs = c.matches("#ifdef").count();
+        let endifs = c.matches("#endif").count();
+        assert_eq!(ifdefs, endifs, "unbalanced #ifdef/#endif");
+        assert_eq!(ifdefs, c.matches("#ifdef _WIN32").count(), "only _WIN32 guards");
+        // On a non-Windows compile every shim line vanishes, so deleting
+        // the guards must remove every Windows-only token.
+        let stripped = strip_win32_block(&c);
+        assert!(!stripped.contains("_setmode"), "shim leaked outside guard");
+        assert!(!stripped.contains("fcntl.h"), "include leaked outside guard");
+        assert!(!stripped.contains("_O_BINARY"), "constant leaked outside guard");
     }
 }
