@@ -46,7 +46,7 @@ jobs:
       - name: build
         shell: bash
         run: |
-          cargo build --release --target ${{ matrix.target }} -p bfc -p bfrun -p bfnative -p bfinterp -p bfwasm -p bfjit
+          cargo build --release --target ${{ matrix.target }} -p bfc -p bfrun -p bfnative -p bfinterp -p bfwasm -p bfjit -p bfjs -p bf2c -p bfdbg
 
       - name: cargo test
         shell: bash
@@ -96,7 +96,7 @@ jobs:
           [[ "${{ matrix.target }}" == *windows* ]] && EXE=".exe"
           SRC="target/${{ matrix.target }}/release"
           mkdir -p target/release
-          for bin in bfc bfrun bfnative bfinterp bfjit bfwasm; do
+          for bin in bfc bfrun bfnative bfinterp bfjit bfwasm bfjs bf2c bfdbg; do
             cp "$SRC/$bin$EXE" "target/release/$bin$EXE"
           done
           python3 scripts/differential_test_all.py .

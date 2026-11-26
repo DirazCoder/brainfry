@@ -10,12 +10,12 @@ interpreter in the loop at all. Written in Rust — no manual memory
 management to get wrong while hand-rolling machine code, executable
 containers, and wasm modules.
 
-Five ways to run a `.bf` file, in increasing order of "how far do you want
+Seven ways to run a `.bf` file, in increasing order of "how far do you want
 to get from an interpreter":
 
 1. **`bfinterp`** — walk the source directly, no bytecode, no compile step,
    no optimizer by default. The simplest and slowest path, and the one the
-   other four are checked against.
+   other six are checked against.
 2. **`bfc` + `bfrun`** — compile to `.bfry` bytecode, run it on a small VM.
    The javac/java split. Fast to build, portable, no toolchain needed.
 3. **`bfjit`** — same codegen as `bfnative`, but instead of writing an
@@ -34,13 +34,31 @@ to get from an interpreter":
    Node with `--experimental-wasi-unstable-preview1`, a browser with a
    WASI shim) instead of a specific OS/CPU pair — the one backend in this
    project whose output isn't tied to the machine it was compiled on.
+6. **`bfjs`** — compile to a standalone `.js` file: a `Uint8Array` tape,
+   guarded moves with doubling growth, and a host-detecting I/O layer. The
+   output runs natively anywhere JavaScript does — Node, Bun, Deno, a
+   browser console — with no WASI shim, no runtime, and no build step,
+   because the host's own JIT (V8 and friends) is the machine-code stage.
+7. **`bf2c`** — compile to portable C99, then hand the last mile to a real
+   C compiler (`cc -O3`, clang, MSVC, a cross-toolchain). The opposite
+   trade from `bfnative`: instead of Brainfry emitting machine code itself
+   for two architectures, GCC/Clang get to spend decades of optimizer
+   engineering on the program — and the output runs on any hardware with
+   a C compiler, 32-bit micros and RISC-V included.
 
-Checking whether a bug is in your program or in one of the other four?
+And one tool for when the question isn't "how fast" but "why did my cell
+end up as 100": **`bfdbg`**, the interactive, time-traveling debugger
+(breakpoints, watchpoints, live tape editing, `back`).
+
+Checking whether a bug is in your program or in one of the other six?
 `bfinterp` is the ground truth. Iterating on a program, `bfc`/`bfrun` is
 zero-friction. Want near-native speed without managing a build artifact —
 `bfjit`. Shipping something you want to hand someone as a standalone
 `.exe`, that's `bfnative`. Shipping something that runs anywhere a wasm
-runtime does, independent of OS or CPU — that's `bfwasm`.
+runtime does, independent of OS or CPU — that's `bfwasm`. Want it to run
+in a browser console or a serverless function with zero tooling — `bfjs`.
+Targeting hardware `bfnative` will never support — `bf2c`. Trying to figure
+out *why* a program misbehaves — `bfdbg`.
 
 ## Layout
 
@@ -60,7 +78,7 @@ runtime does, independent of OS or CPU — that's `bfwasm`.
 - `bfinterp/` — the raw source interpreter. Reads a `.bf` file and executes
   it one op at a time, no bytecode, no optimizer by default, no machine
   code. Deliberately the simplest and slowest correct execution path, so it
-  can serve as the ground-truth reference the other four are
+  can serve as the ground-truth reference the other six are
   differential-tested against. `--optimize` opts into the shared optimizer
   for comparison runs; the default is the naive walk.
 - `bfjit/` — the JIT. Same parser, same optimizer, and the *same source
@@ -81,12 +99,38 @@ runtime does, independent of OS or CPU — that's `bfwasm`.
   needs doesn't apply here. No `wasm-bindgen`, no `wat2wasm`, no
   Emscripten; every byte comes out of `bfwasm` itself, same discipline as
   `bfnative`.
+- `bfjs/` — the JavaScript transpiler. Same front end as every other
+  backend; the output is a standalone `.js` file whose tape is a
+  `Uint8Array` — 8-bit wraparound semantics for free, zero masking — with
+  a doubling grow, the same 1 GiB cap and left-of-zero error as the other
+  backends, and an I/O layer that feature-detects the host once (Node/Bun
+  via `fs.writeSync`, Deno via `Deno.stdout.writeSync`, browsers via a
+  collected buffer). The host's JIT is the machine-code stage, which is
+  what makes the output near-native without Brainfry emitting a single
+  CPU instruction.
+- `bf2c/` — the C99 transpiler. Emits portable C with a moving
+  `uint8_t *p` over a `calloc`'d tape: `Add(5)` becomes `*p += 5;`,
+  `Move(3)` becomes `p += 3;`, `MulAdd(2, 3)` becomes `p[2] += *p * 3;`,
+  all guarded the same way every backend guards them. No GNU extensions,
+  strictly-defined pointer arithmetic (left moves compare `p - tape`
+  before subtracting), and helpers emitted only when reachable so the
+  file compiles warning-clean even under `-Wall -Wextra -Werror`. The C
+  compiler — not Brainfry — is where register allocation, unrolling, and
+  auto-vectorization happen.
+- `bfdbg/` — the interactive debugger. Its own single-stepping engine
+  over the *raw parsed* op list — one op per source character, so every
+  step maps to an exact line/column — with breakpoints by op index or
+  source position, watchpoints on the pointer or on a cell's value, a
+  live tape view (dec/hex/ASCII) with live editing, and time travel: an
+  undo log of `(op_index, old_ptr, old_cell_value)` records that `back`
+  replays in reverse, so a runtime error can be rewound, patched with
+  `set`, and retried without restarting the program.
 
-`bfinterp`, `bfjit`, and `bfwasm` are independent crates with independent
-runtimes/emitters. They share the front end (`bfc`/`bfformat`) exactly like
-`bfnative` does, and share no execution code with `bfrun`/`bfnative` or each
-other. Delete any one of them and the rest of the workspace builds and
-behaves exactly as before.
+`bfinterp`, `bfjit`, `bfwasm`, `bfjs`, `bf2c`, and `bfdbg` are independent
+crates with independent runtimes/emitters. They share the front end
+(`bfc`/`bfformat`) exactly like `bfnative` does, and share no execution
+code with `bfrun`/`bfnative` or each other. Delete any one of them and the
+rest of the workspace builds and behaves exactly as before.
 
 ## Building
 
@@ -97,10 +141,12 @@ compiler, no linker, no platform SDK, for any target, including wasm.
 cargo build --release
 ```
 
-This builds all six binaries — `bfc`, `bfrun`, `bfnative`, `bfinterp`,
-`bfjit`, and `bfwasm` — in one shot. Every crate is listed in
-`Cargo.toml`'s `[workspace] members`, so there's no special-casing needed
-for any of them.
+This builds all nine binaries — `bfc`, `bfrun`, `bfnative`, `bfinterp`,
+`bfjit`, `bfwasm`, `bfjs`, `bf2c`, and `bfdbg` — in one shot. Every crate
+is listed in `Cargo.toml`'s `[workspace] members`, so there's no
+special-casing needed for any of them. The one external tool any of this
+can involve is a C compiler or node — and only for *running* `bf2c`/`bfjs`
+output, never for building the workspace.
 
 ## Usage: bfc / bfrun
 
@@ -295,6 +341,103 @@ module hits a wasm trap, which has no text to print. What a trap turns into
 (exit status, any message) is up to the runtime, and the differential
 harness doesn't exercise either path.
 
+## Usage: bfjs
+
+```
+bfjs program.bf               # writes program.js
+bfjs program.bf -o out.js     # or pick the output name yourself
+node program.js               # or: bun program.js / deno run program.js
+                               # or paste the whole file into a browser console
+```
+
+The output is a standalone JavaScript source file — no imports, no runtime
+library, no build step. The tape is a `Uint8Array`, which has Brainfuck's
+8-bit wraparound semantics built in (`255 + 1 === 0`), so the generated
+statements are as plain as `tape[ptr] += 5;`. One I/O layer is
+feature-detected at startup: Node and Bun write bytes synchronously through
+`fs.writeSync(1, …)`, Deno through `Deno.stdout.writeSync`, and a browser
+collects the output and prints it when the program ends (there's no stdin
+in a console, so `,` behaves as EOF there). Program speed comes from the
+host's JIT: V8/JavaScriptCore/SpiderMonkey profile the hot `while` loops
+and compile them to native code at runtime, which is why this backend
+needs no machine-code stage of its own. One honest wrinkle measured on
+mandelbrot: V8 declines to optimize a single function past a size limit,
+so programs over ~1000 ops are emitted in a *chunked* shape — each loop
+body and long straight run becomes a small function called from its `while`
+skeleton — which moved mandelbrot from 18.9 s (interpreted bytecode, slower
+than `bfinterp`) to 4.0 s on the benchmark script's host. Small programs
+always get the flat one-op-one-statement file.
+
+Semantics are `bfrun`'s exactly — same starting tape, same wraparound,
+same EOF convention, same left-of-zero error message and exit status on
+every host that has a real stderr/stdout pair. Tape growth doubles the
+`Uint8Array` up to the same 1 GiB cap as `bfnative`, with the same
+messages for the cap and for a failed allocation.
+
+## Usage: bf2c
+
+```
+bf2c program.bf               # writes program.c
+bf2c program.bf -o out.c      # or pick the output name yourself
+cc -O3 -o program program.c   # any C99 compiler: gcc, clang, MSVC, tcc...
+./program
+```
+
+The output is portable C99 — no GNU extensions, no compiler assumptions,
+declarations in places even strict C89 modes accept — so the same file
+builds on 64-bit Linux, a 32-bit microcontroller, or cross-compiled for
+RISC-V. The tape is `calloc(30000, 1)` with a moving `uint8_t *p`;
+optimized IR maps one op to one statement (`*p += 5;`, `p += 3;`,
+`p[2] += *p * 3;`, `while (*p) { … }`). Growth `realloc`s with a doubling
+schedule and zeroes the new tail, the 1 GiB cap and left-of-zero checks
+match every other backend's wording and exit status, and the helpers are
+emitted only when an op can reach them, so a plain `+.` program compiles
+warning-clean even under `-Wall -Wextra -Werror`.
+
+What `bf2c` buys over `bfnative` is the C compiler's optimizer: register
+allocation for hot cells, loop unrolling, dead-store elimination, and
+SIMD auto-vectorization of memory scans — plus coverage of every
+architecture with a C toolchain, not just x86-64 and ARM64.
+
+## Usage: bfdbg
+
+```
+bfdbg program.bf                      # interactive session on your terminal
+bfdbg --break @42 program.bf < cmds    # or drive it from a script
+bfdbg --stdin input.txt program.bf     # preload the program's `,` input
+```
+
+A debugger needs to stop between ops, so it has its own single-stepping
+engine (it can't reuse `bfinterp`'s run-to-completion loop) — with
+`bfinterp`'s exact semantics. It debugs the **raw parsed** op list, one op
+per source character, which is what makes every stop point at a real
+line/column in the `.bf` file; the optimizer's folded ops (`Zero`,
+`MulAdd`, `Scan`) correspond to no single character, so stepping them
+against the source would be meaningless — which is why there's no
+`--optimize` flag here.
+
+The session commands: `run`/`continue` resume until a stop; `step [n]`
+executes ops one at a time; `tape [center] [count]` shows cells around the
+pointer in decimal, hex, and ASCII; `list` shows the source window with
+the next instruction careted; `break 42` / `break @3:5` sets breakpoints
+by op index or line/column; `watch ptr 42` stops when the pointer reaches
+a cell, `watch cell 10` stops when a cell's value changes; `set cell[10]
+= 65` and `set ptr = 3` edit the machine live (growing the tape as
+needed); `feed 65 …` queues input bytes for the program's `,`. Program
+output goes to stdout, debugger messages to stderr, commands come from
+stdin — a piped session keeps the program's output stream clean.
+
+Time travel: every executed op appends one `(op_index, old_ptr,
+old_cell_value)` record before it runs — raw ops touch at most one cell
+plus the pointer, so that triple inverts any of them exactly. `back [n]`
+replays records in reverse, restoring tape, pointer, and program counter;
+rewinding out of a whole loop is just several backs. A *failed* op records
+too, so the signature workflow is: hit a runtime error, `back` it, `set`
+whatever you needed, `run` again — without restarting the program. The
+log is bounded (default 1 Mi steps ≈ 24 MB, `--undo-limit` to tune, `0`
+disables), because a program like mandelbrot executes ~120M ops and an
+unbounded log would exhaust memory long before the program finished.
+
 ## Benchmarks (mandelbrot.b)
 
 Four execution strategies, one program, byte-identical output (6,240
@@ -307,6 +450,14 @@ before anything gets timed.
 | `bfrun` (bytecode VM) | 8.1 s / 8.1 s | 1.9x |
 | `bfjit` (in-memory JIT) | 1.27 s / 1.27 s | 12.2x |
 | `bfnative` (AOT ELF) | 1.25 s / 1.27 s | 12.4x |
+
+The two transpiler lanes join the same benchmark through the same harness
+when their host tools are on PATH: `bfjs` under node/V8 lands around 3x
+`bfinterp` — a JIT'd guarded-op loop is real speed, just not hand-emitted
+machine code — and `bf2c` compiled with `cc -O2` around 5x, behind
+`bfnative` because it pays for tape writes through a pointer like every
+portable C program does. Both produce byte-identical output, and
+`scripts/benchmark_all.py` reproduces the comparison.
 
 Pretty much the shape you'd predict: the naive interpreter is slowest, the
 bytecode VM's op-folding roughly doubles it, and the two machine-code

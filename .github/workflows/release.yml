@@ -48,7 +48,7 @@ jobs:
       - name: build
         shell: bash
         run: |
-          cargo build --release --target ${{ matrix.target }} -p bfc -p bfrun -p bfnative -p bfinterp -p bfjit -p bfwasm
+          cargo build --release --target ${{ matrix.target }} -p bfc -p bfrun -p bfnative -p bfinterp -p bfjit -p bfwasm -p bfjs -p bf2c -p bfdbg
 
       - name: install 7-Zip (Linux)
         if: runner.os == 'Linux'
@@ -68,6 +68,9 @@ jobs:
           cp target/${{ matrix.target }}/release/bfinterp "$staging/"
           cp target/${{ matrix.target }}/release/bfjit "$staging/"
           cp target/${{ matrix.target }}/release/bfwasm "$staging/"
+          cp target/${{ matrix.target }}/release/bfjs "$staging/"
+          cp target/${{ matrix.target }}/release/bf2c "$staging/"
+          cp target/${{ matrix.target }}/release/bfdbg "$staging/"
           cp README.md "$staging/"
           sevenzip="$(command -v 7z || command -v 7zz)"
           "$sevenzip" a -mx=9 "Brainfry-0.1.0-${{ matrix.archive_name }}.7z" "$staging"
@@ -84,6 +87,9 @@ jobs:
           Copy-Item "target/${{ matrix.target }}/release/bfinterp.exe" $staging/
           Copy-Item "target/${{ matrix.target }}/release/bfjit.exe" $staging/
           Copy-Item "target/${{ matrix.target }}/release/bfwasm.exe" $staging/
+          Copy-Item "target/${{ matrix.target }}/release/bfjs.exe" $staging/
+          Copy-Item "target/${{ matrix.target }}/release/bf2c.exe" $staging/
+          Copy-Item "target/${{ matrix.target }}/release/bfdbg.exe" $staging/
           Copy-Item README.md $staging/
           $sevenZip = Join-Path $env:ProgramFiles "7-Zip\7z.exe"
           & $sevenZip a -mx=9 "Brainfry-0.1.0-${{ matrix.archive_name }}.7z" $staging

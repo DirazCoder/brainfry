@@ -3,9 +3,25 @@
 version = 4
 
 [[package]]
+name = "bf2c"
+version = "0.1.0"
+dependencies = [
+ "bfc",
+ "bfformat",
+]
+
+[[package]]
 name = "bfc"
 version = "0.1.0"
 dependencies = [
+ "bfformat",
+]
+
+[[package]]
+name = "bfdbg"
+version = "0.1.0"
+dependencies = [
+ "bfc",
  "bfformat",
 ]
 
@@ -23,6 +39,14 @@ dependencies = [
 
 [[package]]
 name = "bfjit"
+version = "0.1.0"
+dependencies = [
+ "bfc",
+ "bfformat",
+]
+
+[[package]]
+name = "bfjs"
 version = "0.1.0"
 dependencies = [
  "bfc",

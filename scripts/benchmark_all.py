@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Benchmark: bfinterp vs bfrun vs bfjit vs bfnative on mandelbrot.b.
+"""Benchmark: bfinterp vs bfrun vs bfjit vs bfnative on mandelbrot.b,
+plus the two transpiler lanes (bfjs under node, bf2c compiled with cc)
+when those host tools are present.
 
 The same real workload the native-vs-bytecode benchmark used (Erik Bosman's
 mandelbrot.b). Every lane produces byte-identical output (verified by the
@@ -33,6 +35,7 @@ import statistics
 import subprocess
 import sys
 import time
+import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = sys.argv[1] if len(sys.argv) > 1 else os.path.dirname(HERE)
@@ -42,8 +45,37 @@ BFRUN = os.path.join(ROOT, "target", "release", "bfrun")
 BFNATIVE = os.path.join(ROOT, "target", "release", "bfnative")
 BFINTERP = os.path.join(ROOT, "target", "release", "bfinterp")
 BFJIT = os.path.join(ROOT, "target", "release", "bfjit")
+BFJS = os.path.join(ROOT, "target", "release", "bfjs")
+BF2C = os.path.join(ROOT, "target", "release", "bf2c")
 MANDELBROT = os.path.join(ROOT, "tests", "mandelbrot.b")
 EXPECTED = os.path.join(ROOT, "tests", "mandelbrot.expected")
+
+
+def _probe(cmd):
+    try:
+        return subprocess.run(cmd, capture_output=True,
+                              timeout=60).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def find_host_node():
+    return "node" if _probe(["node", "-e", "0"]) else None
+
+
+def find_host_cc():
+    for cc in ("cc", "gcc", "clang"):
+        with tempfile.TemporaryDirectory() as td:
+            src = os.path.join(td, "probe.c")
+            with open(src, "w") as f:
+                f.write("int main(void) { return 0; }\n")
+            if _probe([cc, "-o", os.path.join(td, "probe"), src]):
+                return cc
+    return None
+
+
+NODE = find_host_node()
+CC = find_host_cc()
 
 RUNS = int(os.environ.get("BENCH_RUNS", "3"))
 WARMUP = 1
@@ -75,7 +107,7 @@ def bench(label, cmd, expect_stdout, stdin=b""):
 
 
 def main() -> int:
-    for tool in [BFC, BFRUN, BFNATIVE, BFINTERP, BFJIT]:
+    for tool in [BFC, BFRUN, BFNATIVE, BFINTERP, BFJIT, BFJS, BF2C]:
         if not os.path.exists(tool):
             print(f"missing {tool} — run `cargo build --release` first")
             return 1
@@ -85,13 +117,34 @@ def main() -> int:
     with open(EXPECTED, "rb") as f:
         expected = f.read()
 
+    if NODE is None:
+        print("note: no `node` on PATH — skipping the bfjs lane\n")
+    if CC is None:
+        print("note: no C compiler on PATH — skipping the bf2c lane\n")
+
     # Prepare the AOT artifacts once (their compile steps are timed
     # separately, not inside the execution lanes).
     bfry = "/tmp/bench-mandel.bfry"
     native = "/tmp/bench-mandel-native"
+    js = "/tmp/bench-mandel.js"
+    csrc = "/tmp/bench-mandel.c"
+    cbinary = "/tmp/bench-mandel-c"
     t_bfc, _, _ = timed([BFC, MANDELBROT, bfry])
     t_bfnative_compile, code, _ = timed([BFNATIVE, MANDELBROT, "-o", native])
     assert code == 0
+    compile_ms = [("bfc -> .bfry", t_bfc * 1000),
+                 ("bfnative -> native ELF", t_bfnative_compile * 1000)]
+    if NODE is not None:
+        t_bfjs, code, _ = timed([BFJS, MANDELBROT, "-o", js])
+        assert code == 0
+        compile_ms.append(("bfjs -> .js", t_bfjs * 1000))
+    if CC is not None:
+        t_bf2c, code, _ = timed([BF2C, MANDELBROT, "-o", csrc])
+        assert code == 0
+        t_cc, code, _ = timed([CC, "-O3", "-o", cbinary, csrc])
+        assert code == 0
+        compile_ms.append((f"bf2c -> .c ({CC} -O3 builds it)",
+                           (t_bf2c + t_cc) * 1000))
 
     rows = []
     rows.append(("bfinterp (naive reference)",
@@ -102,6 +155,12 @@ def main() -> int:
                  bench("bfjit", [BFJIT, MANDELBROT], expected)))
     rows.append(("bfnative (AOT ELF)",
                  bench("bfnative", [native], expected)))
+    if NODE is not None:
+        rows.append(("bfjs (node, host JIT)",
+                     bench("bfjs", [NODE, js], expected)))
+    if CC is not None:
+        rows.append(("bf2c (cc -O3 binary)",
+                     bench("bf2c", [cbinary], expected)))
 
     print(f"mandelbrot.b — {RUNS} runs each (min / median), output "
           f"{len(expected)} bytes, byte-identical across all lanes\n")
@@ -111,8 +170,8 @@ def main() -> int:
               f"({base_min / mn:6.1f}x faster than bfinterp)")
 
     print(f"\n  compile steps (not in the execution numbers above):")
-    print(f"    bfc -> .bfry                 {t_bfc * 1000:7.1f} ms")
-    print(f"    bfnative -> native ELF       {t_bfnative_compile * 1000:7.1f} ms")
+    for label, ms in compile_ms:
+        print(f"    {label:34s} {ms:7.1f} ms")
     print(f"    (bfjit's compile is included in its run: parse + optimize +")
     print(f"     codegen + mmap + patch, single-digit milliseconds)")
 

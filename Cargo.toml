@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["bfformat", "bfc", "bfrun", "bfnative", "bfinterp", "bfjit", "bfwasm"]
+members = ["bfformat", "bfc", "bfrun", "bfnative", "bfinterp", "bfjit", "bfwasm", "bfjs", "bf2c", "bfdbg"]
 
 [profile.release]
 opt-level = 3              
