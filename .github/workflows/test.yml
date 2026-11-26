@@ -42,6 +42,7 @@ jobs:
         with:
           toolchain: stable
           targets: ${{ matrix.target }}
+          components: clippy, llvm-tools-preview
 
       - name: build
         shell: bash
@@ -52,6 +53,11 @@ jobs:
         shell: bash
         run: |
           cargo test --release --target ${{ matrix.target }}
+
+      - name: cargo clippy
+        shell: bash
+        run: |
+          cargo clippy --workspace --all-targets --target ${{ matrix.target }} -- -D warnings
 
       - name: codesign bfjit for JIT entitlement (macOS)
         if: runner.os == 'macOS'
@@ -100,3 +106,30 @@ jobs:
             cp "$SRC/$bin$EXE" "target/release/$bin$EXE"
           done
           python3 scripts/differential_test_all.py .
+
+      - name: install cargo-llvm-cov
+        shell: bash
+        run: cargo install cargo-llvm-cov --locked --version 0.9.2
+
+      - name: run coverage tests and create reports
+        if: always()
+        shell: bash
+        run: |
+          REPORT="coverage-${{ matrix.archive_name }}"
+          cargo llvm-cov --release --workspace --all-targets \
+            --target "${{ matrix.target }}" \
+            --json --output-path "$REPORT.json"
+          cargo llvm-cov report > "$REPORT-table.txt"
+          cargo llvm-cov report --text --show-missing-lines \
+            --output-path "$REPORT-details.txt"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: coverage-${{ matrix.archive_name }}
+          path: |
+            coverage-${{ matrix.archive_name }}.json
+            coverage-${{ matrix.archive_name }}-table.txt
+            coverage-${{ matrix.archive_name }}-details.txt
+          if-no-files-found: warn
+          retention-days: 30
