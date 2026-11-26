@@ -192,7 +192,10 @@ impl Chunker<'_> {
             // The straight run up to the next loop head (or `end`).
             let run_start = i;
             while i < end
-                && !matches!(self.ops[i], Op::JumpIfZero { .. } | Op::JumpIfNonZero { .. })
+                && !matches!(
+                    self.ops[i],
+                    Op::JumpIfZero { .. } | Op::JumpIfNonZero { .. }
+                )
             {
                 i += 1;
             }
@@ -367,7 +370,14 @@ if (outBuf.length > 0) {
 /// same walk `bfwasm`'s `emit_block` does — bracket-matched nesting
 /// recovered once up front — but the target here is `while` loops over
 /// the tape, not structured wasm branches.
-fn emit_block(out: &mut String, ops: &[Op], loops: &[LoopSpan], start: usize, end: usize, depth: usize) {
+fn emit_block(
+    out: &mut String,
+    ops: &[Op],
+    loops: &[LoopSpan],
+    start: usize,
+    end: usize,
+    depth: usize,
+) {
     let pad = "  ".repeat(depth);
     let mut i = start;
     while i < end {
@@ -424,7 +434,9 @@ fn emit_op(out: &mut String, op: &Op, pad: &str) {
             out.push_str("{ const v = tape[ptr]; if (v !== 0) {\n");
             out.push_str(&format!("{pad}  const t = ptr + {offset};\n"));
             out.push_str(pad);
-            out.push_str("  if (t < 0) { die(\"runtime error: pointer moved left of cell 0\"); }\n");
+            out.push_str(
+                "  if (t < 0) { die(\"runtime error: pointer moved left of cell 0\"); }\n",
+            );
             out.push_str(pad);
             out.push_str("  if (t >= tape.length) { grow(t); }\n");
             out.push_str(&format!("{pad}  tape[t] += v * {factor};\n"));
@@ -436,15 +448,17 @@ fn emit_op(out: &mut String, op: &Op, pad: &str) {
             out.push_str("while (tape[ptr] !== 0) {\n");
             out.push_str(&format!("{pad}  ptr += {stride};\n"));
             out.push_str(pad);
-            out.push_str("  if (ptr < 0) { die(\"runtime error: pointer moved left of cell 0\"); }\n");
+            out.push_str(
+                "  if (ptr < 0) { die(\"runtime error: pointer moved left of cell 0\"); }\n",
+            );
             out.push_str(pad);
             out.push_str("  if (ptr >= tape.length) { grow(ptr); }\n");
             out.push_str(pad);
             out.push_str("}\n");
         }
-        Op::JumpIfZero { .. } | Op::JumpIfNonZero { .. } => unreachable!(
-            "jump ops are consumed by emit_block's loop arm"
-        ),
+        Op::JumpIfZero { .. } | Op::JumpIfNonZero { .. } => {
+            unreachable!("jump ops are consumed by emit_block's loop arm")
+        }
     }
 }
 

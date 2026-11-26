@@ -44,7 +44,11 @@ fn run_args(args: &[&Path]) -> (std::process::ExitStatus, String, String) {
 
 /// Runs a debugger session: `bfdbg [flags] program.bf` with `script`
 /// piped to its stdin. Returns (status, stdout, stderr).
-fn session(flags: &[&Path], program: &Path, script: &str) -> (std::process::ExitStatus, Vec<u8>, Vec<u8>) {
+fn session(
+    flags: &[&Path],
+    program: &Path,
+    script: &str,
+) -> (std::process::ExitStatus, Vec<u8>, Vec<u8>) {
     let mut child = Command::new(env!("CARGO_BIN_EXE_bfdbg"))
         .args(flags)
         .arg(program)
@@ -104,7 +108,10 @@ fn bad_undo_limit_fails() {
     let source_path = write_source(&dir, "+.");
     let (status, _, stderr) = run_args(&[&source_path, Path::new("--undo-limit"), Path::new("x")]);
     assert_eq!(status.code(), Some(1));
-    assert!(stderr.contains("--undo-limit must be a non-negative integer"), "{stderr}");
+    assert!(
+        stderr.contains("--undo-limit must be a non-negative integer"),
+        "{stderr}"
+    );
 }
 
 #[test]
@@ -201,7 +208,10 @@ fn the_time_travel_workflow_recovers_from_underflow() {
     assert_eq!(status.code(), Some(0));
     assert_eq!(prog, vec![1u8]);
     let dbg = String::from_utf8_lossy(&dbg);
-    assert!(dbg.contains("runtime error: pointer moved left of cell 0"), "{dbg}");
+    assert!(
+        dbg.contains("runtime error: pointer moved left of cell 0"),
+        "{dbg}"
+    );
     assert!(dbg.contains("failed at op 3/3"), "{dbg}");
     assert!(dbg.contains("hint: rewind it with `back`"), "{dbg}");
     assert!(dbg.contains("stepped back 1 op(s)"), "{dbg}");
@@ -214,19 +224,24 @@ fn the_time_travel_workflow_recovers_from_underflow() {
 fn breakpoints_pause_and_list_highlights_the_source() {
     let dir = temp_dir("break");
     let source_path = write_source(&dir, "+++\n.\n");
-    let (status, prog, dbg) = session(
-        &[],
-        &source_path,
-        "break 2\nrun\nlist\nstep 2\nquit\n",
-    );
+    let (status, prog, dbg) = session(&[], &source_path, "break 2\nrun\nlist\nstep 2\nquit\n");
     assert_eq!(status.code(), Some(0));
     // `step 2` walks through the breakpoint: the third Add, then the
     // `.` — which prints the cell built up to that point.
     assert_eq!(prog, vec![3u8]);
     let dbg = String::from_utf8_lossy(&dbg);
-    assert!(dbg.contains("breakpoint at op 3/4 (line 1, col 3)"), "{dbg}");
-    assert!(dbg.contains("stopped — breakpoint at op 3/4 (line 1, col 3)"), "{dbg}");
-    assert!(dbg.contains("next: op 3/4 — line 1, col 3 — Add(1)"), "{dbg}");
+    assert!(
+        dbg.contains("breakpoint at op 3/4 (line 1, col 3)"),
+        "{dbg}"
+    );
+    assert!(
+        dbg.contains("stopped — breakpoint at op 3/4 (line 1, col 3)"),
+        "{dbg}"
+    );
+    assert!(
+        dbg.contains("next: op 3/4 — line 1, col 3 — Add(1)"),
+        "{dbg}"
+    );
     assert!(dbg.contains("2 | ."), "{dbg}");
     assert!(dbg.contains("^"), "{dbg}");
 }
@@ -263,7 +278,10 @@ fn watchpoints_trigger_on_pointer_and_cell() {
     let source_path = write_source(&dir, "+>+");
     let (_, _, dbg) = session(&[], &source_path, "watch cell 1\nrun\nquit\n");
     let dbg = String::from_utf8_lossy(&dbg);
-    assert!(dbg.contains("stopped — watchpoint: cell 1 changed 0 -> 1"), "{dbg}");
+    assert!(
+        dbg.contains("stopped — watchpoint: cell 1 changed 0 -> 1"),
+        "{dbg}"
+    );
 }
 
 #[test]
@@ -308,11 +326,7 @@ fn tape_shows_dec_hex_ascii_and_the_pointer() {
 fn tape_editing_and_info_round_trip() {
     let dir = temp_dir("set");
     let source_path = write_source(&dir, ".");
-    let (status, prog, dbg) = session(
-        &[],
-        &source_path,
-        "set cell[0] = 66\ninfo\nrun\nquit\n",
-    );
+    let (status, prog, dbg) = session(&[], &source_path, "set cell[0] = 66\ninfo\nrun\nquit\n");
     assert_eq!(status.code(), Some(0));
     assert_eq!(prog, vec![66u8]);
     let dbg = String::from_utf8_lossy(&dbg);
@@ -331,7 +345,10 @@ fn undo_limit_zero_disables_back() {
         "step\nback\ninfo\nquit\n",
     );
     let dbg = String::from_utf8_lossy(&dbg);
-    assert!(dbg.contains("undo log disabled (--undo-limit 0) — `back` is unavailable"), "{dbg}");
+    assert!(
+        dbg.contains("undo log disabled (--undo-limit 0) — `back` is unavailable"),
+        "{dbg}"
+    );
     assert!(dbg.contains("undo:    disabled"), "{dbg}");
 }
 
@@ -355,7 +372,10 @@ fn unknown_command_is_an_error_not_a_crash() {
     let (status, _, dbg) = session(&[], &source_path, "frobnicate\nquit\n");
     assert_eq!(status.code(), Some(0));
     let dbg = String::from_utf8_lossy(&dbg);
-    assert!(dbg.contains("error: unknown command: \"frobnicate\""), "{dbg}");
+    assert!(
+        dbg.contains("error: unknown command: \"frobnicate\""),
+        "{dbg}"
+    );
 }
 
 #[test]

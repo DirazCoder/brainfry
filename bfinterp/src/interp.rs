@@ -344,7 +344,16 @@ mod tests {
     fn mul_add_skips_a_zero_source_cell() {
         // The loop this op replaces never ran when the source was zero, so
         // neither the bounds check nor the write may happen.
-        let (out, result) = interp(&[Op::MulAdd { offset: 1, factor: 9 }, Op::Output], "");
+        let (out, result) = interp(
+            &[
+                Op::MulAdd {
+                    offset: 1,
+                    factor: 9,
+                },
+                Op::Output,
+            ],
+            "",
+        );
         assert!(result.is_ok());
         assert_eq!(out, vec![0u8]);
     }
@@ -368,7 +377,16 @@ mod tests {
 
     #[test]
     fn mul_add_underflow_errors_like_move_left() {
-        let (_, result) = interp(&[Op::Add(1), Op::MulAdd { offset: -1, factor: 1 }], "");
+        let (_, result) = interp(
+            &[
+                Op::Add(1),
+                Op::MulAdd {
+                    offset: -1,
+                    factor: 1,
+                },
+            ],
+            "",
+        );
         assert!(matches!(result, Err(RunError::PointerUnderflow)));
     }
 
@@ -524,7 +542,11 @@ mod tests {
         // the tape; under a capped address space each must surface
         // GrowFailed cleanly rather than aborting.
         with_address_space_cap(|| {
-            let result = run(&[Op::MoveRight(u32::MAX)], &mut Cursor::new(b""), &mut Vec::new());
+            let result = run(
+                &[Op::MoveRight(u32::MAX)],
+                &mut Cursor::new(b""),
+                &mut Vec::new(),
+            );
             assert!(matches!(result, Err(RunError::GrowFailed)));
 
             let result = run(
@@ -541,7 +563,12 @@ mod tests {
             assert!(matches!(result, Err(RunError::GrowFailed)));
 
             let result = run(
-                &[Op::Add(1), Op::Scan { stride: 2_000_000_000 }],
+                &[
+                    Op::Add(1),
+                    Op::Scan {
+                        stride: 2_000_000_000,
+                    },
+                ],
                 &mut Cursor::new(b""),
                 &mut Vec::new(),
             );

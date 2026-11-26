@@ -67,9 +67,8 @@ pub fn patch(module: &mut Module, layout: &Layout) -> Result<(), String> {
             PatchKind::X86Rel32 => {
                 let field = layout.code_vaddr + pos as u64;
                 let rel = addr as i64 - (field + 4) as i64;
-                let rel = i32::try_from(rel).map_err(|_| {
-                    format!("x86 rel32 branch out of range ({rel} bytes)")
-                })?;
+                let rel = i32::try_from(rel)
+                    .map_err(|_| format!("x86 rel32 branch out of range ({rel} bytes)"))?;
                 module.code[pos..pos + 4].copy_from_slice(&rel.to_le_bytes());
             }
             PatchKind::ArmB => {
@@ -165,8 +164,11 @@ mod tests {
         let code_end = layout.code_vaddr + module.code.len() as u64;
         for f in &module.fixups {
             if let PatchTarget::Label(_) = f.target {
-                let field =
-                    u32::from_le_bytes(module.code[f.pos as usize..f.pos as usize + 4].try_into().unwrap());
+                let field = u32::from_le_bytes(
+                    module.code[f.pos as usize..f.pos as usize + 4]
+                        .try_into()
+                        .unwrap(),
+                );
                 let dst = (layout.code_vaddr + f.pos as u64 + 4) as i64 + field as i32 as i64;
                 assert!(dst >= layout.code_vaddr as i64 && dst < code_end as i64);
             }
@@ -190,8 +192,7 @@ mod tests {
                     0
                 },
             };
-            patch(&mut module, &layout)
-                .unwrap_or_else(|_| panic!("{name}: patch failed"));
+            patch(&mut module, &layout).unwrap_or_else(|_| panic!("{name}: patch failed"));
 
             // Sanity: every 4-byte word is still a decodable branch or data
             // word — here it's enough that the pass didn't error and the
@@ -206,7 +207,10 @@ mod tests {
         let ops = bfc::optimize::optimize(bfc::parser::parse("+").unwrap());
         let mut module = codegen::emit(&ops, target);
         assert!(
-            module.fixups.iter().any(|f| matches!(f.target, PatchTarget::Got(_))),
+            module
+                .fixups
+                .iter()
+                .any(|f| matches!(f.target, PatchTarget::Got(_))),
             "macOS codegen should contain GOT fixups"
         );
         let layout = Layout {
@@ -308,8 +312,11 @@ mod tests {
     #[test]
     fn arm_conditional_out_of_range_is_reported() {
         // +-2 MiB (19-bit * 4) is CBZ/B.cond's reach; 4 MiB is past it.
-        let mut module =
-            synthetic_module(PatchKind::ArmCond, PatchTarget::Label(1), vec![0, 0x40_0000]);
+        let mut module = synthetic_module(
+            PatchKind::ArmCond,
+            PatchTarget::Label(1),
+            vec![0, 0x40_0000],
+        );
         let err = patch(&mut module, &zero_layout()).unwrap_err();
         assert!(err.contains("conditional branch out of range"), "{err}");
     }
@@ -317,13 +324,11 @@ mod tests {
     #[test]
     fn arm_branch_misalignment_is_reported() {
         // Label 1 at byte 2: off = 2, not a multiple of 4.
-        let mut module =
-            synthetic_module(PatchKind::ArmB, PatchTarget::Label(1), vec![0, 2]);
+        let mut module = synthetic_module(PatchKind::ArmB, PatchTarget::Label(1), vec![0, 2]);
         let err = patch(&mut module, &zero_layout()).unwrap_err();
         assert!(err.contains("misaligned"), "{err}");
         // The conditional-branch form shares the check and its own message.
-        let mut module =
-            synthetic_module(PatchKind::ArmCond, PatchTarget::Label(1), vec![0, 2]);
+        let mut module = synthetic_module(PatchKind::ArmCond, PatchTarget::Label(1), vec![0, 2]);
         let err = patch(&mut module, &zero_layout()).unwrap_err();
         assert!(err.contains("misaligned"), "{err}");
     }

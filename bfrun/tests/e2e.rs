@@ -30,10 +30,7 @@ fn write_bfry(dir: &Path, ops: Vec<Op>) -> std::path::PathBuf {
 }
 
 /// Runs `bfrun` with raw args, empty stdin.
-fn run_args(
-    _tag: &str,
-    args: &[&Path],
-) -> (std::process::ExitStatus, Vec<u8>, Vec<u8>) {
+fn run_args(_tag: &str, args: &[&Path]) -> (std::process::ExitStatus, Vec<u8>, Vec<u8>) {
     let output = Command::new(env!("CARGO_BIN_EXE_bfrun"))
         .args(args)
         .stdin(Stdio::null())
@@ -74,14 +71,23 @@ fn no_arguments_prints_usage() {
     let (status, stdout, stderr) = run_args("no-args", &[]);
     assert_eq!(status.code(), Some(1));
     assert_eq!(stdout, b"");
-    assert!(String::from_utf8_lossy(&stderr).contains("usage: bfrun <program.bfry>"), "{stderr:?}");
+    assert!(
+        String::from_utf8_lossy(&stderr).contains("usage: bfrun <program.bfry>"),
+        "{stderr:?}"
+    );
 }
 
 #[test]
 fn missing_file_fails_cleanly() {
-    let (status, _, stderr) = run_args("missing-file", &[Path::new("/nonexistent/bfrun-e2e/x.bfry")]);
+    let (status, _, stderr) = run_args(
+        "missing-file",
+        &[Path::new("/nonexistent/bfrun-e2e/x.bfry")],
+    );
     assert_eq!(status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&stderr).contains("couldn't open"), "{stderr:?}");
+    assert!(
+        String::from_utf8_lossy(&stderr).contains("couldn't open"),
+        "{stderr:?}"
+    );
 }
 
 #[test]
@@ -91,8 +97,14 @@ fn garbage_file_fails_at_the_loader() {
     fs::write(&garbage, b"not a bytecode file at all").expect("writing garbage");
     let (status, _, stderr) = run_args("garbage", &[&garbage]);
     assert_eq!(status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&stderr).contains("couldn't load"), "{stderr:?}");
-    assert!(String::from_utf8_lossy(&stderr).contains("not a bfry bytecode file"), "{stderr:?}");
+    assert!(
+        String::from_utf8_lossy(&stderr).contains("couldn't load"),
+        "{stderr:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(&stderr).contains("not a bfry bytecode file"),
+        "{stderr:?}"
+    );
 }
 
 #[test]
@@ -111,8 +123,7 @@ fn input_round_trips_through_stdout() {
     // The Input op's success path (a real byte arrives on stdin) can only be
     // exercised with actual pipes -- unit tests see EOF -- so it lives here:
     // read 'A', add 1, write 'B' back out.
-    let (status, stdout, stderr) =
-        run_program("io", vec![Op::Input, Op::Add(1), Op::Output], b"A");
+    let (status, stdout, stderr) = run_program("io", vec![Op::Input, Op::Add(1), Op::Output], b"A");
     assert_eq!(stdout, b"B");
     assert_eq!(stderr, b"");
     assert!(status.success());

@@ -796,15 +796,15 @@ mod tests {
         // produces correct targets once earlier passes have shrunk things
         // by different amounts.
         let ops = vec![
-            Op::JumpIfZero { target: 0 }, // outer: index 0
-            Op::JumpIfZero { target: 0 }, // zero-loop start: index 1
-            Op::Sub(1),                   // index 2
+            Op::JumpIfZero { target: 0 },    // outer: index 0
+            Op::JumpIfZero { target: 0 },    // zero-loop start: index 1
+            Op::Sub(1),                      // index 2
             Op::JumpIfNonZero { target: 0 }, // zero-loop end: index 3
-            Op::JumpIfZero { target: 0 }, // offset-add start: index 4
-            Op::Sub(1),                   // index 5
-            Op::MoveRight(1),             // index 6
-            Op::Add(1),                   // index 7
-            Op::MoveLeft(1),              // index 8
+            Op::JumpIfZero { target: 0 },    // offset-add start: index 4
+            Op::Sub(1),                      // index 5
+            Op::MoveRight(1),                // index 6
+            Op::Add(1),                      // index 7
+            Op::MoveLeft(1),                 // index 8
             Op::JumpIfNonZero { target: 0 }, // offset-add end: index 9
             Op::JumpIfNonZero { target: 0 }, // outer end: index 10
         ];

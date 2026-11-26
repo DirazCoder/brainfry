@@ -163,7 +163,11 @@ mod tests {
                 },
             ],
         };
-        let text = render(&module, Target::from_name("linux-x86_64").unwrap(), &layout());
+        let text = render(
+            &module,
+            Target::from_name("linux-x86_64").unwrap(),
+            &layout(),
+        );
         assert!(
             text.contains("empty informational span"),
             "informational span missing: {text}"

@@ -31,11 +31,16 @@ pub enum FormatError {
     Truncated,
     UnknownOpTag(u8),
     /// A jump op's target index falls outside the instruction list.
-    InvalidJumpTarget { target: u32, len: u32 },
+    InvalidJumpTarget {
+        target: u32,
+        len: u32,
+    },
     /// A `JumpIfZero`/`JumpIfNonZero` pair doesn't point at each other.
     /// The compiler only ever emits mutually paired brackets, so anything
     /// else is a corrupt or hand-crafted file, not a program variant.
-    UnbalancedJumps { op_index: u32 },
+    UnbalancedJumps {
+        op_index: u32,
+    },
 }
 
 impl From<io::Error> for FormatError {
@@ -165,16 +170,10 @@ fn validate_jumps(ops: &[Op]) -> Result<(), FormatError> {
         let back = match (is_open, &ops[target as usize]) {
             (true, Op::JumpIfNonZero { target: back })
             | (false, Op::JumpIfZero { target: back }) => *back,
-            _ => {
-                return Err(FormatError::UnbalancedJumps {
-                    op_index: i as u32,
-                })
-            }
+            _ => return Err(FormatError::UnbalancedJumps { op_index: i as u32 }),
         };
         if back as usize != i {
-            return Err(FormatError::UnbalancedJumps {
-                op_index: i as u32,
-            });
+            return Err(FormatError::UnbalancedJumps { op_index: i as u32 });
         }
     }
     Ok(())
@@ -345,10 +344,7 @@ mod tests {
                 "unknown instruction tag 11 in bytecode".to_string(),
             ),
             (
-                FormatError::InvalidJumpTarget {
-                    target: 9,
-                    len: 3,
-                },
+                FormatError::InvalidJumpTarget { target: 9, len: 3 },
                 "jump target 9 is out of range (program has 3 instructions)".to_string(),
             ),
             (
@@ -407,10 +403,7 @@ mod tests {
         // u32, MulAdd's i32, and Scan's i32.
         for tag in [0u8, 1, 2, 3, 6, 7, 9, 10] {
             let err = Program::read_from(&with_body(tag)[..]).unwrap_err();
-            assert!(
-                matches!(err, FormatError::Truncated),
-                "tag {tag}: {err:?}"
-            );
+            assert!(matches!(err, FormatError::Truncated), "tag {tag}: {err:?}");
         }
     }
 
@@ -479,9 +472,7 @@ mod tests {
         // total_writes case is the all-succeed sanity below).
         let total_writes = 4 + 11 + 8;
         for n in 0..total_writes {
-            let mut sink = FailAfter {
-                remaining_ok: n,
-            };
+            let mut sink = FailAfter { remaining_ok: n };
             assert!(
                 program.write_to(&mut sink).is_err(),
                 "write_to must fail when write #{} fails",
@@ -528,7 +519,13 @@ mod tests {
         // well-formed bracket pair are included so validation also runs
         // over a >cap program.
         let mut ops: Vec<Op> = (0..70_000)
-            .map(|i| if i % 2 == 0 { Op::Add(1) } else { Op::MoveRight(1) })
+            .map(|i| {
+                if i % 2 == 0 {
+                    Op::Add(1)
+                } else {
+                    Op::MoveRight(1)
+                }
+            })
             .collect();
         ops.push(Op::JumpIfZero { target: 70_002 });
         ops.push(Op::Sub(1));

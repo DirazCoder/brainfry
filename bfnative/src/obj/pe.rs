@@ -106,9 +106,15 @@ const ARM64_ENTRY_FRAME_BYTES: u32 = 64;
 const UNWIND_CODE_END: u8 = 0xE4;
 
 const fn alloc_s_unwind_code(frame_bytes: u32) -> u8 {
-    assert!(frame_bytes.is_multiple_of(16), "alloc_s requires a 16-byte-aligned frame size");
+    assert!(
+        frame_bytes.is_multiple_of(16),
+        "alloc_s requires a 16-byte-aligned frame size"
+    );
     let units = frame_bytes / 16;
-    assert!(units < 32, "alloc_s's 5-bit immediate covers at most 31*16 = 496 bytes");
+    assert!(
+        units < 32,
+        "alloc_s's 5-bit immediate covers at most 31*16 = 496 bytes"
+    );
     units as u8 // tag bits 000 are implicitly 0 in the low 3 bits of this 5-bit value's byte
 }
 
@@ -221,7 +227,6 @@ pub fn build(module: &mut Module, arch: Arch) -> (Vec<u8>, Layout) {
         Arch::X86_64 => reloc_rva + align_up(reloc_vsize, SECTION_ALIGN),
         Arch::Aarch64 => pdata_rva + align_up(pdata_vsize, SECTION_ALIGN),
     };
-
 
     // ---- serialize ----
     let mut out: Vec<u8> = Vec::new();
@@ -502,9 +507,17 @@ pub fn build(module: &mut Module, arch: Arch) -> (Vec<u8>, Layout) {
         // Unwind codes, byte-stream order, packed into one little-endian
         // word: alloc_s (sub sp,sp,#64) then end. 2 bytes of zero padding
         // fill out the word (padding bytes are unused/ignored).
-        let code_bytes = [alloc_s_unwind_code(ARM64_ENTRY_FRAME_BYTES), UNWIND_CODE_END, 0, 0];
+        let code_bytes = [
+            alloc_s_unwind_code(ARM64_ENTRY_FRAME_BYTES),
+            UNWIND_CODE_END,
+            0,
+            0,
+        ];
         out.extend_from_slice(&code_bytes);
-        debug_assert_eq!(out.len() as u64, pdata_fileoff + RUNTIME_FUNCTION_SIZE + XDATA_SIZE);
+        debug_assert_eq!(
+            out.len() as u64,
+            pdata_fileoff + RUNTIME_FUNCTION_SIZE + XDATA_SIZE
+        );
 
         while (out.len() as u64) < pdata_fileoff + pdata_raw {
             out.push(0);
@@ -602,7 +615,11 @@ mod tests {
         for name in ["windows-x86_64", "windows-aarch64"] {
             let bytes = build_for(&[bfformat::Op::Zero], name);
             let ch = u16::from_le_bytes(bytes[0x56..0x58].try_into().unwrap());
-            assert_ne!(ch & IMAGE_FILE_LARGE_ADDRESS_AWARE, 0, "{name}: LAA not set");
+            assert_ne!(
+                ch & IMAGE_FILE_LARGE_ADDRESS_AWARE,
+                0,
+                "{name}: LAA not set"
+            );
         }
     }
 
@@ -614,7 +631,11 @@ mod tests {
         let dll_ch = u16::from_le_bytes(bytes[0x58 + 70..0x58 + 72].try_into().unwrap());
         assert_eq!(dll_ch, 0x8160);
         let ch = u16::from_le_bytes(bytes[0x56..0x58].try_into().unwrap());
-        assert_eq!(ch & IMAGE_FILE_RELOCS_STRIPPED, 0, "ARM64 must stay relocatable");
+        assert_eq!(
+            ch & IMAGE_FILE_RELOCS_STRIPPED,
+            0,
+            "ARM64 must stay relocatable"
+        );
     }
 
     #[test]
@@ -759,11 +780,12 @@ mod tests {
                     .try_into()
                     .unwrap(),
             );
-            let (reloc_rva, reloc_size) = (
-                (reloc_dir & 0xFFFF_FFFF) as u32,
-                (reloc_dir >> 32) as u32,
+            let (reloc_rva, reloc_size) =
+                ((reloc_dir & 0xFFFF_FFFF) as u32, (reloc_dir >> 32) as u32);
+            assert!(
+                reloc_size >= 12,
+                "block must hold header + at least one real entry"
             );
-            assert!(reloc_size >= 12, "block must hold header + at least one real entry");
 
             // Map reloc_rva -> file offset via the section table (3
             // sections: .text, .idata, .reloc).
@@ -781,7 +803,11 @@ mod tests {
 
             let page_rva = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
             let size_of_block = u32::from_le_bytes(bytes[pos + 4..pos + 8].try_into().unwrap());
-            assert_eq!(size_of_block % 4, 0, "SizeOfBlock must be 4-byte aligned to be walkable");
+            assert_eq!(
+                size_of_block % 4,
+                0,
+                "SizeOfBlock must be 4-byte aligned to be walkable"
+            );
             assert!(size_of_block >= 10, "header (8) + at least one entry (2)");
 
             let mut entries = Vec::new();
@@ -828,7 +854,10 @@ mod tests {
         // ARM64-only path for x86_64 too.
         let bytes = build_for(&[bfformat::Op::Output], "windows-x86_64");
         let nsections = u16::from_le_bytes(bytes[0x46..0x48].try_into().unwrap());
-        assert_eq!(nsections, 3, "x86_64 should still be .text/.idata/.reloc only");
+        assert_eq!(
+            nsections, 3,
+            "x86_64 should still be .text/.idata/.reloc only"
+        );
         let exc_dir = u64::from_le_bytes(
             bytes[DIRS_OFF + DIR_EXCEPTION * 8..DIRS_OFF + DIR_EXCEPTION * 8 + 8]
                 .try_into()
@@ -862,7 +891,10 @@ mod tests {
         );
         let (pdata_rva, pdata_size) = ((exc_dir & 0xFFFF_FFFF) as u32, (exc_dir >> 32) as u32);
         assert_eq!(pdata_size, 8, "exactly one 8-byte RUNTIME_FUNCTION entry");
-        assert_ne!(pdata_rva, 0, "Exception Directory must not be empty on ARM64");
+        assert_ne!(
+            pdata_rva, 0,
+            "Exception Directory must not be empty on ARM64"
+        );
 
         // Map pdata_rva -> file offset via the section table (4th section
         // on ARM64: .text, .idata, .reloc, .pdata).
@@ -893,15 +925,26 @@ mod tests {
         let begin_rva =
             u32::from_le_bytes(bytes[pos as usize..pos as usize + 4].try_into().unwrap()) as u64;
         let unwind_data_rva = u32::from_le_bytes(
-            bytes[pos as usize + 4..pos as usize + 8].try_into().unwrap(),
+            bytes[pos as usize + 4..pos as usize + 8]
+                .try_into()
+                .unwrap(),
         );
-        assert_eq!(begin_rva, text_rva, "RUNTIME_FUNCTION must cover .text from its start");
-        assert_eq!(unwind_data_rva & 0x3, 0, "Flag must be 0 (.xdata pointer, not packed)");
+        assert_eq!(
+            begin_rva, text_rva,
+            "RUNTIME_FUNCTION must cover .text from its start"
+        );
+        assert_eq!(
+            unwind_data_rva & 0x3,
+            0,
+            "Flag must be 0 (.xdata pointer, not packed)"
+        );
 
         // .xdata header word.
         let xdata_pos = pos + (unwind_data_rva as u64 - pdata_rva as u64);
         let header = u32::from_le_bytes(
-            bytes[xdata_pos as usize..xdata_pos as usize + 4].try_into().unwrap(),
+            bytes[xdata_pos as usize..xdata_pos as usize + 4]
+                .try_into()
+                .unwrap(),
         );
         let function_length = header & 0x3FFFF; // bits [17:0]
         let vers = (header >> 18) & 0x3;
@@ -911,7 +954,10 @@ mod tests {
         let code_words = (header >> 27) & 0x1F;
         assert_eq!(vers, 0, "only unwind-info version 0 is defined");
         assert_eq!(x_bit, 0, "no exception handler in this minimal record");
-        assert_eq!(epilog_count, 0, "entry point never executes a normal return");
+        assert_eq!(
+            epilog_count, 0,
+            "entry point never executes a normal return"
+        );
         assert_eq!(code_words, 1, "alloc_s + end fit in exactly one word");
         assert_eq!(
             function_length as u64 * 4,
@@ -930,7 +976,9 @@ mod tests {
             ARM64_ENTRY_FRAME_BYTES,
             "alloc_s must encode the entry stub's actual frame size"
         );
-        assert_eq!(codes[1], UNWIND_CODE_END, "sequence must terminate with end (0xE4)");
+        assert_eq!(
+            codes[1], UNWIND_CODE_END,
+            "sequence must terminate with end (0xE4)"
+        );
     }
 }
-

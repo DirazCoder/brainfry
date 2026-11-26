@@ -385,11 +385,7 @@ unsafe extern "C" {
         new_protect: u32,
         old_protect: *mut u32,
     ) -> i32;
-    fn FlushInstructionCache(
-        process: *mut c_void,
-        base: *const c_void,
-        size: usize,
-    ) -> i32;
+    fn FlushInstructionCache(process: *mut c_void, base: *const c_void, size: usize) -> i32;
     fn GetCurrentProcess() -> *mut c_void;
 }
 
@@ -424,7 +420,13 @@ unsafe fn alloc_region(len: usize) -> Result<JitRegion, String> {
 unsafe fn protect_exec(base: *mut u8, len: usize) -> Result<(), String> {
     unsafe {
         let mut old = 0u32;
-        if VirtualProtect(base as *const c_void, len, windows::PAGE_EXECUTE_READ, &mut old) == 0 {
+        if VirtualProtect(
+            base as *const c_void,
+            len,
+            windows::PAGE_EXECUTE_READ,
+            &mut old,
+        ) == 0
+        {
             return Err(format!(
                 "VirtualProtect(PAGE_EXECUTE_READ) failed: {}",
                 std::io::Error::last_os_error()
@@ -469,10 +471,7 @@ mod tests {
         unsafe {
             let result = JitRegion::alloc(usize::MAX);
             let message = result.err().expect("usize::MAX must fail");
-            assert!(
-                message.contains("failed to map JIT memory"),
-                "{message}"
-            );
+            assert!(message.contains("failed to map JIT memory"), "{message}");
         }
     }
 
@@ -481,8 +480,7 @@ mod tests {
         unsafe {
             let region = JitRegion::alloc(0x1000).expect("alloc");
             region.write_bytes(0, b"int3");
-            protect_exec(region.base, region.len)
-                .expect("aligned mprotect must succeed");
+            protect_exec(region.base, region.len).expect("aligned mprotect must succeed");
         }
     }
 
@@ -494,8 +492,8 @@ mod tests {
         // must carry the OS message, and the region must be unaffected.
         unsafe {
             let region = JitRegion::alloc(0x1000).expect("alloc");
-            let message = protect_exec(region.base.add(1), 0x1000)
-                .expect_err("unaligned mprotect must fail");
+            let message =
+                protect_exec(region.base.add(1), 0x1000).expect_err("unaligned mprotect must fail");
             assert!(
                 message.contains("failed to make JIT memory executable"),
                 "{message}"

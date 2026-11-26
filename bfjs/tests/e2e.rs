@@ -62,7 +62,8 @@ fn run_node(js: &Path, stdin: &[u8]) -> Option<(std::process::ExitStatus, Vec<u8
         .spawn()
         .ok()?;
     if let Some(pipe) = child.stdin.as_mut() {
-        pipe.write_all(stdin).expect("feeding program stdin to node");
+        pipe.write_all(stdin)
+            .expect("feeding program stdin to node");
     }
     let out = child.wait_with_output().expect("node run");
     Some((out.status, out.stdout, out.stderr))
@@ -267,8 +268,7 @@ fn underflow_is_a_clean_error_under_node() {
     assert_eq!(status.code(), Some(1));
     assert_eq!(stdout, b"");
     assert_eq!(
-        stderr,
-        b"runtime error: pointer moved left of cell 0\n",
+        stderr, b"runtime error: pointer moved left of cell 0\n",
         "error wording must match every other backend byte-for-byte"
     );
 }

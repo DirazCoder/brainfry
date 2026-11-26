@@ -135,6 +135,28 @@ mod tests {
         assert!(got_slots(Os::Linux).is_empty());
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_slots_match_codegen_table() {
+        let slots = got_slots(Os::Macos);
+        assert_eq!(
+            slots.len(),
+            crate::codegen::external_symbols(Os::Macos).len()
+        );
+        assert!(slots.iter().all(|slot| *slot != 0));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_slots_match_codegen_table() {
+        let slots = got_slots(Os::Windows);
+        assert_eq!(
+            slots.len(),
+            crate::codegen::external_symbols(Os::Windows).len()
+        );
+        assert!(slots.iter().all(|slot| *slot != 0));
+    }
+
     // The macOS/Windows tables can only be requested by a host/OS mismatch
     // that cannot happen (Target::host() derives from the same cfg!s the
     // table selection compiles on). Their unreachable!() guards are the

@@ -106,8 +106,7 @@ fn output_in_a_missing_directory_fails_cleanly() {
     let dir = temp_dir("bad-output");
     let source_path = write_source(&dir, "+.");
     let bad_output = dir.join("no-such-dir").join("program.wasm");
-    let (status, _, stderr) =
-        run_args("bad-output", &[&source_path, Path::new("-o"), &bad_output]);
+    let (status, _, stderr) = run_args("bad-output", &[&source_path, Path::new("-o"), &bad_output]);
     assert_eq!(status.code(), Some(1));
     assert!(stderr.contains("couldn't write"), "{stderr}");
 }

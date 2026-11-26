@@ -1326,10 +1326,11 @@ mod tests {
         let op0_offset = m.labels[0];
         assert_ne!(op0_offset, u32::MAX, "label 0 must be bound");
         assert!(
-            m.fixups.iter().any(|f| f
-                .target
-                .label_index()
-                .is_some_and(|i| (i as usize) < m.labels.len() && m.labels[i as usize] == op0_offset)),
+            m.fixups
+                .iter()
+                .any(|f| f.target.label_index().is_some_and(
+                    |i| (i as usize) < m.labels.len() && m.labels[i as usize] == op0_offset
+                )),
             "no branch targets the scan's own start"
         );
     }
@@ -1349,7 +1350,10 @@ mod tests {
         ] {
             let m = module(&[Op::Input, Op::Output], name);
             assert!(!m.code.is_empty(), "{name}: no code emitted");
-            assert!(m.labels.iter().all(|&l| l != u32::MAX), "{name}: unbound label");
+            assert!(
+                m.labels.iter().all(|&l| l != u32::MAX),
+                "{name}: unbound label"
+            );
         }
     }
 
@@ -1367,7 +1371,10 @@ mod tests {
             let m = module(&ops, name);
             assert!(!m.code.is_empty(), "{name}: no code emitted");
             assert!(!m.fixups.is_empty(), "{name}: no fixups to resolve");
-            assert!(m.labels.iter().all(|&l| l != u32::MAX), "{name}: unbound label");
+            assert!(
+                m.labels.iter().all(|&l| l != u32::MAX),
+                "{name}: unbound label"
+            );
         }
     }
 
@@ -1377,7 +1384,10 @@ mod tests {
         // they load the count into a register first — exercised here with
         // op lists directly, since no source file could ever hold 2^31
         // repeated `>` characters.
-        let m = module(&[Op::MoveRight(u32::MAX), Op::MoveLeft(0x8000_0000)], "linux-x86_64");
+        let m = module(
+            &[Op::MoveRight(u32::MAX), Op::MoveLeft(0x8000_0000)],
+            "linux-x86_64",
+        );
         assert!(m.code.len() > 8);
     }
 

@@ -106,10 +106,7 @@ impl Target {
     /// `bfnative program.bf` compiles for.
     pub fn host() -> Target {
         Target {
-            arch: arch_from_flags(
-                cfg!(target_arch = "x86_64"),
-                cfg!(target_arch = "aarch64"),
-            ),
+            arch: arch_from_flags(cfg!(target_arch = "x86_64"), cfg!(target_arch = "aarch64")),
             os: os_from_flags(
                 cfg!(target_os = "linux"),
                 cfg!(target_os = "macos"),

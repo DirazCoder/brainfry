@@ -42,7 +42,7 @@ jobs:
         with:
           toolchain: stable
           targets: ${{ matrix.target }}
-          components: clippy, llvm-tools-preview
+          components: clippy
 
       - name: build
         shell: bash
@@ -54,6 +54,14 @@ jobs:
         shell: bash
         run: cargo install cargo-llvm-cov --locked --version 0.9.2
 
+      - name: install nightly coverage toolchain
+        if: always()
+        shell: bash
+        run: |
+          rustup toolchain install nightly --profile minimal \
+            --component llvm-tools-preview \
+            --target "${{ matrix.target }}"
+
       # link.exe's ARM64 padding corrupts LLVM profiles (rust-lang/rust#150123).
       # Use Rust's bundled LLD for coverage while leaving regular MSVC builds unchanged.
       - name: cargo llvm-cov
@@ -64,7 +72,7 @@ jobs:
             export CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_LINKER=rust-lld
           fi
           REPORT="coverage-${{ matrix.archive_name }}"
-          cargo llvm-cov --release --workspace --all-targets \
+          cargo +nightly llvm-cov --branch --release --workspace --all-targets \
             --target "${{ matrix.target }}" \
             --html --output-dir "$REPORT"
 

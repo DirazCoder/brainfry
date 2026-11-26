@@ -43,12 +43,7 @@ fn run_args(_tag: &str, args: &[&Path]) -> (std::process::ExitStatus, String, St
 fn compile(
     tag: &str,
     source: &str,
-) -> (
-    std::process::ExitStatus,
-    String,
-    String,
-    std::path::PathBuf,
-) {
+) -> (std::process::ExitStatus, String, String, std::path::PathBuf) {
     let dir = temp_dir(tag);
     let source_path = write_source(&dir, source);
     let output_path = dir.join("program.bfry");

@@ -134,10 +134,7 @@ pub fn compile(ops: &[Op], source_name: &str) -> String {
 
 /// Whether an op emits a reference to the `grow` helper.
 fn needs_grow(op: &Op) -> bool {
-    matches!(
-        op,
-        Op::MoveRight(_) | Op::MulAdd { .. } | Op::Scan { .. }
-    )
+    matches!(op, Op::MoveRight(_) | Op::MulAdd { .. } | Op::Scan { .. })
 }
 
 /// Whether an op emits a reference to the `die` helper directly.
@@ -266,7 +263,14 @@ const FOOTER: &str = r#"
 /// Emits `ops[start..end)` at `depth` levels of indentation (4 spaces in
 /// C style), recursing into loop bodies. Same walk as `bfjs`'s
 /// `emit_block`.
-fn emit_block(out: &mut String, ops: &[Op], loops: &[LoopSpan], start: usize, end: usize, depth: usize) {
+fn emit_block(
+    out: &mut String,
+    ops: &[Op],
+    loops: &[LoopSpan],
+    start: usize,
+    end: usize,
+    depth: usize,
+) {
     let pad = "    ".repeat(depth);
     let mut i = start;
     while i < end {
@@ -328,10 +332,14 @@ fn emit_op(out: &mut String, op: &Op, pad: &str) {
             out.push_str("if (*p != 0) {\n");
             out.push_str(&format!("{pad}    ptrdiff_t t = p - tape + {offset};\n"));
             out.push_str(pad);
-            out.push_str("    if (t < 0) { die(\"runtime error: pointer moved left of cell 0\"); }\n");
+            out.push_str(
+                "    if (t < 0) { die(\"runtime error: pointer moved left of cell 0\"); }\n",
+            );
             out.push_str(pad);
             out.push_str("    if ((size_t)t >= tape_len) { grow((size_t)t); }\n");
-            out.push_str(&format!("{pad}    p[{offset}] += (uint8_t)(*p * {factor});\n"));
+            out.push_str(&format!(
+                "{pad}    p[{offset}] += (uint8_t)(*p * {factor});\n"
+            ));
             out.push_str(&format!("{pad}}}\n"));
         }
         Op::Scan { stride } => {
@@ -339,15 +347,17 @@ fn emit_op(out: &mut String, op: &Op, pad: &str) {
             out.push_str("while (*p != 0) {\n");
             out.push_str(&format!("{pad}    ptrdiff_t t = p - tape + {stride};\n"));
             out.push_str(pad);
-            out.push_str("    if (t < 0) { die(\"runtime error: pointer moved left of cell 0\"); }\n");
+            out.push_str(
+                "    if (t < 0) { die(\"runtime error: pointer moved left of cell 0\"); }\n",
+            );
             out.push_str(pad);
             out.push_str("    if ((size_t)t >= tape_len) { grow((size_t)t); }\n");
             out.push_str(&format!("{pad}    p += {stride};\n"));
             out.push_str(&format!("{pad}}}\n"));
         }
-        Op::JumpIfZero { .. } | Op::JumpIfNonZero { .. } => unreachable!(
-            "jump ops are consumed by emit_block's loop arm"
-        ),
+        Op::JumpIfZero { .. } | Op::JumpIfNonZero { .. } => {
+            unreachable!("jump ops are consumed by emit_block's loop arm")
+        }
     }
 }
 
@@ -578,12 +588,22 @@ mod tests {
         let ifdefs = c.matches("#ifdef").count();
         let endifs = c.matches("#endif").count();
         assert_eq!(ifdefs, endifs, "unbalanced #ifdef/#endif");
-        assert_eq!(ifdefs, c.matches("#ifdef _WIN32").count(), "only _WIN32 guards");
+        assert_eq!(
+            ifdefs,
+            c.matches("#ifdef _WIN32").count(),
+            "only _WIN32 guards"
+        );
         // On a non-Windows compile every shim line vanishes, so deleting
         // the guards must remove every Windows-only token.
         let stripped = strip_win32_block(&c);
         assert!(!stripped.contains("_setmode"), "shim leaked outside guard");
-        assert!(!stripped.contains("fcntl.h"), "include leaked outside guard");
-        assert!(!stripped.contains("_O_BINARY"), "constant leaked outside guard");
+        assert!(
+            !stripped.contains("fcntl.h"),
+            "include leaked outside guard"
+        );
+        assert!(
+            !stripped.contains("_O_BINARY"),
+            "constant leaked outside guard"
+        );
     }
 }

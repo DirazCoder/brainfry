@@ -19,7 +19,7 @@ mod debugger;
 mod session;
 
 use bfc::parser;
-use debugger::{Debugger, DEFAULT_UNDO_LIMIT};
+use debugger::{DEFAULT_UNDO_LIMIT, Debugger};
 use std::env;
 use std::fs;
 use std::io::{self, BufRead, IsTerminal, Write};
@@ -185,13 +185,7 @@ fn say(out: &mut dyn Write, s: &str) {
     let _ = out.flush();
 }
 
-type Parsed = (
-    String,
-    Option<String>,
-    Vec<String>,
-    Vec<String>,
-    usize,
-);
+type Parsed = (String, Option<String>, Vec<String>, Vec<String>, usize);
 
 fn parse_args(args: Vec<String>) -> Result<Parsed, String> {
     let mut input: Option<String> = None;
@@ -210,14 +204,16 @@ fn parse_args(args: Vec<String>) -> Result<Parsed, String> {
                 break_specs.push(args.next().ok_or("--break needs a spec: 42 | @3 | @3:5")?);
             }
             "--watch" => {
-                watch_specs
-                    .push(args.next().ok_or("--watch needs a spec: \"ptr <n>\" | \"cell <n>\"")?);
+                watch_specs.push(
+                    args.next()
+                        .ok_or("--watch needs a spec: \"ptr <n>\" | \"cell <n>\"")?,
+                );
             }
             "--undo-limit" => {
                 let value = args.next().ok_or("--undo-limit needs a step count")?;
-                undo_limit = value
-                    .parse()
-                    .map_err(|_| format!("--undo-limit must be a non-negative integer, got {value:?}"))?;
+                undo_limit = value.parse().map_err(|_| {
+                    format!("--undo-limit must be a non-negative integer, got {value:?}")
+                })?;
             }
             other if other.starts_with('-') => {
                 return Err(format!("unknown option: {other}"));
@@ -283,13 +279,7 @@ mod tests {
         let mut dbg = Debugger::new(ops, ".".into(), DEFAULT_UNDO_LIMIT);
         let mut prog = Vec::new();
         let mut dbg_out = Vec::new();
-        repl(
-            &mut dbg,
-            &mut FailingRead,
-            false,
-            &mut prog,
-            &mut dbg_out,
-        );
+        repl(&mut dbg, &mut FailingRead, false, &mut prog, &mut dbg_out);
         assert_eq!(dbg.steps(), 0);
         assert!(prog.is_empty());
         // read_line's error arm only needs fill_buf to fail; read/consume

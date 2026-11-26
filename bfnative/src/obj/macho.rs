@@ -488,7 +488,8 @@ pub fn build(module: &mut Module, arch: Arch, image_name: &str) -> (Vec<u8>, Lay
     // unlike every other segment in this same file.
     let linkedit_vmsize = align_up(linkedit_filesize, page);
     let le = linkedit_cmd_pos;
-    out[le + SEG_VMSIZE_OFF..le + SEG_VMSIZE_OFF + 8].copy_from_slice(&linkedit_vmsize.to_le_bytes());
+    out[le + SEG_VMSIZE_OFF..le + SEG_VMSIZE_OFF + 8]
+        .copy_from_slice(&linkedit_vmsize.to_le_bytes());
     out[le + SEG_FILEOFF_OFF..le + SEG_FILEOFF_OFF + 8]
         .copy_from_slice(&linkedit_fileoff.to_le_bytes());
     out[le + SEG_FILESIZE_OFF..le + SEG_FILESIZE_OFF + 8]
@@ -813,7 +814,11 @@ mod tests {
             let cd_index_off =
                 u32::from_be_bytes(bytes[sb + 16..sb + 20].try_into().unwrap()) as usize;
             let cd_off = sb + cd_index_off;
-            assert_eq!(cd_off, sb + 20, "CodeDirectory starts right after the one BlobIndex entry");
+            assert_eq!(
+                cd_off,
+                sb + 20,
+                "CodeDirectory starts right after the one BlobIndex entry"
+            );
             assert_eq!(
                 u32::from_be_bytes(bytes[cd_off..cd_off + 4].try_into().unwrap()),
                 CSMAGIC_CODEDIRECTORY
@@ -823,7 +828,10 @@ mod tests {
             let code_limit =
                 u32::from_be_bytes(bytes[cd + 32..cd + 36].try_into().unwrap()) as usize;
             let page_log2 = bytes[cd + 39];
-            assert_eq!(page_log2, 12, "CodeDirectory hash page is always 4K, on both arches");
+            assert_eq!(
+                page_log2, 12,
+                "CodeDirectory hash page is always 4K, on both arches"
+            );
             let hash_offset =
                 u32::from_be_bytes(bytes[cd + 16..cd + 20].try_into().unwrap()) as usize;
             let n_code_slots =
@@ -974,14 +982,17 @@ mod tests {
                 if cmd == LC_SEGMENT_64 {
                     let seg_name = &bytes[pos + 8..pos + 24];
                     if &seg_name[..6] == b"__TEXT" {
-                        text_fileoff =
-                            Some(u64::from_le_bytes(bytes[pos + 40..pos + 48].try_into().unwrap()));
-                        text_filesize =
-                            Some(u64::from_le_bytes(bytes[pos + 48..pos + 56].try_into().unwrap()));
+                        text_fileoff = Some(u64::from_le_bytes(
+                            bytes[pos + 40..pos + 48].try_into().unwrap(),
+                        ));
+                        text_filesize = Some(u64::from_le_bytes(
+                            bytes[pos + 48..pos + 56].try_into().unwrap(),
+                        ));
                     }
                 } else if cmd == LC_CODE_SIGNATURE {
-                    codesig_dataoff =
-                        Some(u32::from_le_bytes(bytes[pos + 8..pos + 12].try_into().unwrap()) as usize);
+                    codesig_dataoff = Some(u32::from_le_bytes(
+                        bytes[pos + 8..pos + 12].try_into().unwrap(),
+                    ) as usize);
                 }
                 pos += cmdsize;
             }

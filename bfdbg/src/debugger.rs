@@ -227,25 +227,31 @@ pub fn parse_command(line: &str) -> Result<Command, String> {
                 match kind {
                     "ptr" => Ok(Command::Watch(Some(WatchSpec::Ptr(n)))),
                     "cell" => Ok(Command::Watch(Some(WatchSpec::Cell(n)))),
-                    other => Err(format!("watch what? {other:?} — use \"ptr <n>\" or \"cell <n>\"")),
+                    other => Err(format!(
+                        "watch what? {other:?} — use \"ptr <n>\" or \"cell <n>\""
+                    )),
                 }
             }
         },
         "unwatch" => {
-            let t = tokens.get(1).ok_or("unwatch needs: unwatch ptr | unwatch cell")?;
+            let t = tokens
+                .get(1)
+                .ok_or("unwatch needs: unwatch ptr | unwatch cell")?;
             match *t {
                 "ptr" => Ok(Command::Unwatch(Which::Ptr)),
                 "cell" => Ok(Command::Unwatch(Which::Cell)),
-                other => Err(format!("unwatch what? {other:?} — use \"unwatch ptr\" or \"unwatch cell\"")),
+                other => Err(format!(
+                    "unwatch what? {other:?} — use \"unwatch ptr\" or \"unwatch cell\""
+                )),
             }
         }
         "set" => Ok(parse_set(&tokens[1..])?),
         "feed" => {
             let mut bytes = Vec::new();
             for t in &tokens[1..] {
-                let v = t.parse::<u8>().map_err(|_| {
-                    format!("feed values must be 0..=255, got {t:?}")
-                })?;
+                let v = t
+                    .parse::<u8>()
+                    .map_err(|_| format!("feed values must be 0..=255, got {t:?}"))?;
                 bytes.push(v);
             }
             if bytes.is_empty() {
@@ -264,17 +270,17 @@ fn parse_break_spec(spec: &str) -> Result<BreakSpec, String> {
     if let Some(rest) = spec.strip_prefix('@') {
         let mut parts = rest.splitn(2, ':');
         let line = parts.next().unwrap_or("");
-        let line = line.parse::<usize>().map_err(|_| {
-            format!("@line must be a positive integer, got {spec:?}")
-        })?;
+        let line = line
+            .parse::<usize>()
+            .map_err(|_| format!("@line must be a positive integer, got {spec:?}"))?;
         if line == 0 {
             return Err("lines are 1-based — @0 is not a line".to_string());
         }
         let col = match parts.next() {
             Some(c) => {
-                let c = c.parse::<usize>().map_err(|_| {
-                    format!("@line:col must be positive integers, got {spec:?}")
-                })?;
+                let c = c
+                    .parse::<usize>()
+                    .map_err(|_| format!("@line:col must be positive integers, got {spec:?}"))?;
                 if c == 0 {
                     return Err("columns are 1-based — :0 is not a column".to_string());
                 }
@@ -620,9 +626,10 @@ impl Debugger {
 
     fn check_watches(&self, pre: u8) -> Option<Stop> {
         if let Some(n) = self.watch_ptr
-            && self.ptr == n {
-                return Some(Stop::WatchPtr(n));
-            }
+            && self.ptr == n
+        {
+            return Some(Stop::WatchPtr(n));
+        }
         if let Some(n) = self.watch_cell {
             let now = self.cell_at(n);
             if now != pre {
@@ -647,7 +654,12 @@ impl Debugger {
         let op = self.ops[pc];
         let result = self.perform(op, prog_out);
         let counted = result.is_ok();
-        self.undo_push(UndoRecord { pc, ptr, cell, counted });
+        self.undo_push(UndoRecord {
+            pc,
+            ptr,
+            cell,
+            counted,
+        });
         if counted {
             self.pc += 1;
             self.steps += 1;
@@ -676,9 +688,7 @@ impl Debugger {
                 prog_out
                     .write_all(&[self.tape[self.ptr]])
                     .map_err(|e| format!("I/O error: {e}"))?;
-                prog_out
-                    .flush()
-                    .map_err(|e| format!("I/O error: {e}"))?;
+                prog_out.flush().map_err(|e| format!("I/O error: {e}"))?;
             }
             Op::Input => {
                 // Empty queue is EOF: the cell is left untouched, the
@@ -707,8 +717,7 @@ impl Debugger {
                     if target >= self.tape.len() {
                         self.grow_to_at_least(target)?;
                     }
-                    self.tape[target] = self.tape[target]
-                        .wrapping_add(value.wrapping_mul(factor));
+                    self.tape[target] = self.tape[target].wrapping_add(value.wrapping_mul(factor));
                 }
             }
             Op::Scan { stride } => {
@@ -816,11 +825,7 @@ impl Debugger {
             let i = first + offset;
             s.push_str(&format!("{:>numw$} | {}\n", i + 1, line));
             if i == ln {
-                s.push_str(&format!(
-                    "{:>numw$} | {}^\n",
-                    "",
-                    " ".repeat(pos.col - 1)
-                ));
+                s.push_str(&format!("{:>numw$} | {}^\n", "", " ".repeat(pos.col - 1)));
             }
         }
         s
@@ -852,11 +857,7 @@ impl Debugger {
         let undo = if self.undo_limit == 0 {
             "disabled (--undo-limit 0)".to_string()
         } else {
-            format!(
-                "{} entries (limit {})",
-                self.undo.len(),
-                self.undo_limit
-            )
+            format!("{} entries (limit {})", self.undo.len(), self.undo_limit)
         };
         s.push_str(&format!("undo:    {}\n", undo));
         if self.undo_truncated {
@@ -965,7 +966,10 @@ mod tests {
     fn move_left_underflow_is_a_clean_error_that_leaves_state_alone() {
         let mut d = dbg_for("<");
         let mut out = Vec::new();
-        assert_eq!(d.step(&mut out), Stop::Errored("pointer moved left of cell 0".into()));
+        assert_eq!(
+            d.step(&mut out),
+            Stop::Errored("pointer moved left of cell 0".into())
+        );
         assert_eq!(d.pc(), 0); // pc still points at the failed op
         assert_eq!(d.steps(), 0);
     }
@@ -1096,7 +1100,7 @@ mod tests {
         let mut out = Vec::new();
         assert_eq!(d.run(&mut out), Stop::Break(3));
         assert_eq!(d.run(&mut out), Stop::Break(3)); // looped back to it
-        assert_eq!(d.run(&mut out), Stop::Finished);   // one more pass, done
+        assert_eq!(d.run(&mut out), Stop::Finished); // one more pass, done
     }
 
     // ---- watchpoints ----
@@ -1116,7 +1120,14 @@ mod tests {
         d.set_watch_cell(1);
         let mut out = Vec::new();
         // Two ops that don't touch cell 1 run through; the third fires.
-        assert_eq!(d.run(&mut out), Stop::WatchCell { cell: 1, from: 0, to: 1 });
+        assert_eq!(
+            d.run(&mut out),
+            Stop::WatchCell {
+                cell: 1,
+                from: 0,
+                to: 1
+            }
+        );
         assert_eq!(d.steps(), 3);
     }
 
@@ -1206,7 +1217,10 @@ mod tests {
     fn source_view_carets_the_next_op() {
         let d = dbg_for("++\n++\n");
         let view = d.source_view(1);
-        assert!(view.contains("next: op 1/4 — line 1, col 1 — Add(1)"), "{view}");
+        assert!(
+            view.contains("next: op 1/4 — line 1, col 1 — Add(1)"),
+            "{view}"
+        );
         assert!(view.contains("  1 | ++"), "{view}");
         assert!(view.contains("  2 | ++"), "{view}");
         assert!(view.contains(" | ^"), "{view}");
@@ -1302,57 +1316,99 @@ mod tests {
         // (it skips blank lines first), so the arms are exercised here.
         assert_eq!(parse_command("").unwrap_err(), "empty command");
         assert_eq!(parse_command("   ").unwrap_err(), "empty command");
-        assert!(parse_command("step x")
-            .unwrap_err()
-            .contains("step count must be a non-negative integer"));
+        assert!(
+            parse_command("step x")
+                .unwrap_err()
+                .contains("step count must be a non-negative integer")
+        );
         assert!(parse_command("tape z").unwrap_err().contains("tape center"));
-        assert!(parse_command("list z").unwrap_err().contains("list context lines"));
+        assert!(
+            parse_command("list z")
+                .unwrap_err()
+                .contains("list context lines")
+        );
         assert!(parse_command("back z").unwrap_err().contains("back count"));
         // clear with a spec parses; unwatch cell parses; unwatch garbage doesn't.
         assert_eq!(
             parse_command("clear 2"),
             Ok(Command::Clear(BreakSpec::Op(2)))
         );
-        assert_eq!(parse_command("clear @2"), Ok(Command::Clear(BreakSpec::Line(2, None))));
-        assert_eq!(parse_command("unwatch cell"), Ok(Command::Unwatch(Which::Cell)));
-        assert!(parse_command("unwatch bogus")
-            .unwrap_err()
-            .contains("unwatch what? \"bogus\""));
-        assert!(parse_command("watch ptr")
-            .unwrap_err()
-            .contains("watch needs a cell number: watch ptr 42"));
+        assert_eq!(
+            parse_command("clear @2"),
+            Ok(Command::Clear(BreakSpec::Line(2, None)))
+        );
+        assert_eq!(
+            parse_command("unwatch cell"),
+            Ok(Command::Unwatch(Which::Cell))
+        );
+        assert!(
+            parse_command("unwatch bogus")
+                .unwrap_err()
+                .contains("unwatch what? \"bogus\"")
+        );
+        assert!(
+            parse_command("watch ptr")
+                .unwrap_err()
+                .contains("watch needs a cell number: watch ptr 42")
+        );
         assert_eq!(
             parse_command("feed").unwrap_err(),
             "feed needs byte values: feed 65 10"
         );
-        assert!(parse_command("break @x")
-            .unwrap_err()
-            .contains("@line must be a positive integer"));
-        assert!(parse_command("break @3:0")
-            .unwrap_err()
-            .contains("columns are 1-based — :0 is not a column"));
-        assert!(parse_command("break abc")
-            .unwrap_err()
-            .contains("bad breakpoint spec \"abc\""));
+        assert!(
+            parse_command("break @x")
+                .unwrap_err()
+                .contains("@line must be a positive integer")
+        );
+        assert!(
+            parse_command("break @3:0")
+                .unwrap_err()
+                .contains("columns are 1-based — :0 is not a column")
+        );
+        assert!(
+            parse_command("break abc")
+                .unwrap_err()
+                .contains("bad breakpoint spec \"abc\"")
+        );
         // set: every usage shape, both spellings.
         assert!(parse_command("set").unwrap_err().contains("usage: set"));
-        assert!(parse_command("set ptr 3").unwrap_err().contains("usage: set"));
-        assert!(parse_command("set ptr = x")
-            .unwrap_err()
-            .contains("ptr must be a non-negative integer"));
-        assert!(parse_command("set cell x = 5")
-            .unwrap_err()
-            .contains("cell index must be a non-negative integer"));
-        assert!(parse_command("set cell 3 5").unwrap_err().contains("usage: set"));
-        assert!(parse_command("set cell 3 = 300")
-            .unwrap_err()
-            .contains("cell values are 0..=255, got \"300\""));
-        assert!(parse_command("set foo = 1").unwrap_err().contains("usage: set"));
+        assert!(
+            parse_command("set ptr 3")
+                .unwrap_err()
+                .contains("usage: set")
+        );
+        assert!(
+            parse_command("set ptr = x")
+                .unwrap_err()
+                .contains("ptr must be a non-negative integer")
+        );
+        assert!(
+            parse_command("set cell x = 5")
+                .unwrap_err()
+                .contains("cell index must be a non-negative integer")
+        );
+        assert!(
+            parse_command("set cell 3 5")
+                .unwrap_err()
+                .contains("usage: set")
+        );
+        assert!(
+            parse_command("set cell 3 = 300")
+                .unwrap_err()
+                .contains("cell values are 0..=255, got \"300\"")
+        );
+        assert!(
+            parse_command("set foo = 1")
+                .unwrap_err()
+                .contains("usage: set")
+        );
         // An index too big for usize also fails the bracketed parse and
         // falls back to the usage error.
-        assert!(parse_command("set cell[99999999999999999999] = 1")
-            .unwrap_err()
-            .contains("usage: set"));
+        assert!(
+            parse_command("set cell[99999999999999999999] = 1")
+                .unwrap_err()
+                .contains("usage: set")
+        );
     }
 
     #[test]
@@ -1387,7 +1443,11 @@ mod tests {
         let mut out = Vec::new();
         assert_eq!(
             d.step(&mut out),
-            Stop::WatchCell { cell: 0, from: 0, to: 1 }
+            Stop::WatchCell {
+                cell: 0,
+                from: 0,
+                to: 1
+            }
         );
     }
 
@@ -1447,7 +1507,10 @@ mod tests {
 
         // MulAdd on a zero cell is guarded away entirely.
         let mut d = Debugger::new(
-            vec![Op::MulAdd { offset: 1, factor: 2 }],
+            vec![Op::MulAdd {
+                offset: 1,
+                factor: 2,
+            }],
             "z".into(),
             DEFAULT_UNDO_LIMIT,
         );
@@ -1456,7 +1519,10 @@ mod tests {
 
         // MulAdd on a non-zero cell, target in bounds.
         let mut d = Debugger::new(
-            vec![Op::MulAdd { offset: 1, factor: 3 }],
+            vec![Op::MulAdd {
+                offset: 1,
+                factor: 3,
+            }],
             "z".into(),
             DEFAULT_UNDO_LIMIT,
         );
@@ -1466,7 +1532,10 @@ mod tests {
 
         // A target past the end grows the tape to exactly it.
         let mut d = Debugger::new(
-            vec![Op::MulAdd { offset: 30_000, factor: 1 }],
+            vec![Op::MulAdd {
+                offset: 30_000,
+                factor: 1,
+            }],
             "z".into(),
             DEFAULT_UNDO_LIMIT,
         );
@@ -1477,7 +1546,10 @@ mod tests {
 
         // A negative offset off cell 0 underflows with the shared wording.
         let mut d = Debugger::new(
-            vec![Op::MulAdd { offset: -1, factor: 1 }],
+            vec![Op::MulAdd {
+                offset: -1,
+                factor: 1,
+            }],
             "z".into(),
             DEFAULT_UNDO_LIMIT,
         );
@@ -1498,17 +1570,29 @@ mod tests {
         d.set_cell(0, 1).unwrap();
         d.set_cell(2, 1).unwrap();
         assert_eq!(d.step(&mut Vec::new()), Stop::Finished);
-        assert!(d.info().contains("machine: ptr 4, tape 30000 cells"), "{}", d.info());
+        assert!(
+            d.info().contains("machine: ptr 4, tape 30000 cells"),
+            "{}",
+            d.info()
+        );
 
         // A stride that lands past the end grows onto the zero tail.
-        let mut d = Debugger::new(vec![Op::Scan { stride: 30_000 }], "z".into(), DEFAULT_UNDO_LIMIT);
+        let mut d = Debugger::new(
+            vec![Op::Scan { stride: 30_000 }],
+            "z".into(),
+            DEFAULT_UNDO_LIMIT,
+        );
         d.set_cell(0, 1).unwrap();
         assert_eq!(d.step(&mut Vec::new()), Stop::Finished);
         assert_eq!(d.tape_len(), 30_001);
         assert!(d.info().contains("machine: ptr 30000,"), "{}", d.info());
 
         // A negative stride off cell 0 underflows with the shared wording.
-        let mut d = Debugger::new(vec![Op::Scan { stride: -1 }], "z".into(), DEFAULT_UNDO_LIMIT);
+        let mut d = Debugger::new(
+            vec![Op::Scan { stride: -1 }],
+            "z".into(),
+            DEFAULT_UNDO_LIMIT,
+        );
         d.set_cell(0, 1).unwrap();
         assert!(matches!(d.step(&mut Vec::new()),
             Stop::Errored(m) if m == "pointer moved left of cell 0"));
@@ -1536,7 +1620,10 @@ mod tests {
         assert!(matches!(d.run(&mut out), Stop::Errored(_)));
         let view = d.source_view(0);
         assert!(view.contains("this op failed last time"), "{view}");
-        assert!(view.contains("`back` rewinds it, `set` patches state"), "{view}");
+        assert!(
+            view.contains("`back` rewinds it, `set` patches state"),
+            "{view}"
+        );
     }
 
     #[test]
@@ -1572,7 +1659,10 @@ mod tests {
             Op::JumpIfZero { target: 0 },
             Op::JumpIfNonZero { target: 0 },
             Op::Zero,
-            Op::MulAdd { offset: 2, factor: 3 },
+            Op::MulAdd {
+                offset: 2,
+                factor: 3,
+            },
             Op::Scan { stride: 1 },
         ];
         let d = Debugger::new(ops.to_vec(), "z".into(), DEFAULT_UNDO_LIMIT);

@@ -1288,10 +1288,11 @@ mod tests {
         let op0_offset = m.labels[0];
         assert_ne!(op0_offset, u32::MAX, "label 0 must be bound");
         assert!(
-            m.fixups.iter().any(|f| f
-                .target
-                .label_index()
-                .is_some_and(|i| (i as usize) < m.labels.len() && m.labels[i as usize] == op0_offset)),
+            m.fixups
+                .iter()
+                .any(|f| f.target.label_index().is_some_and(
+                    |i| (i as usize) < m.labels.len() && m.labels[i as usize] == op0_offset
+                )),
             "no branch targets the scan's own start"
         );
     }

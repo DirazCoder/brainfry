@@ -1,20 +1,18 @@
 //! End-to-end tests: compile real programs with the bfnative binary, run the
 //! produced executables, and check their output.
 //!
-//! Execution tests run only on linux-x86_64, the one target whose host
-//! environment these tests can assume. linux-aarch64 gets executed too, via
-//! the QEMU-user differential harness in `scripts/differential_test.py`
-//! (set QEMU_AARCH64 to enable it). Everything cross-target gets at least
-//! built and structurally validated (header magic, container shape, import
-//! and bind tables, signature page hashes) in the per-format unit tests.
+//! Generated-program execution tests run only on linux-x86_64, the one target
+//! whose host environment these tests can assume. linux-aarch64 gets executed
+//! too, via the QEMU-user differential harness in `scripts/differential_test.py`
+//! (set QEMU_AARCH64 to enable it). CLI and container-format tests run on all
+//! hosts.
 //!
 //! Note there is no `cc` check anymore: the whole point of the new backend
 //! is that no C toolchain is needed anywhere, so these tests run in any
 //! environment with a Rust compiler.
 
-#![cfg(all(target_os = "linux", target_arch = "x86_64"))]
-
 use std::fs;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 use std::io::Write;
 use std::process::{Command, Stdio};
 
@@ -29,17 +27,20 @@ fn write_source(dir: &std::path::Path, source: &str) -> std::path::PathBuf {
 }
 
 #[test]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 fn hello_world_matches_expected_output() {
     run("hello-world", HELLO_WORLD, "", "Hello World!\n");
 }
 
 #[test]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 fn cells_wrap_at_256() {
     // 256 increments on one cell fold to Add(255) + Add(1) and wrap to 0.
     run("wrap", &format!("{}.", "+".repeat(256)), "", "\x00");
 }
 
 #[test]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 fn eof_leaves_the_cell_unchanged() {
     // bfrun's convention: a read that hits EOF doesn't touch the cell. The
     // untouched cell is 0, +1 makes 1 — so empty stdin prints \x01, and a
@@ -49,6 +50,7 @@ fn eof_leaves_the_cell_unchanged() {
 }
 
 #[test]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 fn echo_stdin_until_eof() {
     // The [-] inside the loop zeroes the cell after printing so the loop
     // test terminates at EOF (where the cell stays unchanged at 0).
@@ -61,6 +63,7 @@ fn echo_stdin_until_eof() {
 }
 
 #[test]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 fn pointer_walks_past_the_interpreters_initial_tape() {
     // 40,000 cells out is past bfrun's initial 30,000; both bfrun and the
     // native backend grow the tape there — the native one commits more
@@ -69,6 +72,7 @@ fn pointer_walks_past_the_interpreters_initial_tape() {
 }
 
 #[test]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 fn tape_growth_beyond_the_first_commit_granule() {
     // 200,000 cells forces several growth steps (30000 -> 65536 -> 131072
     // -> 262144), exercising repeated mprotect commits and the doubling
@@ -82,6 +86,7 @@ fn tape_growth_beyond_the_first_commit_granule() {
 }
 
 #[test]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 fn deeply_nested_loops_six_levels() {
     // Six levels of nested brackets. Counts 6*5*4*3*2*2 = 1440 accumulate in
     // the innermost cell; 1440 mod 256 = 160. Expected value verified
@@ -91,6 +96,7 @@ fn deeply_nested_loops_six_levels() {
 }
 
 #[test]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 fn nested_loops_and_the_zero_idiom() {
     // Multiply 6 by 6 with a copy loop, then bump by one. The first loop
     // zeroes cell 0 while accumulating 36 in cell 1; the second moves those
@@ -102,6 +108,7 @@ fn nested_loops_and_the_zero_idiom() {
 }
 
 #[test]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 fn zero_loop_folding_and_runs() {
     // [-], [+] fold to Zero; long +/- runs fold into counted ops. The loop
     // body is pointer-balanced (an earlier draft ended in a net `<` and
@@ -112,6 +119,7 @@ fn zero_loop_folding_and_runs() {
 }
 
 #[test]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 fn io_inside_loops() {
     // Input and output both inside loop bodies, with the zero idiom nested
     // one level down: read a byte, print it doubled, zero it, repeat.
@@ -119,6 +127,7 @@ fn io_inside_loops() {
 }
 
 #[test]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 fn pointer_underflow_is_a_clean_error() {
     // Walking left of cell 0 must produce bfrun's exact message on stderr
     // and exit code 1 — not a segfault.
@@ -132,6 +141,7 @@ fn pointer_underflow_is_a_clean_error() {
 }
 
 #[test]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 fn huge_left_move_is_caught_not_wrapped() {
     // A MoveLeft far larger than the pointer offset must be detected (the
     // comparison is against a zero-extended count), not wrap the pointer
@@ -145,6 +155,7 @@ fn huge_left_move_is_caught_not_wrapped() {
 }
 
 #[test]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 fn untouched_excursion_in_an_offset_add_candidate_loop_still_underflows() {
     // +[<>-] and +[-<>]: the loop body visits cell -1 without ever writing
     // it. The optimizer used to fold exactly these shapes to a plain Zero
@@ -165,6 +176,7 @@ fn untouched_excursion_in_an_offset_add_candidate_loop_still_underflows() {
 }
 
 #[test]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 fn output_executable_is_a_real_elf() {
     let dir = std::env::temp_dir().join("bfnative-e2e-elf");
     fs::create_dir_all(&dir).expect("creating temp dir");
@@ -215,6 +227,8 @@ fn emit_asm_writes_a_listing() {
     let listing = dir.join("program.lst");
     write_source(&dir, HELLO_WORLD);
     let compiled = Command::new(env!("CARGO_BIN_EXE_bfnative"))
+        .arg("--target")
+        .arg("linux-x86_64")
         .arg("--emit-asm")
         .arg(dir.join("program.bf"))
         .arg("-o")
@@ -230,10 +244,12 @@ fn emit_asm_writes_a_listing() {
 }
 
 /// Compiles `source` and asserts stdout + a successful exit.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 fn run(tag: &str, source: &str, stdin: &str, expected: &str) {
     run_bytes(tag, source, stdin, expected.as_bytes());
 }
 
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 fn run_bytes(tag: &str, source: &str, stdin: &str, expected: &[u8]) {
     let (code, stdout, stderr) = run_raw(tag, source, stdin);
     assert_eq!(
@@ -249,6 +265,7 @@ fn run_bytes(tag: &str, source: &str, stdin: &str, expected: &[u8]) {
     );
 }
 
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 fn run_raw(tag: &str, source: &str, stdin: &str) -> (std::process::ExitStatus, Vec<u8>, Vec<u8>) {
     let dir = std::env::temp_dir().join(format!("bfnative-e2e-{tag}"));
     fs::create_dir_all(&dir).expect("creating temp dir");
@@ -270,6 +287,7 @@ fn run_raw(tag: &str, source: &str, stdin: &str) -> (std::process::ExitStatus, V
     (output.status, output.stdout, output.stderr)
 }
 
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 fn compile(
     dir: &std::path::Path,
     source: &str,
@@ -295,10 +313,7 @@ fn compile(
 // ---------------------------------------------------------------------------
 
 /// Runs the bfnative binary with raw args, empty stdin.
-fn run_cli(
-    _tag: &str,
-    args: &[&std::ffi::OsStr],
-) -> (std::process::ExitStatus, String, String) {
+fn run_cli(_tag: &str, args: &[&std::ffi::OsStr]) -> (std::process::ExitStatus, String, String) {
     let output = Command::new(env!("CARGO_BIN_EXE_bfnative"))
         .args(args)
         .stdin(Stdio::null())
@@ -318,10 +333,7 @@ fn help_flag_prints_usage_and_succeeds() {
     let dir = std::env::temp_dir().join("bfnative-e2e-help");
     fs::create_dir_all(&dir).expect("creating temp dir");
     let source_path = write_source(&dir, "+.");
-    let (status, stdout, stderr) = run_cli(
-        "help",
-        &[source_path.as_os_str(), "--help".as_ref()],
-    );
+    let (status, stdout, stderr) = run_cli("help", &[source_path.as_os_str(), "--help".as_ref()]);
     assert_eq!(status.code(), Some(0), "stderr: {stderr}");
     assert!(stdout.contains("usage: bfnative"), "{stdout}");
 }
@@ -349,7 +361,10 @@ fn flag_without_a_value_fails() {
     let dir = std::env::temp_dir().join("bfnative-e2e-flag-value");
     fs::create_dir_all(&dir).expect("creating temp dir");
     let source_path = write_source(&dir, "+.");
-    let (status, _, stderr) = run_cli("flag-value", &[source_path.as_os_str(), "--target".as_ref()]);
+    let (status, _, stderr) = run_cli(
+        "flag-value",
+        &[source_path.as_os_str(), "--target".as_ref()],
+    );
     assert_eq!(status.code(), Some(1));
     assert!(stderr.contains("--target needs a value"), "{stderr}");
 }
@@ -381,7 +396,10 @@ fn more_than_one_input_file_is_rejected() {
     let dir = std::env::temp_dir().join("bfnative-e2e-two-inputs");
     fs::create_dir_all(&dir).expect("creating temp dir");
     let source_path = write_source(&dir, "+.");
-    let (status, _, stderr) = run_cli("two-inputs", &[source_path.as_os_str(), source_path.as_os_str()]);
+    let (status, _, stderr) = run_cli(
+        "two-inputs",
+        &[source_path.as_os_str(), source_path.as_os_str()],
+    );
     assert_eq!(status.code(), Some(1));
     assert!(stderr.contains("more than one input file"), "{stderr}");
 }
@@ -418,7 +436,11 @@ fn unknown_target_fails_and_lists_the_valid_ones() {
     let source_path = write_source(&dir, "+.");
     let (status, _, stderr) = run_cli(
         "bad-target",
-        &["--target".as_ref(), "linux-arm64".as_ref(), source_path.as_os_str()],
+        &[
+            "--target".as_ref(),
+            "linux-arm64".as_ref(),
+            source_path.as_os_str(),
+        ],
     );
     assert_eq!(status.code(), Some(1));
     assert!(stderr.contains("unknown target `linux-arm64`"), "{stderr}");
@@ -427,10 +449,10 @@ fn unknown_target_fails_and_lists_the_valid_ones() {
 
 #[test]
 fn unreadable_input_fails_cleanly() {
-    let (status, _, stderr) = run_cli(
-        "missing-input",
-        &["/nonexistent/bfnative-e2e/nope.bf".as_ref()],
-    );
+    let dir = std::env::temp_dir().join("bfnative-e2e-missing-input");
+    fs::create_dir_all(&dir).expect("creating temp dir");
+    let missing = dir.join("no-such-dir").join("nope.bf");
+    let (status, _, stderr) = run_cli("missing-input", &[missing.as_os_str()]);
     assert_eq!(status.code(), Some(1));
     assert!(stderr.contains("couldn't read"), "{stderr}");
 }
@@ -470,8 +492,7 @@ fn emit_asm_write_failure_is_clean() {
     fs::create_dir_all(&dir).expect("creating temp dir");
     let source_path = write_source(&dir, "+.");
     let bad = dir.join("no-such-dir").join("program.lst");
-    let (status, _, stderr) =
-        run_cli(
+    let (status, _, stderr) = run_cli(
         "lst-write-fail",
         &[
             "--emit-asm".as_ref(),
@@ -500,20 +521,31 @@ fn executable_write_failure_is_clean() {
 
 #[test]
 fn default_output_path_is_the_bare_input_stem() {
-    // No -o: a linux host target writes `program` next to `program.bf`,
-    // executable-bit set.
+    // No -o: non-Windows hosts write `program`; Windows appends `.exe`.
     let dir = std::env::temp_dir().join("bfnative-e2e-default-out");
     fs::create_dir_all(&dir).expect("creating temp dir");
     let source_path = write_source(&dir, HELLO_WORLD);
     let (status, stdout, stderr) = run_cli("default-out", &[source_path.as_os_str()]);
     assert!(status.success(), "stderr: {stderr}");
-    let out = dir.join("program");
+    let out = dir.join(if cfg!(target_os = "windows") {
+        "program.exe"
+    } else {
+        "program"
+    });
     assert!(out.exists(), "stdout: {stdout}");
     let bytes = fs::read(&out).expect("reading default output");
+    #[cfg(target_os = "linux")]
     assert_eq!(&bytes[..4], b"\x7fELF");
-    use std::os::unix::fs::PermissionsExt;
-    let mode = fs::metadata(&out).expect("stat").permissions().mode();
-    assert_eq!(mode & 0o111, 0o111, "execute bit missing");
+    #[cfg(target_os = "macos")]
+    assert_eq!(&bytes[..4], &[0xCF, 0xFA, 0xED, 0xFE]);
+    #[cfg(target_os = "windows")]
+    assert_eq!(&bytes[..2], b"MZ");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(&out).expect("stat").permissions().mode();
+        assert_eq!(mode & 0o111, 0o111, "execute bit missing");
+    }
 }
 
 #[test]
@@ -523,7 +555,11 @@ fn windows_default_output_path_gets_the_exe_suffix() {
     let source_path = write_source(&dir, HELLO_WORLD);
     let (status, _, stderr) = run_cli(
         "default-exe",
-        &["--target".as_ref(), "windows-x86_64".as_ref(), source_path.as_os_str()],
+        &[
+            "--target".as_ref(),
+            "windows-x86_64".as_ref(),
+            source_path.as_os_str(),
+        ],
     );
     assert!(status.success(), "stderr: {stderr}");
     let out = dir.join("program.exe");

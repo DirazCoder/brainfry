@@ -230,7 +230,7 @@ fn parse_args(args: Vec<String>) -> Result<String, String> {
                      (detected at runtime: {}); cross-target compilation is \
                      bfnative's job",
                     Target::host()
-                ))
+                ));
             }
             other if other.starts_with('-') => {
                 return Err(format!("unknown option: {other}"));

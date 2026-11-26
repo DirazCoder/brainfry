@@ -53,7 +53,12 @@ fn eof_leaves_the_cell_unchanged() {
 
 #[test]
 fn echo_stdin_until_eof() {
-    run("echo", ",[.[-],]", "echo, echo, echo\n", "echo, echo, echo\n");
+    run(
+        "echo",
+        ",[.[-],]",
+        "echo, echo, echo\n",
+        "echo, echo, echo\n",
+    );
 }
 
 #[test]
@@ -68,7 +73,12 @@ fn pointer_walks_past_the_initial_tape() {
 fn tape_growth_through_several_commit_granules() {
     // 200,000 cells forces repeated growth (30000 -> 65536 -> 131072 ->
     // 262144) and lands past the first 64 KiB commit exactly.
-    run("deep-tape", &format!("{}+.", ">".repeat(200_000)), "", "\x01");
+    run(
+        "deep-tape",
+        &format!("{}+.", ">".repeat(200_000)),
+        "",
+        "\x01",
+    );
 }
 
 #[test]
@@ -249,7 +259,10 @@ fn cross_target_request_is_rejected() {
         .expect("running bfjit");
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("host"), "stderr should say host-only: {stderr}");
+    assert!(
+        stderr.contains("host"),
+        "stderr should say host-only: {stderr}"
+    );
 }
 
 #[test]

@@ -240,8 +240,12 @@ mod tests {
         // Both halves of the Input arm: a reader with a byte in it (the
         // cell takes that byte) and one at EOF (the cell keeps its value).
         let mut vm = Vm::new();
-        vm.run_io(&[Op::Input], &mut io::Cursor::new(&b"Q"[..]), &mut io::sink())
-            .unwrap();
+        vm.run_io(
+            &[Op::Input],
+            &mut io::Cursor::new(&b"Q"[..]),
+            &mut io::sink(),
+        )
+        .unwrap();
         assert_eq!(*vm.current_cell(), b'Q');
 
         let mut vm = Vm::new();
@@ -296,7 +300,11 @@ mod tests {
     #[test]
     fn a_failing_flush_surfaces_as_an_io_error() {
         let mut vm = Vm::new();
-        let result = vm.run_io(&[Op::Add(1), Op::Output], &mut io::empty(), &mut Unflushable);
+        let result = vm.run_io(
+            &[Op::Add(1), Op::Output],
+            &mut io::empty(),
+            &mut Unflushable,
+        );
         assert!(matches!(result, Err(RunError::Io(_))));
     }
 
@@ -311,10 +319,7 @@ mod tests {
         // bfnative's MSG_GROW is "runtime error: failed to grow tape\n" and
         // bfrun's main prints "runtime error: {err}" -- the differential
         // harness compares stderr byte for byte, so the two must line up.
-        assert_eq!(
-            RunError::GrowFailed.to_string(),
-            "failed to grow tape"
-        );
+        assert_eq!(RunError::GrowFailed.to_string(), "failed to grow tape");
     }
 
     #[test]
@@ -326,8 +331,7 @@ mod tests {
             "pointer moved left of cell 0"
         );
         assert_eq!(
-            RunError::Io(io::Error::other("pipe broke"))
-                .to_string(),
+            RunError::Io(io::Error::other("pipe broke")).to_string(),
             "I/O error: pipe broke"
         );
         let converted: RunError = io::Error::new(io::ErrorKind::UnexpectedEof, "eof").into();
@@ -417,7 +421,13 @@ mod tests {
     #[test]
     fn mul_add_underflow_errors_like_move_left() {
         let mut vm = Vm::new();
-        let result = vm.run(&[Op::Add(1), Op::MulAdd { offset: -1, factor: 1 }]);
+        let result = vm.run(&[
+            Op::Add(1),
+            Op::MulAdd {
+                offset: -1,
+                factor: 1,
+            },
+        ]);
         assert!(matches!(result, Err(RunError::PointerUnderflow)));
     }
 
@@ -447,11 +457,7 @@ mod tests {
     fn jump_taken_zero_skips_the_loop_body() {
         // Cell 0 is zero, so JumpIfZero fires: execution lands on op 3
         // (the pc = target; pc += 1 convention), skipping the Add entirely.
-        let ops = [
-            Op::JumpIfZero { target: 2 },
-            Op::Add(1),
-            Op::Output,
-        ];
+        let ops = [Op::JumpIfZero { target: 2 }, Op::Add(1), Op::Output];
         let mut vm = Vm::new();
         let result = vm.run(&ops);
         assert!(result.is_ok());
@@ -547,7 +553,12 @@ mod tests {
             assert!(matches!(result, Err(RunError::GrowFailed)));
 
             let mut vm = Vm::new();
-            let result = vm.run(&[Op::Add(1), Op::Scan { stride: 2_000_000_000 }]);
+            let result = vm.run(&[
+                Op::Add(1),
+                Op::Scan {
+                    stride: 2_000_000_000,
+                },
+            ]);
             assert!(matches!(result, Err(RunError::GrowFailed)));
         });
     }

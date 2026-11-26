@@ -78,7 +78,11 @@ fn have_cc() -> bool {
 /// Transpiles `source` to C, compiles it, runs it with the given stdin,
 /// and returns (status, stdout, stderr). Panics if the compile step
 /// fails, so a broken generated file is loud, not a skipped assertion.
-fn compile_and_run(dir: &Path, source: &str, stdin: &[u8]) -> (std::process::ExitStatus, Vec<u8>, Vec<u8>) {
+fn compile_and_run(
+    dir: &Path,
+    source: &str,
+    stdin: &[u8],
+) -> (std::process::ExitStatus, Vec<u8>, Vec<u8>) {
     let cc = find_cc().expect("C compiler required by this test");
     let c_path = compile_program(dir, source);
     let exe = dir.join("program");
@@ -228,8 +232,7 @@ fn echo_program_reads_stdin() {
         return;
     }
     let dir = temp_dir("run-echo");
-    let (status, stdout, stderr) =
-        compile_and_run(&dir, ",[.[-],]", b"echo, echo, echo\n");
+    let (status, stdout, stderr) = compile_and_run(&dir, ",[.[-],]", b"echo, echo, echo\n");
     assert_eq!(status.code(), Some(0));
     assert_eq!(stdout, b"echo, echo, echo\n");
     assert_eq!(stderr, b"");
@@ -303,8 +306,7 @@ fn underflow_is_a_clean_error() {
     assert_eq!(status.code(), Some(1));
     assert_eq!(stdout, b"");
     assert_eq!(
-        stderr,
-        b"runtime error: pointer moved left of cell 0\n",
+        stderr, b"runtime error: pointer moved left of cell 0\n",
         "error wording must match every other backend byte-for-byte"
     );
 }
@@ -320,10 +322,7 @@ fn huge_left_move_is_a_clean_error() {
     let dir = temp_dir("run-huge-left");
     let (status, _stdout, stderr) = compile_and_run(&dir, &source, b"");
     assert_eq!(status.code(), Some(1));
-    assert_eq!(
-        stderr,
-        b"runtime error: pointer moved left of cell 0\n"
-    );
+    assert_eq!(stderr, b"runtime error: pointer moved left of cell 0\n");
 }
 
 #[test]
@@ -405,6 +404,9 @@ fn mandelbrot_runs_byte_exact() {
         .output()
         .expect("mandelbrot run");
     assert_eq!(out.status.code(), Some(0));
-    assert_eq!(out.stdout, expected, "mandelbrot output drifted from expected");
+    assert_eq!(
+        out.stdout, expected,
+        "mandelbrot output drifted from expected"
+    );
     assert_eq!(out.stderr, b"");
 }

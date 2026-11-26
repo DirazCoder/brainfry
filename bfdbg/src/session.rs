@@ -88,7 +88,10 @@ pub fn execute_command(
                         break;
                     }
                 }
-                say(dbg_out, &format!("stepped {done} op(s) — now {}\n", position_line(dbg)));
+                say(
+                    dbg_out,
+                    &format!("stepped {done} op(s) — now {}\n", position_line(dbg)),
+                );
                 if !matches!(stop, Stop::Ran) {
                     say(dbg_out, &format!("{}\n", stop_line(dbg, &stop)));
                 }
@@ -97,7 +100,10 @@ pub fn execute_command(
 
         Command::Back(n) => {
             if !dbg.undo_enabled() {
-                say(dbg_out, "undo log disabled (--undo-limit 0) — `back` is unavailable\n");
+                say(
+                    dbg_out,
+                    "undo log disabled (--undo-limit 0) — `back` is unavailable\n",
+                );
             } else {
                 let done = dbg.back(*n);
                 if done == 0 {
@@ -107,7 +113,10 @@ pub fn execute_command(
                          remembers\n",
                     );
                 } else {
-                    say(dbg_out, &format!("stepped back {done} op(s) — now {}\n", position_line(dbg)));
+                    say(
+                        dbg_out,
+                        &format!("stepped back {done} op(s) — now {}\n", position_line(dbg)),
+                    );
                 }
             }
         }
@@ -141,9 +150,15 @@ pub fn execute_command(
             Err(e) => say(dbg_out, &format!("error: {e}\n")),
             Ok(i) => {
                 if dbg.clear_break(i) {
-                    say(dbg_out, &format!("cleared breakpoint at {}\n", op_number(dbg, i)));
+                    say(
+                        dbg_out,
+                        &format!("cleared breakpoint at {}\n", op_number(dbg, i)),
+                    );
                 } else {
-                    say(dbg_out, &format!("no breakpoint at {}\n", op_number(dbg, i)));
+                    say(
+                        dbg_out,
+                        &format!("no breakpoint at {}\n", op_number(dbg, i)),
+                    );
                 }
             }
         },
@@ -283,7 +298,7 @@ fn stop_line(dbg: &Debugger, stop: &Stop) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::debugger::{parse_command, Debugger, DEFAULT_UNDO_LIMIT};
+    use crate::debugger::{DEFAULT_UNDO_LIMIT, Debugger, parse_command};
     use bfc::parser;
     use std::io::Write;
 
@@ -325,12 +340,12 @@ mod tests {
     fn the_error_back_patch_retry_workflow_renders() {
         // The reason this tool exists, end to end: hit the underflow,
         // rewind, patch, retry, finish.
-        let (prog, dbg) = script(
-            "<",
-            &["run", "back", "set ptr = 2", "run", "info"],
-        );
+        let (prog, dbg) = script("<", &["run", "back", "set ptr = 2", "run", "info"]);
         assert!(prog.is_empty());
-        assert!(dbg.contains("runtime error: pointer moved left of cell 0"), "{dbg}");
+        assert!(
+            dbg.contains("runtime error: pointer moved left of cell 0"),
+            "{dbg}"
+        );
         assert!(dbg.contains("failed at op 1/1"), "{dbg}");
         assert!(dbg.contains("hint: rewind it with `back`"), "{dbg}");
         assert!(dbg.contains("stepped back 1 op(s)"), "{dbg}");
@@ -342,17 +357,26 @@ mod tests {
 
     #[test]
     fn breakpoints_and_stepping_render_positions() {
-        let (_, dbg) = script(
-            "+++\n.\n",
-            &["break 1", "run", "list", "step", "info"],
+        let (_, dbg) = script("+++\n.\n", &["break 1", "run", "list", "step", "info"]);
+        assert!(
+            dbg.contains("breakpoint at op 2/4 (line 1, col 2)"),
+            "{dbg}"
         );
-        assert!(dbg.contains("breakpoint at op 2/4 (line 1, col 2)"), "{dbg}");
-        assert!(dbg.contains("stopped — breakpoint at op 2/4 (line 1, col 2)"), "{dbg}");
+        assert!(
+            dbg.contains("stopped — breakpoint at op 2/4 (line 1, col 2)"),
+            "{dbg}"
+        );
         // `list` marks the paused op with a caret.
-        assert!(dbg.contains("next: op 2/4 — line 1, col 2 — Add(1)"), "{dbg}");
+        assert!(
+            dbg.contains("next: op 2/4 — line 1, col 2 — Add(1)"),
+            "{dbg}"
+        );
         assert!(dbg.contains("^"), "{dbg}");
         // `step` walks through the breakpoint by design.
-        assert!(dbg.contains("stepped 1 op(s) — now op 3/4 — line 1, col 3 — Add(1)"), "{dbg}");
+        assert!(
+            dbg.contains("stepped 1 op(s) — now op 3/4 — line 1, col 3 — Add(1)"),
+            "{dbg}"
+        );
     }
 
     #[test]
@@ -363,15 +387,15 @@ mod tests {
 
         let (_, dbg) = script("+>+", &["watch cell 1", "run"]);
         assert!(dbg.contains("watching cell 1 for value changes"), "{dbg}");
-        assert!(dbg.contains("stopped — watchpoint: cell 1 changed 0 -> 1"), "{dbg}");
+        assert!(
+            dbg.contains("stopped — watchpoint: cell 1 changed 0 -> 1"),
+            "{dbg}"
+        );
     }
 
     #[test]
     fn tape_list_and_feed_render() {
-        let (prog, dbg) = script(
-            "x\n++.",
-            &["tape", "list", "feed 33", "run"],
-        );
+        let (prog, dbg) = script("x\n++.", &["tape", "list", "feed 33", "run"]);
         // tape: header plus the ptr marker.
         assert!(dbg.contains("tape: 30000 cells, ptr at 0"), "{dbg}");
         assert!(dbg.contains("> "), "{dbg}");
@@ -386,16 +410,31 @@ mod tests {
     #[test]
     fn set_renders_growth_and_bad_specs_error() {
         let (_, dbg) = script("+", &["set cell[40000] = 5", "set ptr = 50000", "info"]);
-        assert!(dbg.contains("cell 40000 = 5 (tape grew to 40001 cells)"), "{dbg}");
-        assert!(dbg.contains("ptr = 50000 (tape grew to 50001 cells)"), "{dbg}");
-        assert!(dbg.contains("machine: ptr 50000, tape 50001 cells"), "{dbg}");
+        assert!(
+            dbg.contains("cell 40000 = 5 (tape grew to 40001 cells)"),
+            "{dbg}"
+        );
+        assert!(
+            dbg.contains("ptr = 50000 (tape grew to 50001 cells)"),
+            "{dbg}"
+        );
+        assert!(
+            dbg.contains("machine: ptr 50000, tape 50001 cells"),
+            "{dbg}"
+        );
 
         // Bad commands through the REPL path produce errors, not panics.
         let (_, dbg) = script("+", &["break 99", "break @9", "watch bogus 1", "feed 999"]);
-        assert!(dbg.contains("error: program has 1 ops — there is no op 99"), "{dbg}");
+        assert!(
+            dbg.contains("error: program has 1 ops — there is no op 99"),
+            "{dbg}"
+        );
         assert!(dbg.contains("error: no instruction on line 9"), "{dbg}");
         assert!(dbg.contains("error: watch what? \"bogus\""), "{dbg}");
-        assert!(dbg.contains("error: feed values must be 0..=255, got \"999\""), "{dbg}");
+        assert!(
+            dbg.contains("error: feed values must be 0..=255, got \"999\""),
+            "{dbg}"
+        );
     }
 
     #[test]
@@ -453,7 +492,10 @@ mod tests {
         let (_, dbg) = script("++.", &["break 1", "clear 1", "clear 1", "clear 99"]);
         assert!(dbg.contains("cleared breakpoint at op 2/3"), "{dbg}");
         assert!(dbg.contains("no breakpoint at op 2/3"), "{dbg}");
-        assert!(dbg.contains("error: program has 3 ops — there is no op 99"), "{dbg}");
+        assert!(
+            dbg.contains("error: program has 3 ops — there is no op 99"),
+            "{dbg}"
+        );
     }
 
     #[test]
@@ -488,7 +530,10 @@ mod tests {
     fn absurd_set_growth_is_a_clean_error() {
         let (_, dbg) = script(
             "+",
-            &["set cell[1000000000000000000] = 1", "set ptr = 1000000000000000000"],
+            &[
+                "set cell[1000000000000000000] = 1",
+                "set ptr = 1000000000000000000",
+            ],
         );
         assert!(dbg.contains("error: failed to grow tape"), "{dbg}");
     }

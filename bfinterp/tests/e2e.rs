@@ -43,7 +43,12 @@ fn eof_leaves_the_cell_unchanged() {
 
 #[test]
 fn echo_stdin_until_eof() {
-    run("echo", ",[.[-],]", "echo, echo, echo\n", "echo, echo, echo\n");
+    run(
+        "echo",
+        ",[.[-],]",
+        "echo, echo, echo\n",
+        "echo, echo, echo\n",
+    );
 }
 
 #[test]
@@ -56,7 +61,12 @@ fn pointer_walks_past_the_initial_tape() {
 fn tape_growth_beyond_the_first_commit_granule() {
     // 200,000 cells — far past 30,000 (and past the native backend's first
     // 64 KiB commit; here it's plain Vec growth).
-    run("deep-tape", &format!("{}+.", ">".repeat(200_000)), "", "\x01");
+    run(
+        "deep-tape",
+        &format!("{}+.", ">".repeat(200_000)),
+        "",
+        "\x01",
+    );
 }
 
 #[test]
@@ -211,13 +221,21 @@ fn optimize_flag_agrees_with_the_naive_path() {
     // aid, not a behavior change.
     for (tag, source, stdin) in [
         ("hello", HELLO_WORLD, ""),
-        ("loops", "++++++[>+++++[>++++[>+++[>++[>++[>+<-]<-]<-]<-]<-]>>>>>>.", ""),
+        (
+            "loops",
+            "++++++[>+++++[>++++[>+++[>++[>++[>+<-]<-]<-]<-]<-]>>>>>>.",
+            "",
+        ),
         ("wrap", &"+".repeat(256), ""),
         ("echo", ",[.[-],]", "roundtrip"),
     ] {
         let naive = run_raw(tag, source, stdin, &[]);
         let optimized = run_raw_optimized(tag, source, stdin, &[]);
-        assert_eq!(naive.0.code(), optimized.0.code(), "{tag}: exit codes differ");
+        assert_eq!(
+            naive.0.code(),
+            optimized.0.code(),
+            "{tag}: exit codes differ"
+        );
         assert_eq!(naive.1, optimized.1, "{tag}: stdout differs");
         assert_eq!(naive.2, optimized.2, "{tag}: stderr differs");
     }
