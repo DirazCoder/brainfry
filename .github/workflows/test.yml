@@ -61,10 +61,7 @@ jobs:
           REPORT="coverage-${{ matrix.archive_name }}"
           cargo llvm-cov --release --workspace --all-targets \
             --target "${{ matrix.target }}" \
-            --json --output-path "$REPORT.json"
-          cargo llvm-cov report --release > "$REPORT-table.txt"
-          cargo llvm-cov report --release --text --show-missing-lines \
-            --output-path "$REPORT-details.txt"
+            --html --output-dir "$REPORT"
 
       - name: cargo clippy
         shell: bash
@@ -123,9 +120,6 @@ jobs:
         if: always()
         with:
           name: coverage-${{ matrix.archive_name }}
-          path: |
-            coverage-${{ matrix.archive_name }}.json
-            coverage-${{ matrix.archive_name }}-table.txt
-            coverage-${{ matrix.archive_name }}-details.txt
+          path: coverage-${{ matrix.archive_name }}/
           if-no-files-found: warn
           retention-days: 30
