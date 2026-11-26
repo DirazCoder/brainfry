@@ -120,6 +120,28 @@ fn main() -> ExitCode {
     let interactive = io::stdin().is_terminal();
     let stdin = io::stdin();
     let mut reader = io::BufReader::new(stdin.lock());
+    repl(
+        &mut dbg,
+        &mut reader,
+        interactive,
+        &mut prog_out,
+        &mut dbg_out,
+    );
+
+    let _ = prog_out.flush();
+    ExitCode::SUCCESS
+}
+
+/// The read/parse/dispatch loop, factored over trait objects so the
+/// read-error, blank-line, and prompt arms are unit-testable in-process —
+/// the same shape `bfrun`/`bfinterp` use for their stdio wrappers.
+fn repl(
+    dbg: &mut Debugger,
+    reader: &mut dyn BufRead,
+    interactive: bool,
+    prog_out: &mut dyn Write,
+    dbg_out: &mut dyn Write,
+) {
     loop {
         let mut line = String::new();
         match reader.read_line(&mut line) {
@@ -135,13 +157,10 @@ fn main() -> ExitCode {
             let _ = write!(dbg_out, "(bfdbg) ");
             let _ = dbg_out.flush();
         }
-        if dispatch(&mut dbg, line, &mut prog_out, &mut dbg_out) {
+        if dispatch(dbg, line, prog_out, dbg_out) {
             break;
         }
     }
-
-    let _ = prog_out.flush();
-    ExitCode::SUCCESS
 }
 
 /// Parses one input line into a command and executes it; true = quit.
@@ -219,4 +238,88 @@ fn parse_args(args: Vec<String>) -> Result<Parsed, String> {
         watch_specs,
         undo_limit,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bfc::parser;
+    use std::io::Cursor;
+
+    /// A reader whose every read fails — the stdin-is-broken arm, which a
+    /// real pipe can't be made to produce.
+    struct FailingRead;
+    impl io::Read for FailingRead {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::other("stdin went away"))
+        }
+    }
+    impl BufRead for FailingRead {
+        fn fill_buf(&mut self) -> io::Result<&[u8]> {
+            Err(io::Error::other("stdin went away"))
+        }
+        fn consume(&mut self, _: usize) {}
+    }
+
+    /// Drives one scripted session in-process: program stdout, debugger
+    /// stderr, executed step count.
+    fn session(source: &str, input: &str, interactive: bool) -> (Vec<u8>, String, u64) {
+        let ops = parser::parse(source).unwrap();
+        let mut dbg = Debugger::new(ops, source.to_string(), DEFAULT_UNDO_LIMIT);
+        let mut reader = Cursor::new(input.to_string());
+        let mut prog = Vec::new();
+        let mut dbg_out = Vec::new();
+        repl(&mut dbg, &mut reader, interactive, &mut prog, &mut dbg_out);
+        (
+            prog,
+            String::from_utf8_lossy(&dbg_out).into_owned(),
+            dbg.steps(),
+        )
+    }
+
+    #[test]
+    fn a_read_error_ends_the_session_without_a_panic() {
+        let ops = parser::parse("+.").unwrap();
+        let mut dbg = Debugger::new(ops, ".".into(), DEFAULT_UNDO_LIMIT);
+        let mut prog = Vec::new();
+        let mut dbg_out = Vec::new();
+        repl(
+            &mut dbg,
+            &mut FailingRead,
+            false,
+            &mut prog,
+            &mut dbg_out,
+        );
+        assert_eq!(dbg.steps(), 0);
+        assert!(prog.is_empty());
+        // read_line's error arm only needs fill_buf to fail; read/consume
+        // are trait plumbing it never reaches on that path, so drive both
+        // directly to pin their behavior.
+        let mut reader = FailingRead;
+        assert!(io::Read::read(&mut reader, &mut [0u8; 4]).is_err());
+        BufRead::consume(&mut reader, 0); // no-op, but must not panic
+    }
+
+    #[test]
+    fn blank_lines_are_skipped_and_commands_still_run() {
+        let (prog, dbg_out, steps) = session("+.", "\n\n   \nrun\nquit\n\n", false);
+        assert_eq!(prog, vec![1u8]);
+        assert_eq!(steps, 2);
+        assert!(!dbg_out.contains("(bfdbg)"), "{dbg_out}");
+    }
+
+    #[test]
+    fn eof_terminates_the_session_cleanly_without_quit() {
+        let (prog, _, steps) = session("+.", "run", false);
+        assert_eq!(prog, vec![1u8]);
+        assert_eq!(steps, 2);
+    }
+
+    #[test]
+    fn the_prompt_appears_only_in_interactive_sessions() {
+        let (_, prompted, _) = session("+.", "run\nquit\n", true);
+        assert!(prompted.contains("(bfdbg) "), "{prompted}");
+        let (_, piped, _) = session("+.", "run\nquit\n", false);
+        assert!(!piped.contains("(bfdbg)"), "{piped}");
+    }
 }

@@ -459,6 +459,25 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "JumpIfNonZero outside its own loop's recursion")]
+    fn a_lone_close_bracket_is_a_loud_invariant_failure() {
+        // emit_block only ever sees a JumpIfNonZero nested inside the
+        // recursion opened by its matching JumpIfZero; match_loops
+        // guarantees that pairing. Feeding it a bare close must panic
+        // loudly rather than silently emit unbalanced JS.
+        let mut out = String::new();
+        let ops = [Op::JumpIfNonZero { target: 0 }];
+        emit_block(&mut out, &ops, &[], 0, ops.len(), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "jump ops are consumed by emit_block's loop arm")]
+    fn emit_op_rejects_jump_ops_directly() {
+        let mut out = String::new();
+        emit_op(&mut out, &Op::JumpIfZero { target: 0 }, "");
+    }
+
+    #[test]
     fn ir_ops_lower_to_the_documented_statements() {
         let js = compiled("+-><.");
         assert!(js.contains("tape[ptr] += 1;"), "Add: {js}");

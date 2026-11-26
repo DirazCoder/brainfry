@@ -515,6 +515,25 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "JumpIfNonZero outside its own loop's recursion")]
+    fn a_lone_close_bracket_is_a_loud_invariant_failure() {
+        // emit_block only ever sees a JumpIfNonZero nested inside the
+        // recursion opened by its matching JumpIfZero; match_loops
+        // guarantees that pairing. Feeding it a bare close must panic
+        // loudly rather than silently emit unbalanced C.
+        let mut out = String::new();
+        let ops = [Op::JumpIfNonZero { target: 0 }];
+        emit_block(&mut out, &ops, &[], 0, ops.len(), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "jump ops are consumed by emit_block's loop arm")]
+    fn emit_op_rejects_jump_ops_directly() {
+        let mut out = String::new();
+        emit_op(&mut out, &Op::JumpIfZero { target: 0 }, "");
+    }
+
+    #[test]
     fn windows_text_mode_is_disabled_for_byte_exact_io() {
         // Windows C runtimes translate '\n' to CR LF in text mode — that
         // is the whole class of Windows e2e failures (hello world ending
@@ -537,16 +556,16 @@ mod tests {
             "stderr not binary: {c}"
         );
         // The shim runs before any byte can reach a stream — including
-        // the tape-allocation failure path — so it must open main.
+        // the tape-allocation failure path — so it must open main, ahead
+        // of the calloc that always follows.
         let main_body = c.split("int main(void)").nth(1).expect("main body");
         let shim_at = main_body
             .find("_setmode(_fileno(stdin), _O_BINARY);")
             .expect("shim in main");
-        let first_io_at = main_body
-            .find("fprintf(stderr")
-            .or_else(|| main_body.find("putchar"))
-            .expect("some stdio statement");
-        assert!(shim_at < first_io_at, "shim must precede all stdio: {c}");
+        let calloc_at = main_body
+            .find("tape = calloc")
+            .expect("tape allocation in main");
+        assert!(shim_at < calloc_at, "shim must precede all stdio: {c}");
     }
 
     #[test]

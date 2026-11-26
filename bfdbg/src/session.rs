@@ -78,11 +78,10 @@ pub fn execute_command(
             } else {
                 let mut done = 0;
                 let mut stop = Stop::Ran;
+                // No is_finished probe between iterations: step never
+                // returns Ran once finished — it returns Finished itself,
+                // and the not-Ran break below is what ends the walk.
                 for _ in 0..*n {
-                    if dbg.is_finished() {
-                        stop = Stop::Finished;
-                        break;
-                    }
                     stop = dbg.step(prog_out);
                     done += 1;
                     if !matches!(stop, Stop::Ran) {
@@ -408,5 +407,124 @@ mod tests {
         // The second run never happened: quit ended the script.
         assert_eq!(prog, vec![1u8]);
         assert!(!dbg.contains("program already finished"), "{dbg}");
+    }
+
+    #[test]
+    fn run_and_step_after_finish_explain_themselves() {
+        let (_, dbg) = script("+.", &["run", "run", "step"]);
+        assert!(
+            dbg.contains("program already finished — `back` rewinds, then `run` resumes"),
+            "{dbg}"
+        );
+        assert!(
+            dbg.contains("program already finished — `back` rewinds, then `step` resumes"),
+            "{dbg}"
+        );
+    }
+
+    #[test]
+    fn stepping_past_the_end_reports_the_finish() {
+        let (_, dbg) = script("+.", &["step 5"]);
+        assert!(dbg.contains("stepped 2 op(s)"), "{dbg}");
+        assert!(dbg.contains("program finished — 2 steps executed"), "{dbg}");
+    }
+
+    #[test]
+    fn back_at_the_start_says_nothing_to_rewind() {
+        let (_, dbg) = script("+", &["back"]);
+        assert!(
+            dbg.contains("nothing to rewind — this is the earliest state the undo log remembers"),
+            "{dbg}"
+        );
+    }
+
+    #[test]
+    fn bare_break_lists_the_breakpoints_or_their_absence() {
+        let (_, dbg) = script("++.", &["break"]);
+        assert!(dbg.contains("no breakpoints"), "{dbg}");
+
+        let (_, dbg) = script("++.", &["break 1", "break"]);
+        assert!(dbg.contains("breakpoints:"), "{dbg}");
+        assert!(dbg.contains("op 2/3 (line 1, col 2)"), "{dbg}");
+    }
+
+    #[test]
+    fn clear_reports_cleared_missing_and_bad_specs() {
+        let (_, dbg) = script("++.", &["break 1", "clear 1", "clear 1", "clear 99"]);
+        assert!(dbg.contains("cleared breakpoint at op 2/3"), "{dbg}");
+        assert!(dbg.contains("no breakpoint at op 2/3"), "{dbg}");
+        assert!(dbg.contains("error: program has 3 ops — there is no op 99"), "{dbg}");
+    }
+
+    #[test]
+    fn watch_unwatch_and_the_listing_render() {
+        let (_, dbg) = script("+", &["watch"]);
+        assert!(dbg.contains("no watchpoints"), "{dbg}");
+
+        let (_, dbg) = script("+", &["watch ptr 2", "watch cell 1", "watch"]);
+        assert!(dbg.contains("watchpoints:"), "{dbg}");
+        assert!(dbg.contains("ptr == 2"), "{dbg}");
+        assert!(dbg.contains("cell 1 (value changes)"), "{dbg}");
+
+        // Only one watchpoint set: the other listing slot renders nothing.
+        let (_, dbg) = script("+", &["watch ptr 2", "watch"]);
+        assert!(dbg.contains("ptr == 2"), "{dbg}");
+        assert!(!dbg.contains("(value changes)"), "{dbg}");
+
+        let (_, dbg) = script("+", &["watch cell 1", "watch"]);
+        assert!(dbg.contains("cell 1 (value changes)"), "{dbg}");
+        assert!(!dbg.contains("ptr =="), "{dbg}");
+
+        let (_, dbg) = script("+", &["watch ptr 2", "unwatch ptr", "unwatch ptr"]);
+        assert!(dbg.contains("ptr watchpoint cleared"), "{dbg}");
+        assert!(dbg.contains("no ptr watchpoint was set"), "{dbg}");
+
+        let (_, dbg) = script("+", &["watch cell 1", "unwatch cell", "unwatch cell"]);
+        assert!(dbg.contains("cell watchpoint cleared"), "{dbg}");
+        assert!(dbg.contains("no cell watchpoint was set"), "{dbg}");
+    }
+
+    #[test]
+    fn absurd_set_growth_is_a_clean_error() {
+        let (_, dbg) = script(
+            "+",
+            &["set cell[1000000000000000000] = 1", "set ptr = 1000000000000000000"],
+        );
+        assert!(dbg.contains("error: failed to grow tape"), "{dbg}");
+    }
+
+    #[test]
+    fn stop_line_renders_the_plain_ran_stop() {
+        // `run`/`step` never surface Stop::Ran themselves, so the arm is
+        // driven directly — it is the wording `step` would need if it ever
+        // stopped for something that wasn't a stop.
+        let ops = parser::parse("+.").unwrap();
+        let dbg = Debugger::new(ops, "+.".into(), DEFAULT_UNDO_LIMIT);
+        assert_eq!(stop_line(&dbg, &Stop::Ran), "ran one op");
+    }
+
+    #[test]
+    fn breakpoint_listing_handles_ops_without_a_source_position() {
+        // A hand-built debugger (optimized-style ops) has no srcmap
+        // entries, so the listing falls back to `--` instead of panicking.
+        use bfformat::Op;
+        let mut dbg = Debugger::new(vec![Op::Zero], "z".into(), DEFAULT_UNDO_LIMIT);
+        let mut prog = Vec::new();
+        let mut dbg_out = Vec::new();
+        execute_command(
+            &mut dbg,
+            &parse_command("break 0").unwrap(),
+            &mut prog,
+            &mut dbg_out,
+        );
+        execute_command(
+            &mut dbg,
+            &parse_command("break").unwrap(),
+            &mut prog,
+            &mut dbg_out,
+        );
+        let out = String::from_utf8_lossy(&dbg_out).into_owned();
+        assert!(out.contains("breakpoints:"), "{out}");
+        assert!(out.contains("op 1/1 (--)\n"), "{out}");
     }
 }

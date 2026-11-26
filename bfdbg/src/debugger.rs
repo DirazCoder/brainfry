@@ -1295,4 +1295,306 @@ mod tests {
         assert!(parse_command("frobnicate").is_err());
         assert!(parse_command("clear").is_err());
     }
+
+    #[test]
+    fn parse_command_rejects_the_remaining_bad_shapes() {
+        // Blank and empty input never reaches the parser from the REPL
+        // (it skips blank lines first), so the arms are exercised here.
+        assert_eq!(parse_command("").unwrap_err(), "empty command");
+        assert_eq!(parse_command("   ").unwrap_err(), "empty command");
+        assert!(parse_command("step x")
+            .unwrap_err()
+            .contains("step count must be a non-negative integer"));
+        assert!(parse_command("tape z").unwrap_err().contains("tape center"));
+        assert!(parse_command("list z").unwrap_err().contains("list context lines"));
+        assert!(parse_command("back z").unwrap_err().contains("back count"));
+        // clear with a spec parses; unwatch cell parses; unwatch garbage doesn't.
+        assert_eq!(
+            parse_command("clear 2"),
+            Ok(Command::Clear(BreakSpec::Op(2)))
+        );
+        assert_eq!(parse_command("clear @2"), Ok(Command::Clear(BreakSpec::Line(2, None))));
+        assert_eq!(parse_command("unwatch cell"), Ok(Command::Unwatch(Which::Cell)));
+        assert!(parse_command("unwatch bogus")
+            .unwrap_err()
+            .contains("unwatch what? \"bogus\""));
+        assert!(parse_command("watch ptr")
+            .unwrap_err()
+            .contains("watch needs a cell number: watch ptr 42"));
+        assert_eq!(
+            parse_command("feed").unwrap_err(),
+            "feed needs byte values: feed 65 10"
+        );
+        assert!(parse_command("break @x")
+            .unwrap_err()
+            .contains("@line must be a positive integer"));
+        assert!(parse_command("break @3:0")
+            .unwrap_err()
+            .contains("columns are 1-based — :0 is not a column"));
+        assert!(parse_command("break abc")
+            .unwrap_err()
+            .contains("bad breakpoint spec \"abc\""));
+        // set: every usage shape, both spellings.
+        assert!(parse_command("set").unwrap_err().contains("usage: set"));
+        assert!(parse_command("set ptr 3").unwrap_err().contains("usage: set"));
+        assert!(parse_command("set ptr = x")
+            .unwrap_err()
+            .contains("ptr must be a non-negative integer"));
+        assert!(parse_command("set cell x = 5")
+            .unwrap_err()
+            .contains("cell index must be a non-negative integer"));
+        assert!(parse_command("set cell 3 5").unwrap_err().contains("usage: set"));
+        assert!(parse_command("set cell 3 = 300")
+            .unwrap_err()
+            .contains("cell values are 0..=255, got \"300\""));
+        assert!(parse_command("set foo = 1").unwrap_err().contains("usage: set"));
+        // An index too big for usize also fails the bracketed parse and
+        // falls back to the usage error.
+        assert!(parse_command("set cell[99999999999999999999] = 1")
+            .unwrap_err()
+            .contains("usage: set"));
+    }
+
+    #[test]
+    fn resolve_break_reports_a_missing_line_col() {
+        let d = dbg_for("++\n--");
+        assert_eq!(
+            d.resolve_break(&BreakSpec::Line(2, Some(9))),
+            Err("no instruction at line 2, col 9".to_string())
+        );
+    }
+
+    // ---- step/run edge arms ----
+
+    #[test]
+    fn step_and_run_after_the_end_report_finished_again() {
+        let mut d = dbg_for("+.");
+        let mut out = Vec::new();
+        d.run(&mut out);
+        assert_eq!(d.step(&mut out), Stop::Finished);
+        assert_eq!(d.run(&mut out), Stop::Finished);
+    }
+
+    #[test]
+    fn watchpoints_fire_during_step_too() {
+        let mut d = dbg_for(">>>");
+        d.set_watch_ptr(1);
+        let mut out = Vec::new();
+        assert_eq!(d.step(&mut out), Stop::WatchPtr(1));
+        // A cell watch fires on the change itself, mid-step.
+        let mut d = dbg_for("+");
+        d.set_watch_cell(0);
+        let mut out = Vec::new();
+        assert_eq!(
+            d.step(&mut out),
+            Stop::WatchCell { cell: 0, from: 0, to: 1 }
+        );
+    }
+
+    // ---- program-output I/O failures ----
+
+    /// Every write fails — the `.` arm's write error path.
+    struct FailingWrite;
+    impl std::io::Write for FailingWrite {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("stdout broke"))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::other("stdout broke"))
+        }
+    }
+
+    /// Writes succeed but the flush fails — the `.` arm's flush path.
+    struct Unflushable;
+    impl std::io::Write for Unflushable {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::other("flush refused"))
+        }
+    }
+
+    #[test]
+    fn output_write_and_flush_failures_are_clean_errors() {
+        let ops = parser::parse(".").unwrap();
+        let mut d = Debugger::new(ops, ".".into(), DEFAULT_UNDO_LIMIT);
+        assert!(matches!(d.step(&mut FailingWrite),
+            Stop::Errored(m) if m.starts_with("I/O error:")));
+        // write_all's failure aborts the `.` op before its flush, so the
+        // flush arm is driven directly — the same Err shape the op's flush
+        // path needs when it is the one that fails.
+        assert!(FailingWrite.flush().is_err());
+
+        let ops = parser::parse(".").unwrap();
+        let mut d = Debugger::new(ops, ".".into(), DEFAULT_UNDO_LIMIT);
+        assert!(matches!(d.step(&mut Unflushable),
+            Stop::Errored(m) if m.starts_with("I/O error:")));
+        // The failed op stayed un-counted and rewinds like any other.
+        assert_eq!(d.back(1), 1);
+    }
+
+    // ---- optimized ops (hand-built: raw parses never produce them) ----
+
+    #[test]
+    fn zero_and_muladd_execute_like_bfinterp() {
+        // Zero clears the cell in one op.
+        let mut d = Debugger::new(vec![Op::Zero], "z".into(), DEFAULT_UNDO_LIMIT);
+        d.set_cell(0, 7).unwrap();
+        // One op in the program: executing it is also finishing it.
+        assert_eq!(d.step(&mut Vec::new()), Stop::Finished);
+        assert_eq!(d.cell_at(0), 0);
+
+        // MulAdd on a zero cell is guarded away entirely.
+        let mut d = Debugger::new(
+            vec![Op::MulAdd { offset: 1, factor: 2 }],
+            "z".into(),
+            DEFAULT_UNDO_LIMIT,
+        );
+        assert_eq!(d.step(&mut Vec::new()), Stop::Finished);
+        assert_eq!(d.cell_at(1), 0);
+
+        // MulAdd on a non-zero cell, target in bounds.
+        let mut d = Debugger::new(
+            vec![Op::MulAdd { offset: 1, factor: 3 }],
+            "z".into(),
+            DEFAULT_UNDO_LIMIT,
+        );
+        d.set_cell(0, 5).unwrap();
+        assert_eq!(d.step(&mut Vec::new()), Stop::Finished);
+        assert_eq!(d.cell_at(1), 15);
+
+        // A target past the end grows the tape to exactly it.
+        let mut d = Debugger::new(
+            vec![Op::MulAdd { offset: 30_000, factor: 1 }],
+            "z".into(),
+            DEFAULT_UNDO_LIMIT,
+        );
+        d.set_cell(0, 9).unwrap();
+        assert_eq!(d.step(&mut Vec::new()), Stop::Finished);
+        assert_eq!(d.tape_len(), 30_001);
+        assert_eq!(d.cell_at(30_000), 9);
+
+        // A negative offset off cell 0 underflows with the shared wording.
+        let mut d = Debugger::new(
+            vec![Op::MulAdd { offset: -1, factor: 1 }],
+            "z".into(),
+            DEFAULT_UNDO_LIMIT,
+        );
+        d.set_cell(0, 1).unwrap();
+        assert!(matches!(d.step(&mut Vec::new()),
+            Stop::Errored(m) if m == "pointer moved left of cell 0"));
+    }
+
+    #[test]
+    fn scan_ops_execute_like_bfinterp() {
+        // Scan on a zero cell doesn't move at all.
+        let mut d = Debugger::new(vec![Op::Scan { stride: 1 }], "z".into(), DEFAULT_UNDO_LIMIT);
+        assert_eq!(d.step(&mut Vec::new()), Stop::Finished);
+        assert!(d.info().contains("machine: ptr 0,"), "{}", d.info());
+
+        // Scan walks the stride over non-zero cells onto the first zero.
+        let mut d = Debugger::new(vec![Op::Scan { stride: 2 }], "z".into(), DEFAULT_UNDO_LIMIT);
+        d.set_cell(0, 1).unwrap();
+        d.set_cell(2, 1).unwrap();
+        assert_eq!(d.step(&mut Vec::new()), Stop::Finished);
+        assert!(d.info().contains("machine: ptr 4, tape 30000 cells"), "{}", d.info());
+
+        // A stride that lands past the end grows onto the zero tail.
+        let mut d = Debugger::new(vec![Op::Scan { stride: 30_000 }], "z".into(), DEFAULT_UNDO_LIMIT);
+        d.set_cell(0, 1).unwrap();
+        assert_eq!(d.step(&mut Vec::new()), Stop::Finished);
+        assert_eq!(d.tape_len(), 30_001);
+        assert!(d.info().contains("machine: ptr 30000,"), "{}", d.info());
+
+        // A negative stride off cell 0 underflows with the shared wording.
+        let mut d = Debugger::new(vec![Op::Scan { stride: -1 }], "z".into(), DEFAULT_UNDO_LIMIT);
+        d.set_cell(0, 1).unwrap();
+        assert!(matches!(d.step(&mut Vec::new()),
+            Stop::Errored(m) if m == "pointer moved left of cell 0"));
+    }
+
+    #[test]
+    fn absurd_growth_fails_cleanly() {
+        let mut d = dbg_for("+");
+        assert_eq!(
+            d.set_cell(1_000_000_000_000_000_000, 1).unwrap_err(),
+            "failed to grow tape"
+        );
+        assert_eq!(
+            d.set_ptr(1_000_000_000_000_000_000).unwrap_err(),
+            "failed to grow tape"
+        );
+    }
+
+    // ---- views ----
+
+    #[test]
+    fn source_view_flags_the_op_that_errored() {
+        let mut d = dbg_for("<");
+        let mut out = Vec::new();
+        assert!(matches!(d.run(&mut out), Stop::Errored(_)));
+        let view = d.source_view(0);
+        assert!(view.contains("this op failed last time"), "{view}");
+        assert!(view.contains("`back` rewinds it, `set` patches state"), "{view}");
+    }
+
+    #[test]
+    fn info_reports_error_state_and_undo_truncation() {
+        let mut d = dbg_for("<");
+        let mut out = Vec::new();
+        assert!(matches!(d.run(&mut out), Stop::Errored(_)));
+        let info = d.info();
+        assert!(
+            info.contains("errored — runtime error: pointer moved left of cell 0"),
+            "{info}"
+        );
+
+        let ops = parser::parse("+++++").unwrap();
+        let mut d = Debugger::new(ops, "+++++".into(), 3);
+        d.run(&mut Vec::new());
+        let info = d.info();
+        assert!(
+            info.contains("undo history hit its limit — oldest steps were dropped"),
+            "{info}"
+        );
+    }
+
+    #[test]
+    fn op_labels_cover_every_variant() {
+        let ops = [
+            Op::Add(1),
+            Op::Sub(1),
+            Op::MoveRight(1),
+            Op::MoveLeft(1),
+            Op::Output,
+            Op::Input,
+            Op::JumpIfZero { target: 0 },
+            Op::JumpIfNonZero { target: 0 },
+            Op::Zero,
+            Op::MulAdd { offset: 2, factor: 3 },
+            Op::Scan { stride: 1 },
+        ];
+        let mut d = Debugger::new(ops.to_vec(), "z".into(), DEFAULT_UNDO_LIMIT);
+        for (i, want) in [
+            "Add(1)",
+            "Sub(1)",
+            "MoveRight(1)",
+            "MoveLeft(1)",
+            "Output",
+            "Input",
+            "JumpIfZero",
+            "JumpIfNonZero",
+            "Zero",
+            "MulAdd(2, 3)",
+            "Scan(1)",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(d.op_label(i), want, "label {i}");
+        }
+        // Past the end there is no op at all.
+        assert_eq!(d.op_label(ops.len()), "(no op)");
+    }
 }
