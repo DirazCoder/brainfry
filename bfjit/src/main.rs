@@ -28,23 +28,8 @@ mod exec;
 mod host;
 mod patch;
 
-// The machine-code layer, reused verbatim from bfnative. `#[path]`
-// compiles bfnative's codegen source *into this crate* — one source of
-// truth, zero modifications to the bfnative crate itself. Its internal
-// `crate::target` / `crate::codegen` references resolve against the
-// modules declared here, so the tree shape matches what bfnative builds.
-//
-// `allow(dead_code)`: bfnative's own binary uses target names, the
-// all-targets table, and listing spans; the JIT path doesn't, and the
-// warning would point into bfnative's files, which must not be edited.
-#[path = "../../bfnative/src/codegen/mod.rs"]
-#[allow(dead_code)]
-mod codegen;
-#[path = "../../bfnative/src/target.rs"]
-#[allow(dead_code)]
-mod target;
-
 use bfc::{optimize, parser};
+use bfnative::{codegen, target};
 use std::env;
 use std::fs;
 use std::process::ExitCode;
@@ -78,11 +63,7 @@ executable.";
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
 
-    if args
-        .iter()
-        .skip(1)
-        .any(|arg| arg == "-h" || arg == "--help")
-    {
+    if has_help_flag(&args) {
         println!("{USAGE}");
         return ExitCode::SUCCESS;
     }
@@ -131,24 +112,13 @@ fn main() -> ExitCode {
     // GOT/IAT (macOS/Windows only) 16-aligned after that. 16-alignment
     // satisfies every constraint in the patcher (ARM64 ADRP+LDR wants
     // 8-byte-aligned slots; 16 covers it).
-    let code_len = module.code.len();
-    let rodata_off = align_up(code_len, 16);
-    let rodata_end = rodata_off + module.rodata.len();
-    let got_count = host::got_slots(target.os).len();
-    let got_off = if got_count > 0 {
-        align_up(rodata_end, 16)
-    } else {
-        0
-    };
-    let total = if got_count > 0 {
-        got_off + 8 * got_count
-    } else {
-        rodata_end
-    };
+    let got_slots = host::got_slots(target.os);
+    let got_count = got_slots.len();
+    let image_layout = image_layout(module.code.len(), module.rodata.len(), got_count);
 
     // Map first (writable, non-executable), then resolve fixups against
     // the region's real address, then copy.
-    let region = match unsafe { exec::JitRegion::alloc(total) } {
+    let region = match unsafe { exec::JitRegion::alloc(image_layout.total) } {
         Ok(region) => region,
         Err(message) => {
             eprintln!("bfjit: {message}");
@@ -158,12 +128,10 @@ fn main() -> ExitCode {
 
     let layout = patch::Layout {
         code_vaddr: region.base as u64,
-        rodata_vaddr: region.base as u64 + rodata_off as u64,
-        got_vaddr: if got_count > 0 {
-            region.base as u64 + got_off as u64
-        } else {
-            0
-        },
+        rodata_vaddr: region.base as u64 + image_layout.rodata_off as u64,
+        got_vaddr: image_layout
+            .got_off
+            .map_or(0, |off| region.base as u64 + off as u64),
     };
 
     if let Err(message) = patch::patch(&mut module, &layout) {
@@ -175,9 +143,11 @@ fn main() -> ExitCode {
         // Writable phase: code, read-only data, and the "dynamic link"
         // table all go in before the W^X flip.
         region.write_bytes(0, &module.code);
-        region.write_bytes(rodata_off, &module.rodata);
-        for (i, function) in host::got_slots(target.os).iter().enumerate() {
-            region.write_u64(got_off + 8 * i, *function as u64);
+        region.write_bytes(image_layout.rodata_off, &module.rodata);
+        if let Some(got_off) = image_layout.got_off {
+            for (i, function) in got_slots.iter().enumerate() {
+                region.write_u64(got_off + 8 * i, *function as u64);
+            }
         }
 
         if let Err(message) = region.make_executable() {
@@ -201,6 +171,32 @@ fn main() -> ExitCode {
         // I/O, so nothing after this line executes.
         region.enter()
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ImageLayout {
+    rodata_off: usize,
+    got_off: Option<usize>,
+    total: usize,
+}
+
+fn image_layout(code_len: usize, rodata_len: usize, got_count: usize) -> ImageLayout {
+    let rodata_off = align_up(code_len, 16);
+    let rodata_end = rodata_off + rodata_len;
+    let got_off = (got_count > 0).then(|| align_up(rodata_end, 16));
+    let total = got_off.map_or(rodata_end, |off| off + 8 * got_count);
+
+    ImageLayout {
+        rodata_off,
+        got_off,
+        total,
+    }
+}
+
+fn has_help_flag(args: &[String]) -> bool {
+    args.iter()
+        .skip(1)
+        .any(|arg| arg == "-h" || arg == "--help")
 }
 
 /// Accepts exactly one input path. `--target` (and anything else that
@@ -291,5 +287,36 @@ mod tests {
         assert_eq!(align_up(16, 16), 16);
         assert_eq!(align_up(17, 16), 32);
         assert_eq!(align_up(33, 16), 48);
+    }
+
+    #[test]
+    fn help_flag_is_recognized_after_the_program_name() {
+        assert!(has_help_flag(&["bfjit".to_string(), "--help".to_string()]));
+        assert!(has_help_flag(&["bfjit".to_string(), "-h".to_string()]));
+        assert!(!has_help_flag(&["--help".to_string()]));
+        assert!(!has_help_flag(&[
+            "bfjit".to_string(),
+            "program.bf".to_string()
+        ]));
+    }
+
+    #[test]
+    fn image_layout_handles_images_with_and_without_got_slots() {
+        assert_eq!(
+            image_layout(101, 3, 0),
+            ImageLayout {
+                rodata_off: 112,
+                got_off: None,
+                total: 115,
+            }
+        );
+        assert_eq!(
+            image_layout(101, 3, 2),
+            ImageLayout {
+                rodata_off: 112,
+                got_off: Some(128),
+                total: 144,
+            }
+        );
     }
 }

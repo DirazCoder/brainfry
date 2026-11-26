@@ -406,6 +406,22 @@ mod tests {
             Op::MoveLeft(4096),
             Op::MoveLeft(u32::MAX),
             Op::MulAdd {
+                offset: 4095,
+                factor: 2,
+            },
+            Op::MulAdd {
+                offset: -4095,
+                factor: 2,
+            },
+            Op::MulAdd {
+                offset: 4096,
+                factor: 2,
+            },
+            Op::MulAdd {
+                offset: -4096,
+                factor: 2,
+            },
+            Op::MulAdd {
                 offset: i32::MAX,
                 factor: 2,
             },
@@ -413,6 +429,10 @@ mod tests {
                 offset: i32::MIN,
                 factor: 2,
             },
+            Op::Scan { stride: 4095 },
+            Op::Scan { stride: -4095 },
+            Op::Scan { stride: 4096 },
+            Op::Scan { stride: -4096 },
             Op::Scan { stride: i32::MAX },
             Op::Scan { stride: i32::MIN },
         ];

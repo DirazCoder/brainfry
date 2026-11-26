@@ -380,6 +380,11 @@ mod tests {
     }
 
     #[test]
+    fn folds_a_sub_run_at_the_end_of_the_input() {
+        assert_eq!(fold_runs(&[Op::Sub(1), Op::Sub(1)]), vec![Op::Sub(2)]);
+    }
+
+    #[test]
     fn splits_runs_over_255() {
         let ops = vec![Op::Add(1); 300];
         let folded = fold_runs(&ops);

@@ -1,10 +1,9 @@
-mod codegen;
 mod listing;
 mod obj;
 mod sha256;
-mod target;
 
 use bfc::{optimize, parser};
+use bfnative::{codegen, target};
 use std::env;
 use std::fs;
 use std::path::Path;

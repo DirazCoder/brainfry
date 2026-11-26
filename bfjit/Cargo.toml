@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 bfformat = { path = "../bfformat" }
 bfc = { path = "../bfc" }
+bfnative = { path = "../bfnative" }
 
 [lints.rust]
 # `coverage` and `coverage_nightly` are set by cargo-llvm-cov when this

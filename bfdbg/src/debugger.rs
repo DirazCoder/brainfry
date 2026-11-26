@@ -1060,6 +1060,7 @@ mod tests {
         d.step(&mut out);
         assert!(!d.undo_enabled());
         assert_eq!(d.back(1), 0);
+        assert!(d.info().contains("disabled (--undo-limit 0)"));
     }
 
     #[test]
@@ -1489,8 +1490,9 @@ mod tests {
     fn output_write_and_flush_failures_are_clean_errors() {
         let ops = parser::parse(".").unwrap();
         let mut d = Debugger::new(ops, ".".into(), DEFAULT_UNDO_LIMIT);
-        assert!(matches!(d.step(&mut FailingWrite),
-            Stop::Errored(m) if m.starts_with("I/O error:")));
+        assert!(
+            matches!(d.step(&mut FailingWrite), Stop::Errored(m) if m.starts_with("I/O error:"))
+        );
         // write_all's failure aborts the `.` op before its flush, so the
         // flush arm is driven directly — the same Err shape the op's flush
         // path needs when it is the one that fails.
@@ -1498,8 +1500,9 @@ mod tests {
 
         let ops = parser::parse(".").unwrap();
         let mut d = Debugger::new(ops, ".".into(), DEFAULT_UNDO_LIMIT);
-        assert!(matches!(d.step(&mut Unflushable),
-            Stop::Errored(m) if m.starts_with("I/O error:")));
+        assert!(
+            matches!(d.step(&mut Unflushable), Stop::Errored(m) if m.starts_with("I/O error:"))
+        );
         // The failed op stayed un-counted and rewinds like any other.
         assert_eq!(d.back(1), 1);
     }
@@ -1564,8 +1567,9 @@ mod tests {
             DEFAULT_UNDO_LIMIT,
         );
         d.set_cell(0, 1).unwrap();
-        assert!(matches!(d.step(&mut Vec::new()),
-            Stop::Errored(m) if m == "pointer moved left of cell 0"));
+        assert!(
+            matches!(d.step(&mut Vec::new()), Stop::Errored(m) if m == "pointer moved left of cell 0")
+        );
     }
 
     #[test]
@@ -1604,8 +1608,9 @@ mod tests {
             DEFAULT_UNDO_LIMIT,
         );
         d.set_cell(0, 1).unwrap();
-        assert!(matches!(d.step(&mut Vec::new()),
-            Stop::Errored(m) if m == "pointer moved left of cell 0"));
+        assert!(
+            matches!(d.step(&mut Vec::new()), Stop::Errored(m) if m == "pointer moved left of cell 0")
+        );
     }
 
     #[test]

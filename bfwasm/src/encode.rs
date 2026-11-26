@@ -90,6 +90,13 @@ mod tests {
     }
 
     #[test]
+    fn sleb_positive_value_with_sign_bit_set_gets_a_terminating_byte() {
+        let mut out = Vec::new();
+        sleb(&mut out, 64);
+        assert_eq!(out, vec![0xc0, 0x00]);
+    }
+
+    #[test]
     fn sleb_matches_spec_example() {
         // -123456, same worked example set as the ULEB128 test above.
         let mut out = Vec::new();

@@ -494,6 +494,25 @@ mod tests {
     }
 
     #[test]
+    fn back_reports_when_the_undo_log_is_disabled() {
+        let ops = parser::parse("+").unwrap();
+        let mut dbg = Debugger::new(ops, "+".into(), 0);
+        let mut prog_out = Vec::new();
+        let mut dbg_out = Vec::new();
+
+        assert!(!execute_command(
+            &mut dbg,
+            &parse_command("back").unwrap(),
+            &mut prog_out,
+            &mut dbg_out
+        ));
+        assert_eq!(
+            String::from_utf8(dbg_out).unwrap(),
+            "undo log disabled (--undo-limit 0) — `back` is unavailable\n"
+        );
+    }
+
+    #[test]
     fn bare_break_lists_the_breakpoints_or_their_absence() {
         let (_, dbg) = script("++.", &["break"]);
         assert!(dbg.contains("no breakpoints"), "{dbg}");

@@ -294,7 +294,8 @@ mod tests {
         let optimized = bfc::optimize::optimize(raw.clone());
         let (naive_out, naive_res) = interp(&raw, "");
         let (opt_out, opt_res) = interp(&optimized, "");
-        assert!(naive_res.is_ok() && opt_res.is_ok());
+        naive_res.expect("naive interpreter should succeed");
+        opt_res.expect("optimized interpreter should succeed");
         assert_eq!(naive_out, opt_out);
     }
 
