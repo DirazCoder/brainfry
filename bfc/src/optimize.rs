@@ -155,6 +155,11 @@ fn fold_zero_loops(ops: Vec<Op>) -> Vec<Op> {
 ///   - every other touched cell only receives Add, never Sub (this pass
 ///     only handles the "spread value into other cells" case, not general
 ///     arithmetic loops)
+///   - every cell the body lands on is a cell it actually adds to: a move
+///     that touches down and leaves without writing ([<>-]'s round trip
+///     through cell -1, [->>+<<]'s hop to cell 2) still has to be
+///     bounds-checked on every real iteration, and a folded MulAdd/Zero
+///     body can't perform that excursion -- so such loops stay real
 ///   - no Output, Input, or nested Jump in the body -- collapsing the loop
 ///     would change how many times a side effect fires, which is a
 ///     behavior change, not just a speed one
@@ -224,10 +229,32 @@ fn find_offset_add_loop(ops: &[Op], start: usize) -> Option<(usize, Vec<(i32, u8
             }
             Op::MoveRight(n) => {
                 pos += *n as i64;
+                // The landing cell is touched even when nothing is ever
+                // added to it. A loop like [<>-] round-trips through cell
+                // -1 without writing: if only Add/Sub landings were
+                // recorded, that excursion stayed invisible, every
+                // structural check below passed, and the body folded to a
+                // plain Zero -- dropping the underflow the real MoveLeft
+                // raises on every iteration. Recording the touchdown
+                // leaves a delta-0 entry, which the `*delta <= 0` filter
+                // rejects, so the loop stays real and its bounds check
+                // still fires.
+                //
+                // fold_runs has already merged same-direction moves, so
+                // this records exactly the cells a real MoveRight /
+                // MoveLeft bounds-checks: each move's landing cell. The
+                // cells a multi-cell stride passes over never get
+                // checked by the real ops either (the check lands on the
+                // destination), so not recording them matches runtime
+                // semantics rather than being an approximation.
+                cell_delta.entry(pos).or_insert(0);
                 i += 1;
             }
             Op::MoveLeft(n) => {
                 pos -= *n as i64;
+                // Same touchdown rule as MoveRight: a landing without a
+                // write must still count as a visited cell.
+                cell_delta.entry(pos).or_insert(0);
                 i += 1;
             }
             Op::JumpIfNonZero { .. } => break,
@@ -613,6 +640,93 @@ mod tests {
         ];
         let folded = fold_offset_adds(ops.clone());
         assert_eq!(folded, ops);
+    }
+
+    #[test]
+    fn does_not_fold_loop_whose_moves_touch_an_untouched_cell() {
+        // [<>-]: the body walks to cell -1 and back without ever writing
+        // it. Only the Sub lands in cell_delta, so with write-only
+        // recording every structural check passed and the loop folded to a
+        // plain Zero -- silently dropping the left-of-cell-0 excursion the
+        // real loop performs on every iteration. The touchdown recording
+        // leaves a delta-0 entry at -1, which the `*delta <= 0` filter
+        // rejects: the loop stays real and the runtime bounds check fires.
+        let ops = vec![
+            Op::JumpIfZero { target: 0 },
+            Op::MoveLeft(1),
+            Op::MoveRight(1),
+            Op::Sub(1),
+            Op::JumpIfNonZero { target: 0 },
+        ];
+        let folded = fold_offset_adds(ops.clone());
+        assert_eq!(folded, ops);
+    }
+
+    #[test]
+    fn does_not_fold_loop_with_untouched_excursion_after_the_decrement() {
+        // [-<>]: same excursion, after the decrement instead of before.
+        // Also diverges when folded to Zero: entering with a nonzero cell,
+        // the real body decrements then dies on the MoveLeft.
+        let ops = vec![
+            Op::JumpIfZero { target: 0 },
+            Op::Sub(1),
+            Op::MoveLeft(1),
+            Op::MoveRight(1),
+            Op::JumpIfNonZero { target: 0 },
+        ];
+        let folded = fold_offset_adds(ops.clone());
+        assert_eq!(folded, ops);
+    }
+
+    #[test]
+    fn does_not_fold_loop_with_a_multi_cell_untouched_excursion() {
+        // [->>+<<]: fold_runs merges the hops, so what gets recorded is
+        // the landing cell two to the right. A rightward excursion still
+        // has to run for real -- a huge landing cell forces a tape grow
+        // that can fail -- so it can't be folded away either.
+        let ops = vec![
+            Op::JumpIfZero { target: 0 },
+            Op::Sub(1),
+            Op::MoveRight(2),
+            Op::MoveLeft(2),
+            Op::JumpIfNonZero { target: 0 },
+        ];
+        let folded = fold_offset_adds(ops.clone());
+        assert_eq!(folded, ops);
+    }
+
+    #[test]
+    fn folds_offset_add_across_multi_cell_hops() {
+        // [->>+>+<<<]: the hops land on cells 2 and 3 and both get a real
+        // Add, so the fold still applies -- recording touchdowns must not
+        // over-reject loops whose every landing cell is written. Compare
+        // does_not_fold_loop_with_a_multi_cell_untouched_excursion, which
+        // is this shape minus the writes.
+        let ops = vec![
+            Op::JumpIfZero { target: 0 },
+            Op::Sub(1),
+            Op::MoveRight(2),
+            Op::Add(1),
+            Op::MoveRight(1),
+            Op::Add(1),
+            Op::MoveLeft(3),
+            Op::JumpIfNonZero { target: 0 },
+        ];
+        let folded = fold_offset_adds(ops);
+        assert_eq!(
+            folded,
+            vec![
+                Op::MulAdd {
+                    offset: 2,
+                    factor: 1
+                },
+                Op::MulAdd {
+                    offset: 3,
+                    factor: 1
+                },
+                Op::Zero,
+            ]
+        );
     }
 
     #[test]

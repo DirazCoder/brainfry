@@ -107,6 +107,26 @@ fn huge_left_move_is_caught_not_wrapped() {
 }
 
 #[test]
+fn untouched_excursion_in_an_offset_add_candidate_loop_still_underflows() {
+    // +[<>-] and +[-<>]: the loop body visits cell -1 without ever writing
+    // it. The naive path dies on the MoveLeft; the optimizer used to fold
+    // exactly these shapes to a plain Zero (only written cells were
+    // tracked, so every structural check passed), silently swallowing the
+    // underflow. The fold is rejected now, so the optimized path must
+    // error identically, with bfrun's exact message.
+    for (tag, source) in [("excursion-lead", "+[<>-]"), ("excursion-trail", "+[-<>]")] {
+        let (code, stdout, stderr) = run_raw_optimized(tag, source, "", &[]);
+        assert_eq!(stdout, b"", "{tag}");
+        assert_eq!(code.code(), Some(1), "{tag}");
+        assert_eq!(
+            String::from_utf8_lossy(&stderr),
+            "runtime error: pointer moved left of cell 0\n",
+            "{tag}"
+        );
+    }
+}
+
+#[test]
 fn help_flag_prints_usage_and_succeeds() {
     let (code, stdout, stderr) = run_with_args("help", "+.", "", &["--help"]);
     assert_eq!(code.code(), Some(0), "stderr: {stderr:?}");

@@ -132,6 +132,26 @@ fn huge_left_move_is_caught_not_wrapped() {
 }
 
 #[test]
+fn untouched_excursion_in_an_offset_add_candidate_loop_still_underflows() {
+    // +[<>-] and +[-<>]: the loop body visits cell -1 without ever writing
+    // it. The optimizer used to fold exactly these shapes to a plain Zero
+    // (it only tracked written cells, so every structural check passed)
+    // and thereby dropped the underflow the real loop raises; the shared
+    // bfc front end now rejects the fold, so the JITed code must keep
+    // erroring with bfrun's exact message and exit code.
+    for (tag, source) in [("excursion-lead", "+[<>-]"), ("excursion-trail", "+[-<>]")] {
+        let (code, stdout, stderr) = run_raw(tag, source, "");
+        assert_eq!(stdout, b"", "{tag}");
+        assert_eq!(code.code(), Some(1), "{tag}");
+        assert_eq!(
+            String::from_utf8_lossy(&stderr),
+            "runtime error: pointer moved left of cell 0\n",
+            "{tag}"
+        );
+    }
+}
+
+#[test]
 fn unmatched_brackets_fail_before_jitting() {
     let (code, _, stderr) = run_raw("unmatched", "[+", "");
     assert_eq!(code.code(), Some(1));

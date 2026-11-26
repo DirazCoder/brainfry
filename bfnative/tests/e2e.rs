@@ -145,6 +145,26 @@ fn huge_left_move_is_caught_not_wrapped() {
 }
 
 #[test]
+fn untouched_excursion_in_an_offset_add_candidate_loop_still_underflows() {
+    // +[<>-] and +[-<>]: the loop body visits cell -1 without ever writing
+    // it. The optimizer used to fold exactly these shapes to a plain Zero
+    // (it only tracked written cells, so every structural check passed)
+    // and thereby dropped the underflow the real loop raises; the shared
+    // bfc front end now rejects the fold, so the generated code must keep
+    // erroring with bfrun's exact message and exit code.
+    for (tag, source) in [("excursion-lead", "+[<>-]"), ("excursion-trail", "+[-<>]")] {
+        let (code, stdout, stderr) = run_raw(tag, source, "");
+        assert_eq!(stdout, b"", "{tag}");
+        assert_eq!(code.code(), Some(1), "{tag}");
+        assert_eq!(
+            String::from_utf8_lossy(&stderr),
+            "runtime error: pointer moved left of cell 0\n",
+            "{tag}"
+        );
+    }
+}
+
+#[test]
 fn output_executable_is_a_real_elf() {
     let dir = std::env::temp_dir().join("bfnative-e2e-elf");
     fs::create_dir_all(&dir).expect("creating temp dir");

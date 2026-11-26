@@ -341,10 +341,16 @@ into one `MulAdd` per target cell (or several, for patterns like
 `[->+>+<<]` that spread a value into more than one place) followed by a
 `Zero`, instead of actually iterating. This only fires when every
 condition holds: the loop returns to its start, the counting cell's net
-change is exactly `-1`, every other touched cell only gets added to, and
+change is exactly `-1`, every other touched cell only gets added to,
+every cell the pointer lands on is one the body actually writes to, and
 the body has no `Output`, `Input`, or nested loop — any of those would
 mean collapsing the loop changes something other than speed, like how many
-times a side effect fires. A loop that doesn't meet all four stays a real
+times a side effect fires. The write-free condition covers the subtle one:
+a body like `[<>-]` touches down on cell -1 without writing it, and while
+that excursion has no effect on any cell's value, it still has to be
+bounds-checked when the real loop runs — a folded `MulAdd`/`Zero` body
+can't perform it, so the underflow the real loop raises would silently
+disappear. A loop that doesn't meet all five stays a real
 loop rather than risk folding something unsafe.
 
 Scan-loop folding handles the other common idiom, `[>]` / `[<]` and their
@@ -420,8 +426,8 @@ not something this doc is deciding.
 
 Every target now runs for real. `.github/workflows/test.yml` builds all
 six on a native GitHub-hosted runner (same OS and architecture, no
-emulation) and runs `scripts/differential_test_all.py`: 31 programs (the
-25-program corpus, five regression programs for folded scans and multiply
+emulation) and runs `scripts/differential_test_all.py`: 33 programs (the
+27-program corpus, five regression programs for folded scans and multiply
 loops, plus `mandelbrot.b`) through `bfinterp`, `bfinterp --optimize`,
 `bfrun`, `bfnative`, `bfjit` and `bfwasm`, with stdout, stderr and exit
 status required to be byte-identical to `bfrun`. The corpus covers hello

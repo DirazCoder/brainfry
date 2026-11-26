@@ -290,6 +290,30 @@ mod tests {
     }
 
     #[test]
+    fn optimized_offset_add_with_untouched_excursion_still_underflows() {
+        // +[<>-] and +[-<>]: the loop body visits cell -1 without ever
+        // writing it. The naive path dies on the MoveLeft; the optimizer
+        // used to fold both shapes to a plain Zero (only written cells
+        // were tracked, so every structural check passed), silently
+        // swallowing the underflow. The fold must be rejected so the
+        // optimized path raises the same error.
+        for source in ["+[<>-]", "+[-<>]"] {
+            let raw = bfc::parser::parse(source).unwrap();
+            let optimized = bfc::optimize::optimize(raw.clone());
+            let (_, naive_res) = interp(&raw, "");
+            let (_, opt_res) = interp(&optimized, "");
+            assert!(
+                matches!(naive_res, Err(RunError::PointerUnderflow)),
+                "{source}: naive path should underflow"
+            );
+            assert!(
+                matches!(opt_res, Err(RunError::PointerUnderflow)),
+                "{source}: optimized path should underflow too"
+            );
+        }
+    }
+
+    #[test]
     fn stdout_receives_every_byte_before_flush() {
         // Echo loop with the zero idiom, driven through a Cursor.
         let source = ",[.[-],]";

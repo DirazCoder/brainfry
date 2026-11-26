@@ -116,6 +116,15 @@ CORPUS = [
     ("huge-left",
      ">" * 10 + "<" * 100_000,
      ""),
+    # Offset-add folding candidates whose body visits a cell without
+    # writing it: bfc must NOT fold them to Zero, or the underflow the
+    # real loop raises disappears on the bfc-fed lane.
+    ("underflow-untouched-excursion",
+     "+[<>-]",
+     ""),
+    ("underflow-trailing-excursion",
+     "+[-<>]",
+     ""),
 ]
 
 

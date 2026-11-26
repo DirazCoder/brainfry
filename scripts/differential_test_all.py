@@ -17,7 +17,7 @@ installed, that lane is skipped (with a note) rather than failing the run,
 since it's an external runtime rather than something `cargo build` produces.
 
 stdout, stderr, and exit status must be byte-identical across all of them.
-The corpus is the 25-program set from differential_test.py (deep nesting,
+The corpus is the 27-program set from differential_test.py (deep nesting,
 multiplication loops, tape growth to 200k cells, wraparound, EOF semantics,
 stdin echo, runtime-error paths) plus Erik Bosman's mandelbrot.b — the same
 real workload used for the native-vs-bytecode benchmark.
@@ -72,7 +72,7 @@ BFJIT_AARCH64 = os.environ.get("BFJIT_AARCH64", "")
 BFNATIVE_AARCH64 = os.environ.get("BFNATIVE_AARCH64", "")
 BFRUN_AARCH64 = os.environ.get("BFRUN_AARCH64", "")
 
-# (name, source, stdin) — the 25-program corpus from differential_test.py,
+# (name, source, stdin) — the 27-program corpus from differential_test.py,
 # plus mandelbrot.
 CORPUS = [
     ("hello-world",
@@ -177,6 +177,16 @@ CORPUS = [
      ""),
     ("huge-left",
      ">" * 10 + "<" * 100_000,
+     ""),
+    # Offset-add folding candidates whose body visits a cell without
+    # writing it: bfc must NOT fold them to Zero, or the underflow the real
+    # loop raises disappears on every bfc-fed lane while bfinterp's naive
+    # path keeps it.
+    ("underflow-untouched-excursion",
+     "+[<>-]",
+     ""),
+    ("underflow-trailing-excursion",
+     "+[-<>]",
      ""),
     # The real workload — same program the native-vs-bytecode benchmark
     # used. Only added when the asset is present.
