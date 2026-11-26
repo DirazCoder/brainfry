@@ -54,10 +54,15 @@ jobs:
         shell: bash
         run: cargo install cargo-llvm-cov --locked --version 0.9.2
 
+      # link.exe's ARM64 padding corrupts LLVM profiles (rust-lang/rust#150123).
+      # Use Rust's bundled LLD for coverage while leaving regular MSVC builds unchanged.
       - name: cargo llvm-cov
         if: always()
         shell: bash
         run: |
+          if [[ "${{ matrix.target }}" == "aarch64-pc-windows-msvc" ]]; then
+            export CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_LINKER=rust-lld
+          fi
           REPORT="coverage-${{ matrix.archive_name }}"
           cargo llvm-cov --release --workspace --all-targets \
             --target "${{ matrix.target }}" \
