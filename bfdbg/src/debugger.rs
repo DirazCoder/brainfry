@@ -812,8 +812,9 @@ impl Debugger {
         let first = ln.saturating_sub(context);
         let last = (ln + context).min(self.source_lines.len().saturating_sub(1));
         let numw = self.source_lines.len().to_string().len().max(3);
-        for i in first..=last {
-            s.push_str(&format!("{:>numw$} | {}\n", i + 1, self.source_lines[i]));
+        for (offset, line) in self.source_lines[first..=last].iter().enumerate() {
+            let i = first + offset;
+            s.push_str(&format!("{:>numw$} | {}\n", i + 1, line));
             if i == ln {
                 s.push_str(&format!(
                     "{:>numw$} | {}^\n",

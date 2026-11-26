@@ -495,8 +495,7 @@ mod tests {
         unsafe {
             let region = JitRegion::alloc(0x1000).expect("alloc");
             let message = protect_exec(region.base.add(1), 0x1000)
-                .err()
-                .expect("unaligned mprotect must fail");
+                .expect_err("unaligned mprotect must fail");
             assert!(
                 message.contains("failed to make JIT memory executable"),
                 "{message}"
