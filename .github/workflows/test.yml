@@ -181,6 +181,34 @@ jobs:
           sys.exit(failed)
           EOF
 
+      # The HTML report doesn't always show where a missed line or region is
+      # (the summary can say 671/672 while every row reads as hit), so on
+      # failure print the locations straight from the text report.
+      - name: show uncovered lines and regions
+        if: failure()
+        shell: bash
+        run: |
+          cargo +nightly llvm-cov report --branch --release \
+            --target "${{ matrix.target }}" --show-missing-lines
+          cargo +nightly llvm-cov report --branch --release \
+            --target "${{ matrix.target }}" --text --output-path coverage-text.txt
+          python3 - <<'EOF'
+          import re
+
+          current_file = last_line = None
+          with open("coverage-text.txt", encoding="utf-8", errors="replace") as report:
+              for raw in report:
+                  line = raw.rstrip("\n")
+                  if re.match(r"^\s*\d+\|", line):
+                      last_line = line
+                      if re.match(r"^\s*\d+\|\s+0\|", line):
+                          print(f"::warning::{current_file}: line never ran: {line.strip()}")
+                  elif line and not line.startswith((" ", "-")) and line.endswith(":"):
+                      current_file = line[:-1]
+                  elif "^0" in line:
+                      print(f"::warning::{current_file}: region never ran after: {last_line.strip() if last_line else '?'}")
+          EOF
+
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
