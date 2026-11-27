@@ -91,8 +91,30 @@ mod tests {
         }
     }
 
+    // A read-only handle fails on every OS, unlike /dev/full. Both outcomes
+    // run through the `File` instantiation, which coverage counts on its own.
+    #[test]
+    fn file_writes_report_success_and_failure() {
+        let path = std::env::temp_dir().join(format!("bfc-write-{}.bfry", std::process::id()));
+        let program = Program {
+            ops: vec![bfformat::Op::Zero],
+        };
+        let writable = std::fs::File::create(&path).unwrap();
+        assert_eq!(
+            write_program(&program, "input.bf", "output.bfry", writable),
+            ExitCode::SUCCESS
+        );
+        let read_only = std::fs::File::open(&path).unwrap();
+        assert_eq!(
+            write_program(&program, "input.bf", "output.bfry", read_only),
+            ExitCode::FAILURE
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
     #[test]
     fn write_failure_returns_failure() {
+        assert!(io::Write::flush(&mut FailingWriter).is_ok());
         let program = Program {
             ops: vec![bfformat::Op::Zero],
         };

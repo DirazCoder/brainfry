@@ -185,6 +185,8 @@ fn grow_to_at_least(tape: &mut Vec<u8>, index: usize) -> Result<(), RunError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
     use std::io::Cursor;
 
     fn interp(ops: &[Op], input: &str) -> (Vec<u8>, Result<(), RunError>) {
@@ -526,70 +528,47 @@ mod tests {
         assert!(matches!(result, Err(RunError::Io(_))));
     }
 
-    /// Caps RLIMIT_AS for the duration of a closure, restoring it after.
-    /// Twin of the same-named helper in bfrun's vm tests (the two crates
-    /// deliberately share no code); see that copy for the rationale —
-    /// in short: the one deterministic, dependency-free way to make real
-    /// allocation fail in-process. Linux x86-64 only.
-    // coverage(off) in coverage runs: the `get_ret == 0` guard below is
-    // the defensive half of a syscall-error check that cannot be made to
-    // fail in any real process, so its false branch is uninstrumentable
-    // by construction. This is test-support code, not product code.
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    #[cfg_attr(coverage_nightly, coverage(off))]
-    fn with_address_space_cap<T>(body: impl FnOnce() -> T) -> T {
-        const GETRLIMIT: u64 = 97;
-        const SETRLIMIT: u64 = 160;
-        const RLIMIT_AS: u64 = 9;
-        // (rlim_cur, rlim_max). RLIM_INFINITY on Linux x86-64 is ~0u64.
-        let mut old: (u64, u64) = (u64::MAX, u64::MAX);
-        unsafe {
-            let get_ret: u64;
-            core::arch::asm!(
-                "syscall",
-                inlateout("rax") GETRLIMIT => get_ret,
-                in("rdi") RLIMIT_AS,
-                in("rsi") &mut old as *mut (u64, u64) as u64,
-                lateout("rcx") _,
-                lateout("r11") _,
-                options(nostack),
-            );
-            if get_ret == 0 {
-                let cap = 512u64 << 20;
-                let tight = (cap.min(old.1), old.1);
-                core::arch::asm!(
-                    "syscall",
-                    inlateout("rax") SETRLIMIT => _,
-                    in("rdi") RLIMIT_AS,
-                    in("rsi") &tight as *const (u64, u64) as u64,
-                    lateout("rcx") _,
-                    lateout("r11") _,
-                    options(nostack),
-                );
-            }
-        }
-        let result = body();
-        unsafe {
-            core::arch::asm!(
-                "syscall",
-                inlateout("rax") SETRLIMIT => _,
-                in("rdi") RLIMIT_AS,
-                in("rsi") &old as *const (u64, u64) as u64,
-                lateout("rcx") _,
-                lateout("r11") _,
-                options(nostack),
-            );
-        }
-        result
+    /// Test-only allocator that refuses large reallocations on a thread that
+    /// asks for it, so tape-growth failures run the same way on every target.
+    /// `alloc` stays unchecked: growing the tape never goes through it.
+    struct CappedAlloc;
+
+    thread_local! {
+        static ALLOC_LIMIT: Cell<usize> = const { Cell::new(usize::MAX) };
     }
 
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    unsafe impl GlobalAlloc for CappedAlloc {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            unsafe { System.alloc(layout) }
+        }
+
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            if new_size > ALLOC_LIMIT.get() {
+                return std::ptr::null_mut();
+            }
+            unsafe { System.realloc(ptr, layout, new_size) }
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            unsafe { System.dealloc(ptr, layout) }
+        }
+    }
+
+    #[global_allocator]
+    static ALLOCATOR: CappedAlloc = CappedAlloc;
+
+    fn with_alloc_cap(body: fn()) {
+        ALLOC_LIMIT.set(1 << 20);
+        body();
+        ALLOC_LIMIT.set(usize::MAX);
+    }
+
     #[test]
     fn allocation_failure_through_every_growing_op_is_a_clean_error() {
         // MoveRight, MulAdd's far target, and Scan's long stride all grow
-        // the tape; under a capped address space each must surface
+        // the tape; with large allocations refused each must surface
         // GrowFailed cleanly rather than aborting.
-        with_address_space_cap(|| {
+        with_alloc_cap(|| {
             let result = run(
                 &[Op::MoveRight(u32::MAX)],
                 &mut Cursor::new(b""),

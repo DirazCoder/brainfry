@@ -357,6 +357,12 @@ mod tests {
     use super::*;
 
     #[test]
+    fn folds_a_move_run_that_ends_the_program() {
+        let folded = fold_runs(&[Op::MoveRight(1), Op::MoveRight(1)]);
+        assert_eq!(folded, vec![Op::MoveRight(2)]);
+    }
+
+    #[test]
     fn folds_repeated_add() {
         let ops = vec![Op::Add(1), Op::Add(1), Op::Add(1)];
         let folded = fold_runs(&ops);

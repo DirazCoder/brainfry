@@ -1,10 +1,3 @@
-// Only the Linux x86-64 test helpers use coverage(off); keep the unstable
-// feature gate off other targets and the non-test binary.
-#![cfg_attr(
-    all(coverage_nightly, test, target_os = "linux", target_arch = "x86_64"),
-    feature(coverage_attribute)
-)]
-
 mod vm;
 
 use bfformat::Program;

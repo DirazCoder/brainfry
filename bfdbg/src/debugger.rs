@@ -899,6 +899,43 @@ fn op_label(op: Option<&Op>) -> String {
 mod tests {
     use super::*;
     use bfc::parser;
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+
+    /// Test-only allocator that refuses large reallocations on a thread that
+    /// asks for it, so tape-growth failures run the same way on every target.
+    /// `alloc` stays unchecked: growing the tape never goes through it.
+    struct CappedAlloc;
+
+    thread_local! {
+        static ALLOC_LIMIT: Cell<usize> = const { Cell::new(usize::MAX) };
+    }
+
+    unsafe impl GlobalAlloc for CappedAlloc {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            unsafe { System.alloc(layout) }
+        }
+
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            if new_size > ALLOC_LIMIT.get() {
+                return std::ptr::null_mut();
+            }
+            unsafe { System.realloc(ptr, layout, new_size) }
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            unsafe { System.dealloc(ptr, layout) }
+        }
+    }
+
+    #[global_allocator]
+    static ALLOCATOR: CappedAlloc = CappedAlloc;
+
+    fn with_alloc_cap(body: fn()) {
+        ALLOC_LIMIT.set(1 << 20);
+        body();
+        ALLOC_LIMIT.set(usize::MAX);
+    }
 
     fn dbg_for(source: &str) -> Debugger {
         let ops = parser::parse(source).unwrap();
@@ -1643,6 +1680,48 @@ mod tests {
             d.set_ptr(1_000_000_000_000_000_000).unwrap_err(),
             "failed to grow tape"
         );
+    }
+
+    #[test]
+    fn allocation_failure_through_every_growing_op_is_a_clean_error() {
+        with_alloc_cap(|| {
+            let far = 2_000_000_000;
+            for ops in [
+                vec![Op::MoveRight(u32::MAX)],
+                vec![
+                    Op::Add(1),
+                    Op::MulAdd {
+                        offset: far,
+                        factor: 1,
+                    },
+                ],
+                vec![Op::Add(1), Op::Scan { stride: far }],
+            ] {
+                let mut d = Debugger::new(ops, "z".into(), DEFAULT_UNDO_LIMIT);
+                assert_eq!(
+                    d.run(&mut Vec::new()),
+                    Stop::Errored("failed to grow tape".into())
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn parse_command_rejects_truncated_and_non_numeric_arguments() {
+        for (line, expected) in [
+            ("tape 0 x", "tape count"),
+            ("clear x", "bad breakpoint spec"),
+            ("watch ptr x", "watch target"),
+            ("unwatch", "unwatch needs"),
+            ("set cell[3] =", "usage: set"),
+            ("set ptr =", "usage: set"),
+            ("set cell", "usage: set"),
+            ("set cell 3 =", "usage: set"),
+            ("set cell[3 = 1", "usage: set"),
+        ] {
+            let err = parse_command(line).unwrap_err();
+            assert!(err.contains(expected), "{line}: {err}");
+        }
     }
 
     // ---- views ----

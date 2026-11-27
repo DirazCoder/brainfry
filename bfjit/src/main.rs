@@ -109,37 +109,59 @@ fn run(args: Vec<String>) -> ExitCode {
     // for everything whose address wasn't known during emission.
     let module = codegen::emit(&ops, target);
 
-    match prepare_image(module, target) {
+    let got_slots = host::got_slots(target.os);
+    launch(prepare_image(
+        module,
+        &got_slots,
+        exec::JitRegion::alloc,
+        exec::JitRegion::make_executable,
+    ))
+}
+
+// coverage(off): coverage is counted per binary, and no single one can take
+// both arms. `Ok` ends the process, and `Err` needs the OS to refuse memory,
+// which the real binary can't be made to hit reliably.
+#[cfg_attr(coverage_nightly, coverage(off))]
+fn launch(prepared: Result<ReadyRegion, ExitCode>) -> ExitCode {
+    match prepared {
         Ok(ready) => unsafe { jump(ready) },
         Err(status) => status,
     }
 }
 
+type AllocFn = unsafe fn(usize) -> Result<exec::JitRegion, String>;
+type ProtectFn = unsafe fn(&exec::JitRegion) -> Result<(), String>;
+
 /// Everything `run` does after codegen and before the final, irreversible
 /// jump into generated code: map the image, resolve fixups against the
 /// real address, copy the bytes in, and flip the region to read+execute.
 ///
-/// Split out of `run` so the three OS-fallible steps (`alloc`, `patch`,
-/// `make_executable`) can be driven into their `Err` arms from a test:
+/// Split out of `run`, with the OS calls passed in, so the three fallible
+/// steps (`alloc`, `patch`, `make_executable`) can be driven into their
+/// `Err` arms from a test:
 /// `run` itself can't be, because its only path past them ends in
 /// `JitRegion::enter`, which never returns and terminates the process via
 /// a raw exit syscall — a test that reached that line would kill the test
 /// binary, not record a pass. `tests/e2e.rs` covers the happy path end to
 /// end in its own process for that reason; this function covers the error
 /// arms, which happy-path runs never take.
-fn prepare_image(mut module: codegen::Module, target: Target) -> Result<ReadyRegion, ExitCode> {
+fn prepare_image(
+    mut module: codegen::Module,
+    got_slots: &[usize],
+    alloc: AllocFn,
+    make_executable: ProtectFn,
+) -> Result<ReadyRegion, ExitCode> {
     // ---- layout the JIT image inside one region ----
     // code at offset 0 (entry stub first), rodata 16-aligned after it,
     // GOT/IAT (macOS/Windows only) 16-aligned after that. 16-alignment
     // satisfies every constraint in the patcher (ARM64 ADRP+LDR wants
     // 8-byte-aligned slots; 16 covers it).
-    let got_slots = host::got_slots(target.os);
     let got_count = got_slots.len();
     let image_layout = image_layout(module.code.len(), module.rodata.len(), got_count);
 
     // Map first (writable, non-executable), then resolve fixups against
     // the region's real address, then copy.
-    let region = unsafe { exec::JitRegion::alloc(image_layout.total) }.map_err(alloc_failure)?;
+    let region = unsafe { alloc(image_layout.total) }.map_err(alloc_failure)?;
 
     let layout = patch::Layout {
         code_vaddr: region.base as u64,
@@ -156,11 +178,11 @@ fn prepare_image(mut module: codegen::Module, target: Target) -> Result<ReadyReg
         // table all go in before the W^X flip.
         region.write_bytes(0, &module.code);
         region.write_bytes(image_layout.rodata_off, &module.rodata);
-        for (offset, function) in got_writes(image_layout.got_off, &got_slots) {
+        for (offset, function) in got_writes(image_layout.got_off, got_slots) {
             region.write_u64(offset, function);
         }
 
-        executable_status(region.make_executable())?;
+        executable_status(make_executable(&region))?;
     }
 
     Ok(ReadyRegion { region })
@@ -348,8 +370,39 @@ mod tests {
             rodata: e.rodata,
             spans: e.spans,
         };
-        let status = prepare_image(module, Target::host());
+        let status = prepare_image(
+            module,
+            &[],
+            exec::JitRegion::alloc,
+            exec::JitRegion::make_executable,
+        );
         assert_eq!(status.err(), Some(ExitCode::FAILURE));
+    }
+
+    unsafe fn refuse_alloc(_: usize) -> Result<exec::JitRegion, String> {
+        Err("out of memory".to_string())
+    }
+
+    unsafe fn refuse_protect(_: &exec::JitRegion) -> Result<(), String> {
+        Err("protection denied".to_string())
+    }
+
+    #[test]
+    fn prepare_image_handles_each_os_call_outcome() {
+        fn prepare(alloc: AllocFn, protect: ProtectFn) -> Option<ExitCode> {
+            let target = Target::host();
+            // Fake slot values are fine because the image is never executed.
+            // At least one slot exercises the table writes on Linux too.
+            let slot_count = codegen::external_symbols(target.os).len().max(1);
+            let module = codegen::emit(&[], target);
+            prepare_image(module, &vec![1; slot_count], alloc, protect).err()
+        }
+        let alloc: AllocFn = exec::JitRegion::alloc;
+        let protect: ProtectFn = exec::JitRegion::make_executable;
+
+        assert_eq!(prepare(alloc, protect), None);
+        assert_eq!(prepare(refuse_alloc, protect), Some(ExitCode::FAILURE));
+        assert_eq!(prepare(alloc, refuse_protect), Some(ExitCode::FAILURE));
     }
 
     #[test]

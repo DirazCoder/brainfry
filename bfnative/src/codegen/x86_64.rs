@@ -1493,6 +1493,7 @@ mod tests {
         emit_bounds_checked_offset(&mut e, 4, true, &rt);
         let mut e2 = Emitter::new(0);
         emit_bounds_checked_offset(&mut e2, 4, false, &rt);
-        assert!(!e.code.is_empty() && !e2.code.is_empty());
+        assert!(!e.code.is_empty());
+        assert!(!e2.code.is_empty());
     }
 }

@@ -201,7 +201,7 @@ mod tests {
                     0
                 },
             };
-            patch(&mut module, &layout).unwrap_or_else(|_| panic!("{name}: patch failed"));
+            patch(&mut module, &layout).expect(name);
 
             // Sanity: every 4-byte word is still a decodable branch or data
             // word — here it's enough that the pass didn't error and the

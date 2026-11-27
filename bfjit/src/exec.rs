@@ -442,6 +442,12 @@ unsafe fn protect_exec(base: *mut u8, len: usize) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    #[test]
+    fn clearing_an_empty_instruction_cache_range_is_a_no_op() {
+        unsafe { clear_instruction_cache(core::ptr::null_mut(), 0) };
+    }
+
     #[test]
     fn region_round_trip_writes_and_reads_back() {
         // Allocating a region, writing, and reading back is the writable
