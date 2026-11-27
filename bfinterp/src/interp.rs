@@ -798,4 +798,36 @@ mod tests {
             assert!(matches!(result, Err(RunError::GrowFailed)));
         });
     }
+
+    #[test]
+    fn zero_at_and_set_at_reject_bad_targets_like_add_at() {
+        // AddAt's error paths were tested, but ZeroAt and SetAt each have
+        // their own `?` on offset_cell, so they need their own cases.
+        for op in [
+            Op::ZeroAt { offset: -1 },
+            Op::SetAt {
+                offset: -1,
+                value: 1,
+            },
+        ] {
+            assert!(matches!(
+                interp(&[op], "").1,
+                Err(RunError::PointerUnderflow)
+            ));
+        }
+        for op in [
+            Op::ZeroAt {
+                offset: TAPE_LIMIT as isize,
+            },
+            Op::SetAt {
+                offset: TAPE_LIMIT as isize,
+                value: 1,
+            },
+        ] {
+            assert!(matches!(
+                interp(&[op], "").1,
+                Err(RunError::TapeLimitExceeded)
+            ));
+        }
+    }
 }
