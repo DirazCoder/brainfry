@@ -638,7 +638,9 @@ mod tests {
         );
     }
 
+    // These branches validate the test's PE parser, not the PE writer.
     #[test]
+    #[cfg_attr(coverage_nightly, coverage(off))]
     fn import_table_resolves_six_kernel32_functions() {
         for name in ["windows-x86_64", "windows-aarch64"] {
             let bytes = build_for(&[bfformat::Op::Output, bfformat::Op::Input], name);
@@ -759,7 +761,9 @@ mod tests {
         }
     }
 
+    // These branches validate the test's PE parser, not the PE writer.
     #[test]
+    #[cfg_attr(coverage_nightly, coverage(off))]
     fn base_relocation_table_has_a_real_dir64_fixup() {
         // Regression test: this table used to contain a single
         // IMAGE_REL_BASED_ABSOLUTE (type 0) no-op entry. That's spec-legal
@@ -845,6 +849,7 @@ mod tests {
         rva + vsize
     }
 
+    // These branches validate the test's PE parser, not the PE writer.
     #[test]
     fn x86_64_has_no_exception_directory() {
         // x86_64 has no equivalent hard requirement for unwind info on a
@@ -866,7 +871,9 @@ mod tests {
         assert_eq!(exc_dir, 0, "x86_64 Exception Directory should be empty");
     }
 
+    // These branches validate the test's PE parser, not the PE writer.
     #[test]
+    #[cfg_attr(coverage_nightly, coverage(off))]
     fn arm64_exception_directory_describes_the_whole_of_text() {
         // Regression test for "%1 is not a valid Win32 application" on real
         // ARM64 Windows hardware: dumpbin showed an otherwise well-formed
@@ -979,6 +986,42 @@ mod tests {
         assert_eq!(
             codes[1], UNWIND_CODE_END,
             "sequence must terminate with end (0xE4)"
+        );
+    }
+
+    #[test]
+    fn text_section_preserves_code_and_rodata_with_required_padding() {
+        let mut module = Module {
+            code: vec![0x90; 17],
+            labels: Vec::new(),
+            fixups: Vec::new(),
+            rodata: b"msg\0".to_vec(),
+            spans: Vec::new(),
+        };
+        let code = module.code.clone();
+        let rodata = module.rodata.clone();
+        let (bytes, _) = build(&mut module, Arch::X86_64);
+
+        let section = 0x148;
+        let text_vsize =
+            u32::from_le_bytes(bytes[section + 8..section + 12].try_into().unwrap()) as usize;
+        let text_raw_size =
+            u32::from_le_bytes(bytes[section + 16..section + 20].try_into().unwrap()) as usize;
+        let text_raw_off =
+            u32::from_le_bytes(bytes[section + 20..section + 24].try_into().unwrap()) as usize;
+        let rodata_off = align_up(code.len() as u64, 16) as usize;
+
+        assert_eq!(text_vsize, 36);
+        assert_eq!(text_raw_size, 0x200);
+        assert_eq!(text_raw_off, 0x200);
+        assert_eq!(&bytes[text_raw_off..text_raw_off + code.len()], code);
+        assert_eq!(
+            &bytes[text_raw_off + code.len()..text_raw_off + rodata_off],
+            &[0; 15]
+        );
+        assert_eq!(
+            &bytes[text_raw_off + rodata_off..text_raw_off + rodata_off + rodata.len()],
+            rodata
         );
     }
 }

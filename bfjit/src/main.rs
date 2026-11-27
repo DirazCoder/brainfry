@@ -61,8 +61,10 @@ handles its own tape growth, I/O, and exit, exactly like a bfnative-built
 executable.";
 
 fn main() -> ExitCode {
-    let args: Vec<String> = env::args().collect();
+    run(env::args().collect())
+}
 
+fn run(args: Vec<String>) -> ExitCode {
     if has_help_flag(&args) {
         println!("{USAGE}");
         return ExitCode::SUCCESS;
@@ -87,10 +89,10 @@ fn main() -> ExitCode {
     // Same front end as bfc/bfnative: parse, then optimize. The JIT is
     // supposed to be fast — this is the one place where running the
     // optimizer is the whole point.
-    let raw_ops = match parser::parse(&source) {
+    let raw_ops = match parse_source(&input, &source) {
         Ok(ops) => ops,
-        Err(err) => {
-            eprintln!("{input}:{}: {}", err.line, err.message);
+        Err(message) => {
+            eprintln!("{message}");
             return ExitCode::FAILURE;
         }
     };
@@ -144,15 +146,12 @@ fn main() -> ExitCode {
         // table all go in before the W^X flip.
         region.write_bytes(0, &module.code);
         region.write_bytes(image_layout.rodata_off, &module.rodata);
-        if let Some(got_off) = image_layout.got_off {
-            for (i, function) in got_slots.iter().enumerate() {
-                region.write_u64(got_off + 8 * i, *function as u64);
-            }
+        for (offset, function) in got_writes(image_layout.got_off, &got_slots) {
+            region.write_u64(offset, function);
         }
 
-        if let Err(message) = region.make_executable() {
-            eprintln!("bfjit: {message}");
-            return ExitCode::FAILURE;
+        if let Err(status) = executable_status(region.make_executable()) {
+            return status;
         }
 
         // Flush coverage counters (see the extern block above) before the
@@ -171,6 +170,29 @@ fn main() -> ExitCode {
         // I/O, so nothing after this line executes.
         region.enter()
     }
+}
+
+fn parse_source(input: &str, source: &str) -> Result<Vec<bfformat::Op>, String> {
+    parser::parse(source).map_err(|err| format!("{input}:{}: {}", err.line, err.message))
+}
+
+fn got_writes<'a>(
+    got_off: Option<usize>,
+    got_slots: &'a [usize],
+) -> impl Iterator<Item = (usize, u64)> + 'a {
+    got_off.into_iter().flat_map(move |got_off| {
+        got_slots
+            .iter()
+            .enumerate()
+            .map(move |(i, function)| (got_off + 8 * i, *function as u64))
+    })
+}
+
+fn executable_status(result: Result<(), String>) -> Result<(), ExitCode> {
+    result.map_err(|message| {
+        eprintln!("bfjit: {message}");
+        ExitCode::FAILURE
+    })
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -239,6 +261,41 @@ fn align_up(value: usize, align: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn run_reports_a_directory_as_an_unreadable_input() {
+        let directory = env::current_dir().unwrap();
+        let status = run(vec![
+            "bfjit".to_string(),
+            directory.to_string_lossy().into_owned(),
+        ]);
+        assert_eq!(status, ExitCode::FAILURE);
+    }
+
+    #[test]
+    fn parse_source_reports_the_input_and_location_for_invalid_programs() {
+        let err = parse_source("broken.bf", "]").unwrap_err();
+        assert!(err.starts_with("broken.bf:1:"), "{err}");
+    }
+
+    #[test]
+    fn got_writes_only_produces_slots_when_the_image_has_a_got() {
+        let functions = [0x1234, 0x5678];
+        assert_eq!(got_writes(None, &functions).collect::<Vec<_>>(), []);
+        assert_eq!(
+            got_writes(Some(0x1000), &functions).collect::<Vec<_>>(),
+            [(0x1000, 0x1234), (0x1008, 0x5678)]
+        );
+    }
+
+    #[test]
+    fn executable_protection_errors_become_cli_failures() {
+        assert_eq!(
+            executable_status(Err("protection denied".to_string())),
+            Err(ExitCode::FAILURE)
+        );
+        assert_eq!(executable_status(Ok(())), Ok(()));
+    }
 
     /// Runs parse_args over a synthetic argv (program name first).
     fn parsed(args: &[&str]) -> Result<String, String> {

@@ -6,3 +6,7 @@ edition = "2024"
 [dependencies]
 bfformat = { path = "../bfformat" }
 bfc = { path = "../bfc" }
+
+[lints.rust]
+# `cargo-llvm-cov` sets these cfgs for coverage builds.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage, coverage_nightly)'] }

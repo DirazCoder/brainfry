@@ -73,6 +73,8 @@ jobs:
           fi
           # Keep debug-only invariants instrumented in the release coverage build.
           export CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS=true
+          # Keep shared library coverage mappings stable across test binaries.
+          export CARGO_PROFILE_RELEASE_LTO=false
           REPORT="coverage-${{ matrix.archive_name }}"
           cargo +nightly llvm-cov --branch --release --workspace --all-targets \
             --target "${{ matrix.target }}" \

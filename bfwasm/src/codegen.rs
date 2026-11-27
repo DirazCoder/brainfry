@@ -875,9 +875,11 @@ mod tests {
             Op::JumpIfNonZero { target: 0 },
         ];
         let spans = match_loops(&ops);
-        assert_eq!(spans.len(), 2);
-        assert!(spans.iter().any(|s| s.open == 0 && s.close == 4));
-        assert!(spans.iter().any(|s| s.open == 2 && s.close == 3));
+        let pairs = spans
+            .into_iter()
+            .map(|span| (span.open, span.close))
+            .collect::<Vec<_>>();
+        assert_eq!(pairs, vec![(2, 3), (0, 4)]);
     }
 
     #[test]
@@ -986,6 +988,20 @@ mod tests {
             }
         }
         result
+    }
+
+    #[test]
+    fn read_sleb_handles_full_width_i64_values() {
+        let mut min_encoding = [0x80; 10];
+        min_encoding[9] = 0x7F;
+        let mut max_encoding = [0xFF; 10];
+        max_encoding[9] = 0x00;
+
+        for (encoding, expected) in [(&min_encoding[..], i64::MIN), (&max_encoding[..], i64::MAX)] {
+            let mut cursor = 0;
+            assert_eq!(read_sleb(encoding, &mut cursor), expected);
+            assert_eq!(cursor, encoding.len());
+        }
     }
 
     #[test]

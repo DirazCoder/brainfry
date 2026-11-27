@@ -1312,7 +1312,10 @@ mod tests {
         }];
         let m = module(&ops, "linux-x86_64");
         let underflow_msg = b"pointer moved left of cell 0";
-        assert!(find(&m.code, underflow_msg).is_some() || find(&m.rodata, underflow_msg).is_some());
+        assert!(
+            find(&m.rodata, underflow_msg).is_some(),
+            "underflow message was not emitted in read-only data"
+        );
     }
 
     #[test]
@@ -1325,12 +1328,13 @@ mod tests {
         let m = module(&ops, "linux-x86_64");
         let op0_offset = m.labels[0];
         assert_ne!(op0_offset, u32::MAX, "label 0 must be bound");
+        let label_offsets = m
+            .fixups
+            .iter()
+            .filter_map(|f| f.target.label_index())
+            .map(|i| m.labels[i as usize]);
         assert!(
-            m.fixups
-                .iter()
-                .any(|f| f.target.label_index().is_some_and(
-                    |i| (i as usize) < m.labels.len() && m.labels[i as usize] == op0_offset
-                )),
+            label_offsets.into_iter().any(|offset| offset == op0_offset),
             "no branch targets the scan's own start"
         );
     }

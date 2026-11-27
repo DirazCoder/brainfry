@@ -1103,6 +1103,21 @@ mod tests {
     }
 
     #[test]
+    fn editing_state_rearms_a_breakpoint_before_resume() {
+        let mut d = dbg_for("+");
+        d.add_break(0);
+
+        assert_eq!(d.run(&mut Vec::new()), Stop::Break(0));
+        d.set_cell(0, 7).unwrap();
+        assert_eq!(d.run(&mut Vec::new()), Stop::Break(0));
+        assert_eq!(d.cell_at(0), 7);
+
+        assert!(d.clear_break(0));
+        assert_eq!(d.run(&mut Vec::new()), Stop::Finished);
+        assert_eq!(d.cell_at(0), 8);
+    }
+
+    #[test]
     fn a_loop_revisit_retriggers_the_breakpoint() {
         // Two iterations (cell 0 counts 2 down to 0), so op 3 — the
         // MoveRight, hit every iteration — triggers on both passes.
@@ -1490,8 +1505,9 @@ mod tests {
     fn output_write_and_flush_failures_are_clean_errors() {
         let ops = parser::parse(".").unwrap();
         let mut d = Debugger::new(ops, ".".into(), DEFAULT_UNDO_LIMIT);
-        assert!(
-            matches!(d.step(&mut FailingWrite), Stop::Errored(m) if m.starts_with("I/O error:"))
+        assert_eq!(
+            d.step(&mut FailingWrite),
+            Stop::Errored("I/O error: stdout broke".into())
         );
         // write_all's failure aborts the `.` op before its flush, so the
         // flush arm is driven directly — the same Err shape the op's flush
@@ -1500,8 +1516,9 @@ mod tests {
 
         let ops = parser::parse(".").unwrap();
         let mut d = Debugger::new(ops, ".".into(), DEFAULT_UNDO_LIMIT);
-        assert!(
-            matches!(d.step(&mut Unflushable), Stop::Errored(m) if m.starts_with("I/O error:"))
+        assert_eq!(
+            d.step(&mut Unflushable),
+            Stop::Errored("I/O error: flush refused".into())
         );
         // The failed op stayed un-counted and rewinds like any other.
         assert_eq!(d.back(1), 1);
@@ -1567,8 +1584,9 @@ mod tests {
             DEFAULT_UNDO_LIMIT,
         );
         d.set_cell(0, 1).unwrap();
-        assert!(
-            matches!(d.step(&mut Vec::new()), Stop::Errored(m) if m == "pointer moved left of cell 0")
+        assert_eq!(
+            d.step(&mut Vec::new()),
+            Stop::Errored("pointer moved left of cell 0".into())
         );
     }
 
@@ -1608,8 +1626,9 @@ mod tests {
             DEFAULT_UNDO_LIMIT,
         );
         d.set_cell(0, 1).unwrap();
-        assert!(
-            matches!(d.step(&mut Vec::new()), Stop::Errored(m) if m == "pointer moved left of cell 0")
+        assert_eq!(
+            d.step(&mut Vec::new()),
+            Stop::Errored("pointer moved left of cell 0".into())
         );
     }
 

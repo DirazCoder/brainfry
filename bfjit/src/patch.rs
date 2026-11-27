@@ -75,7 +75,7 @@ pub fn patch(module: &mut Module, layout: &Layout) -> Result<(), String> {
                 let pc = layout.code_vaddr + pos as u64;
                 let off = addr as i64 - pc as i64;
                 check_arm_alignment(off, "b/bl")?;
-                if off.unsigned_abs() > 0x7FF_FFFF * 4 {
+                if !arm_branch_offset_fits(off, 26) {
                     return Err(format!("ARM64 b/bl out of range ({off} bytes)"));
                 }
                 let imm26 = ((off >> 2) as u32) & 0x03FF_FFFF;
@@ -86,7 +86,7 @@ pub fn patch(module: &mut Module, layout: &Layout) -> Result<(), String> {
                 let pc = layout.code_vaddr + pos as u64;
                 let off = addr as i64 - pc as i64;
                 check_arm_alignment(off, "conditional branch")?;
-                if off.unsigned_abs() > 0x7_FFFF * 4 {
+                if !arm_branch_offset_fits(off, 19) {
                     return Err(format!(
                         "ARM64 conditional branch out of range ({off} bytes) — trampoline bug"
                     ));
@@ -138,6 +138,13 @@ fn check_arm_alignment(off: i64, what: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn arm_branch_offset_fits(off: i64, immediate_bits: u32) -> bool {
+    // Branch immediates are signed word displacements; the negative limit
+    // therefore has one extra unit compared with the positive limit.
+    let sign_bit = 1_i64 << (immediate_bits - 1);
+    off >= -sign_bit * 4 && off <= (sign_bit - 1) * 4
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -147,7 +154,9 @@ mod tests {
     /// A tiny emitted module with one x86 rel32 fixup, patched and decoded
     /// back: the point of the test is that the JIT patcher produces the same
     /// displacement math as the object writers.
+    // Exclude the test's own assertion branches; patch() remains instrumented.
     #[test]
+    #[cfg_attr(coverage_nightly, coverage(off))]
     fn x86_rel32_resolves_to_the_label_address() {
         let target = Target::from_name("linux-x86_64").unwrap();
         let mut module = codegen::emit(&[bfformat::Op::Zero], target);
@@ -198,6 +207,94 @@ mod tests {
             // word — here it's enough that the pass didn't error and the
             // code length is a multiple of 4.
             assert_eq!(module.code.len() % 4, 0);
+        }
+    }
+
+    #[test]
+    fn arm_fixups_encode_valid_signed_limits_and_paired_low_offsets() {
+        let b_limit = 0x1FF_FFFF_i64 * 4;
+        let mut forward_b = synthetic_module(
+            PatchKind::ArmB,
+            PatchTarget::Label(1),
+            vec![0, b_limit as u32],
+        );
+        patch(&mut forward_b, &zero_layout()).unwrap();
+        let b_imm = forward_b.read32(0) & 0x03FF_FFFF;
+        assert_eq!(((b_imm as i32) << 6 >> 6) as i64 * 4, b_limit);
+
+        let mut backward_b = synthetic_module(PatchKind::ArmB, PatchTarget::Label(1), vec![0, 0]);
+        backward_b.fixups[0].pos = 4;
+        patch(&mut backward_b, &zero_layout()).unwrap();
+        let b_imm = backward_b.read32(4) & 0x03FF_FFFF;
+        assert_eq!(((b_imm as i32) << 6 >> 6) as i64 * 4, -4);
+
+        let cond_limit = 0x3_FFFF_i64 * 4;
+        for (fixup_pos, label_off, expected) in [(0, cond_limit as u32, cond_limit), (4, 0, -4)] {
+            let mut conditional = synthetic_module(
+                PatchKind::ArmCond,
+                PatchTarget::Label(1),
+                vec![0, label_off],
+            );
+            conditional.fixups[0].pos = fixup_pos;
+            patch(
+                &mut conditional,
+                &Layout {
+                    code_vaddr: 0,
+                    ..zero_layout()
+                },
+            )
+            .unwrap();
+            let imm19 = (conditional.read32(fixup_pos) >> 5) & 0x7_FFFF;
+            assert_eq!(((imm19 as i32) << 13 >> 13) as i64 * 4, expected);
+        }
+
+        let mut ldr_pair = synthetic_module(
+            PatchKind::ArmAdrp {
+                pair: ArmAdrpPair::Ldr,
+            },
+            PatchTarget::Got(0),
+            vec![0],
+        );
+        patch(
+            &mut ldr_pair,
+            &Layout {
+                code_vaddr: 0x1000,
+                rodata_vaddr: 0,
+                got_vaddr: 0x2008,
+            },
+        )
+        .unwrap();
+        assert_eq!((ldr_pair.read32(4) >> 10) & 0xFFF, 1);
+
+        let mut add_pair = synthetic_module(
+            PatchKind::ArmAdrp {
+                pair: ArmAdrpPair::Add,
+            },
+            PatchTarget::Str(0),
+            vec![0],
+        );
+        patch(
+            &mut add_pair,
+            &Layout {
+                code_vaddr: 0x1000,
+                rodata_vaddr: 0x2FFF,
+                got_vaddr: 0,
+            },
+        )
+        .unwrap();
+        assert_eq!((add_pair.read32(4) >> 10) & 0xFFF, 0xFFF);
+    }
+
+    #[test]
+    fn signed_arm_branch_ranges_include_each_exact_boundary() {
+        for (immediate_bits, min, max) in [
+            (26, -0x0800_0000, 0x07FF_FFFC),
+            (19, -0x0010_0000, 0x000F_FFFC),
+        ] {
+            assert!(arm_branch_offset_fits(min, immediate_bits));
+            assert!(arm_branch_offset_fits(max, immediate_bits));
+            assert!(!arm_branch_offset_fits(min - 4, immediate_bits));
+            assert!(!arm_branch_offset_fits(max + 4, immediate_bits));
         }
     }
 
@@ -302,20 +399,22 @@ mod tests {
 
     #[test]
     fn arm_b_out_of_range_is_reported() {
-        // +-128 MiB is B/BL's reach; 512 MiB is well past it.
+        // The largest positive 26-bit immediate is 0x1ffffff words;
+        // the next word is out of range.
         let mut module =
-            synthetic_module(PatchKind::ArmB, PatchTarget::Label(1), vec![0, 0x3000_0000]);
+            synthetic_module(PatchKind::ArmB, PatchTarget::Label(1), vec![0, 0x0800_0000]);
         let err = patch(&mut module, &zero_layout()).unwrap_err();
         assert!(err.contains("ARM64 b/bl out of range"), "{err}");
     }
 
     #[test]
     fn arm_conditional_out_of_range_is_reported() {
-        // +-2 MiB (19-bit * 4) is CBZ/B.cond's reach; 4 MiB is past it.
+        // The largest positive 19-bit immediate is 0x3ffff words;
+        // the next word is out of range.
         let mut module = synthetic_module(
             PatchKind::ArmCond,
             PatchTarget::Label(1),
-            vec![0, 0x40_0000],
+            vec![0, 0x0010_0000],
         );
         let err = patch(&mut module, &zero_layout()).unwrap_err();
         assert!(err.contains("conditional branch out of range"), "{err}");

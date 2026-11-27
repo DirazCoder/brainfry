@@ -186,7 +186,9 @@ mod tests {
         }
     }
 
+    // Exclude the test's byte-decoding assertions, not the ELF writer.
     #[test]
+    #[cfg_attr(coverage_nightly, coverage(off))]
     fn resolved_rel32_branches_stay_in_bounds() {
         // +[>+<-] keeps a real loop through the optimizer.
         let source = "+[>+<-]";
@@ -218,5 +220,27 @@ mod tests {
                 code_end
             );
         }
+    }
+
+    #[test]
+    fn code_and_rodata_are_preserved_across_the_alignment_gap() {
+        let mut module = Module {
+            code: vec![0x90; 17],
+            labels: Vec::new(),
+            fixups: Vec::new(),
+            rodata: b"error\0".to_vec(),
+            spans: Vec::new(),
+        };
+        let code = module.code.clone();
+        let rodata = module.rodata.clone();
+        let (bytes, layout) = build(&mut module, Arch::X86_64);
+
+        let code_off = (layout.code_vaddr - IMAGE_BASE) as usize;
+        let rodata_off = (layout.rodata_vaddr - IMAGE_BASE) as usize;
+        assert_eq!(code_off, 176);
+        assert_eq!(rodata_off % 16, 0);
+        assert_eq!(&bytes[code_off..code_off + code.len()], code);
+        assert_eq!(&bytes[code_off + code.len()..rodata_off], &[0; 15]);
+        assert_eq!(&bytes[rodata_off..], rodata);
     }
 }

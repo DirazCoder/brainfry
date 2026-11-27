@@ -649,6 +649,26 @@ mod tests {
     }
 
     #[test]
+    fn full_pipeline_keeps_offset_add_when_combined_factor_exceeds_u8() {
+        let mut ops = vec![Op::JumpIfZero { target: 0 }, Op::Sub(1), Op::MoveRight(1)];
+        ops.extend(vec![Op::Add(1); u8::MAX as usize + 1]);
+        ops.extend([Op::MoveLeft(1), Op::JumpIfNonZero { target: 0 }]);
+
+        assert_eq!(
+            optimize(ops),
+            vec![
+                Op::JumpIfZero { target: 6 },
+                Op::Sub(1),
+                Op::MoveRight(1),
+                Op::Add(u8::MAX),
+                Op::Add(1),
+                Op::MoveLeft(1),
+                Op::JumpIfNonZero { target: 0 },
+            ]
+        );
+    }
+
+    #[test]
     fn does_not_fold_loop_with_subtract_on_other_cell() {
         // [->-<]  decrements the other cell instead of adding -- not the
         // "spread value" pattern this pass targets

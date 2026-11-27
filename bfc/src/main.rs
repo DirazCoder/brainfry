@@ -101,4 +101,15 @@ mod tests {
             ExitCode::FAILURE
         );
     }
+
+    #[test]
+    fn write_success_returns_success() {
+        let program = Program {
+            ops: vec![bfformat::Op::Zero],
+        };
+        assert_eq!(
+            write_program(&program, "input.bf", "output.bfry", Vec::new()),
+            ExitCode::SUCCESS
+        );
+    }
 }

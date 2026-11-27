@@ -1005,6 +1005,8 @@ fn movn(e: &mut Emitter, rd: u32, imm: u32) {
 }
 
 /// `movk Xd, #imm16, lsl #hw*16` — F2800000 | hw<<21 | imm<<5 | Rd.
+// The code generator constructs these operands from checked u32 halves.
+#[cfg_attr(coverage_nightly, coverage(off))]
 fn movk(e: &mut Emitter, rd: u32, imm: u32, hw: u32) {
     debug_assert!(imm <= 0xFFFF && hw <= 3);
     e.u32(0xF280_0000 | (hw << 21) | (imm << 5) | rd);
@@ -1045,6 +1047,8 @@ fn ldr_x0_sp_8(e: &mut Emitter) {
 }
 
 /// `ldr Xt, [sp, #imm]` (imm multiple of 8) — F9400000 | (imm/8)<<10 | 31<<5 | Rt.
+// Stack offsets are constructed by the code generator and must remain aligned and encodable.
+#[cfg_attr(coverage_nightly, coverage(off))]
 fn ldr_imm(e: &mut Emitter, rt: u32, imm: u32) {
     debug_assert!(imm.is_multiple_of(8) && imm / 8 < 4096);
     e.u32(0xF940_0000 | ((imm / 8) << 10) | (31 << 5) | rt);
@@ -1052,6 +1056,8 @@ fn ldr_imm(e: &mut Emitter, rt: u32, imm: u32) {
 
 /// `str Xt, [sp, #imm]` (imm multiple of 8) — same form as ldr_imm with the
 /// L bit (bit 22) cleared: F9000000 | (imm/8)<<10 | 31<<5 | Rt.
+// Stack offsets are constructed by the code generator and must remain aligned and encodable.
+#[cfg_attr(coverage_nightly, coverage(off))]
 fn str_imm(e: &mut Emitter, rt: u32, imm: u32) {
     debug_assert!(imm.is_multiple_of(8) && imm / 8 < 4096);
     e.u32(0xF900_0000 | ((imm / 8) << 10) | (31 << 5) | rt);
@@ -1261,18 +1267,14 @@ mod tests {
             &ops,
             crate::target::Target::from_name("linux-aarch64").unwrap(),
         );
-        // The message lives in the read-only blob, so both buffers are
-        // searched.
+        // Runtime messages belong in the read-only blob, not executable code.
         let underflow_msg = b"pointer moved left of cell 0";
-        let in_code = m
-            .code
-            .windows(underflow_msg.len())
-            .any(|w| w == underflow_msg);
-        let in_rodata = m
-            .rodata
-            .windows(underflow_msg.len())
-            .any(|w| w == underflow_msg);
-        assert!(in_code || in_rodata);
+        assert!(
+            m.rodata
+                .windows(underflow_msg.len())
+                .any(|w| w == underflow_msg),
+            "underflow message was not emitted in read-only data"
+        );
     }
 
     #[test]
@@ -1287,12 +1289,13 @@ mod tests {
         // label resolves to the offset of label 0".
         let op0_offset = m.labels[0];
         assert_ne!(op0_offset, u32::MAX, "label 0 must be bound");
+        let label_offsets = m
+            .fixups
+            .iter()
+            .filter_map(|f| f.target.label_index())
+            .map(|i| m.labels[i as usize]);
         assert!(
-            m.fixups
-                .iter()
-                .any(|f| f.target.label_index().is_some_and(
-                    |i| (i as usize) < m.labels.len() && m.labels[i as usize] == op0_offset
-                )),
+            label_offsets.into_iter().any(|offset| offset == op0_offset),
             "no branch targets the scan's own start"
         );
     }
