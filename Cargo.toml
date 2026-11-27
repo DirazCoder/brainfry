@@ -1,14 +1,29 @@
 [workspace]
 resolver = "2"
-members = ["bfformat", "bfc", "bfrun", "bfnative", "bfinterp", "bfjit", "bfwasm", "bfjs", "bf2c", "bfdbg"]
+members = [
+    "bfformat",
+    "bfc",
+    "bfrun",
+    "bfnative",
+    "bfinterp",
+    "bfjit",
+    "bfwasm",
+    "bfjs",
+    "bf2c",
+    "bfdbg",
+]
 
 [profile.release]
-opt-level = 3              
-lto = "fat"                
-codegen-units = 1         
-panic = "abort"          
-strip = "symbols"       
-overflow-checks = false    
-debug = false               
-debug-assertions = false    
-incremental = false       
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+overflow-checks = false
+debug = false
+debug-assertions = false
+incremental = false
+
+[profile.release.package."*"]
+opt-level = 3
+codegen-units = 1
