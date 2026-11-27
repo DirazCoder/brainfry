@@ -1288,4 +1288,10 @@ mod tests {
         assert_eq!(read_uleb(&[0xff, 0x01], &mut i), 255);
         assert_eq!(i, 2);
     }
+
+    #[test]
+    #[should_panic(expected = "no matching JumpIfNonZero")]
+    fn match_loops_panics_on_an_unclosed_open() {
+        match_loops(&[Op::JumpIfZero { target: 0 }]);
+    }
 }

@@ -552,7 +552,7 @@ fn eliminate_dead_code(ops: Vec<Op>) -> Vec<Op> {
                 let was_allocated = address < tape_len;
                 let old = known.get(address);
                 let value = old.map(|v| v.wrapping_add(delta));
-                if !(delta == 0 && value == old && was_allocated) {
+                if !(delta == 0 && was_allocated) {
                     if old == Some(0) {
                         out.push(Op::SetAt {
                             offset,
@@ -611,7 +611,7 @@ fn eliminate_dead_code(ops: Vec<Op>) -> Vec<Op> {
                     let was_allocated = address < tape_len;
                     let old = known.get(address);
                     let value = old.map(|v| v.wrapping_add(delta));
-                    if !(delta == 0 && value == old && was_allocated) {
+                    if !(delta == 0 && was_allocated) {
                         if old == Some(0) {
                             out.push(Op::SetAt {
                                 offset,
@@ -1516,6 +1516,53 @@ mod tests {
                 Op::JumpIfZero { target: 3 },
                 Op::Output,
                 Op::JumpIfNonZero { target: 1 }
+            ]
+        );
+    }
+
+    #[test]
+    fn dce_keeps_a_nonzero_sub_and_tracks_the_cell_it_leaves_behind() {
+        assert_eq!(eliminate_dead_code(vec![Op::Sub(3)]), vec![Op::Sub(3)]);
+        // 0 - 3 = 253, so the loop is live. If Sub didn't update the known
+        // value the cell would still look zero and the loop would be dropped.
+        let live_loop = vec![
+            Op::Sub(3),
+            Op::JumpIfZero { target: 3 },
+            Op::Output,
+            Op::JumpIfNonZero { target: 1 },
+        ];
+        assert_eq!(eliminate_dead_code(live_loop.clone()), live_loop);
+    }
+
+    #[test]
+    fn zero_deltas_past_the_allocated_tape_still_grow_it() {
+        let beyond = INITIAL_TAPE_SIZE as isize;
+        // A zero delta on an allocated cell is a no-op and gets dropped. Past
+        // the end it still has to grow the tape, so it becomes a SetAt.
+        assert_eq!(
+            eliminate_dead_code(vec![Op::AddAt {
+                offset: beyond,
+                delta: 0
+            }]),
+            vec![Op::SetAt {
+                offset: beyond,
+                value: 0
+            }]
+        );
+        assert_eq!(
+            eliminate_dead_code(vec![
+                Op::Add(1),
+                Op::MulAdd {
+                    offset: beyond,
+                    factor: 0
+                }
+            ]),
+            vec![
+                Op::Add(1),
+                Op::SetAt {
+                    offset: beyond,
+                    value: 0
+                }
             ]
         );
     }

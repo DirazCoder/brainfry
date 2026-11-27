@@ -161,8 +161,9 @@ pub fn run(ops: &[Op], stdin: &mut dyn Read, stdout: &mut dyn Write) -> Result<(
             } => {
                 let min = offset_cell(cell, min_offset)?;
                 let max = offset_cell(cell, max_offset)?;
-                if max >= tape.len() || min >= tape.len() {
-                    grow_to_at_least(&mut tape, max.max(min))?;
+                let target = max.max(min);
+                if target >= tape.len() {
+                    grow_to_at_least(&mut tape, target)?;
                 }
             }
             Op::MulAdd { offset, factor } => {
@@ -768,6 +769,29 @@ mod tests {
 
             let result = run(
                 &[Op::Add(1), Op::Scan { stride: 2_000_000 }],
+                &mut Cursor::new(b""),
+                &mut Vec::new(),
+            );
+            assert!(matches!(result, Err(RunError::GrowFailed)));
+        });
+    }
+
+    #[test]
+    fn bounds_check_covers_the_farther_end_even_when_the_bounds_are_reversed() {
+        // The optimizer never emits min_offset > max_offset, but the check
+        // has to cover whichever end is farther.
+        let reversed = [Op::BoundsCheck {
+            min_offset: 40_000,
+            max_offset: 0,
+        }];
+        assert!(interp(&reversed, "").1.is_ok());
+
+        with_alloc_cap(|| {
+            let result = run(
+                &[Op::BoundsCheck {
+                    min_offset: 2_000_000,
+                    max_offset: 0,
+                }],
                 &mut Cursor::new(b""),
                 &mut Vec::new(),
             );

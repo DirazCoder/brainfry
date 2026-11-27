@@ -599,8 +599,13 @@ class BrowserHarness:
                 return result.returncode, result.stdout, result.stderr
 
             page = self.pages[engine]
+            # The split lane leaves __bfwasm (with its stdout/stderr hooks)
+            # on the page. The runtime reads it once at load, so a stale one
+            # sends this run's output to the previous program's capture and
+            # the console hooks below see nothing.
             page.evaluate(
                 "window.__bf={out:[],err:[],thrown:false};"
+                "delete window.__bfwasm;"
                 "delete window.__bfwasmExitCode")
             with open(js_path, encoding="utf-8") as f:
                 page.add_script_tag(content=f.read())

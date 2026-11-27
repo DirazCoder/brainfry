@@ -2017,4 +2017,23 @@ mod tests {
         // Past the end there is no op at all.
         assert_eq!(d.op_label(ops.len()), "(no op)");
     }
+
+    #[test]
+    fn bounds_check_grows_the_tape_only_when_the_window_needs_it() {
+        let grow = Op::BoundsCheck {
+            min_offset: 0,
+            max_offset: 30_000,
+        };
+        let mut d = Debugger::new(vec![grow], "optimized".into(), DEFAULT_UNDO_LIMIT);
+        assert_eq!(d.step(&mut Vec::new()), Stop::Finished);
+        assert_eq!(d.tape_len(), 30_001);
+
+        let within = Op::BoundsCheck {
+            min_offset: 0,
+            max_offset: 29_999,
+        };
+        let mut d = Debugger::new(vec![within], "optimized".into(), DEFAULT_UNDO_LIMIT);
+        assert_eq!(d.step(&mut Vec::new()), Stop::Finished);
+        assert_eq!(d.tape_len(), INITIAL_TAPE_SIZE);
+    }
 }
