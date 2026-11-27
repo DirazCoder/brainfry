@@ -133,6 +133,30 @@ jobs:
           done
           python3 scripts/differential_test_all.py .
 
+      # Runs after the other checks so a coverage gap doesn't hide their results.
+      # A script because cargo-llvm-cov has no --fail-under-branches.
+      - name: require 100% coverage
+        shell: bash
+        run: |
+          cargo +nightly llvm-cov report --branch --release \
+            --target "${{ matrix.target }}" \
+            --json --summary-only --output-path coverage-summary.json
+          python3 - <<'EOF'
+          import json, sys
+
+          with open("coverage-summary.json") as report:
+              totals = json.load(report)["data"][0]["totals"]
+          failed = False
+          for kind in ("functions", "lines", "regions", "branches"):
+              covered, count = totals[kind]["covered"], totals[kind]["count"]
+              print(f"{kind}: {covered}/{count}")
+              # A zero count means the metric wasn't collected at all.
+              if count == 0 or covered != count:
+                  print(f"::error::{kind} coverage is below 100% ({covered}/{count})")
+                  failed = True
+          sys.exit(failed)
+          EOF
+
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
