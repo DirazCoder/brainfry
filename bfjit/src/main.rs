@@ -107,8 +107,27 @@ fn run(args: Vec<String>) -> ExitCode {
 
     // One module: entry + body + exits + runtime routines, with fixups
     // for everything whose address wasn't known during emission.
-    let mut module = codegen::emit(&ops, target);
+    let module = codegen::emit(&ops, target);
 
+    match prepare_image(module, target) {
+        Ok(ready) => unsafe { jump(ready) },
+        Err(status) => status,
+    }
+}
+
+/// Everything `run` does after codegen and before the final, irreversible
+/// jump into generated code: map the image, resolve fixups against the
+/// real address, copy the bytes in, and flip the region to read+execute.
+///
+/// Split out of `run` so the three OS-fallible steps (`alloc`, `patch`,
+/// `make_executable`) can be driven into their `Err` arms from a test:
+/// `run` itself can't be, because its only path past them ends in
+/// `JitRegion::enter`, which never returns and terminates the process via
+/// a raw exit syscall — a test that reached that line would kill the test
+/// binary, not record a pass. `tests/e2e.rs` covers the happy path end to
+/// end in its own process for that reason; this function covers the error
+/// arms, which happy-path runs never take.
+fn prepare_image(mut module: codegen::Module, target: Target) -> Result<ReadyRegion, ExitCode> {
     // ---- layout the JIT image inside one region ----
     // code at offset 0 (entry stub first), rodata 16-aligned after it,
     // GOT/IAT (macOS/Windows only) 16-aligned after that. 16-alignment
@@ -120,13 +139,7 @@ fn run(args: Vec<String>) -> ExitCode {
 
     // Map first (writable, non-executable), then resolve fixups against
     // the region's real address, then copy.
-    let region = match unsafe { exec::JitRegion::alloc(image_layout.total) } {
-        Ok(region) => region,
-        Err(message) => {
-            eprintln!("bfjit: {message}");
-            return ExitCode::FAILURE;
-        }
-    };
+    let region = unsafe { exec::JitRegion::alloc(image_layout.total) }.map_err(alloc_failure)?;
 
     let layout = patch::Layout {
         code_vaddr: region.base as u64,
@@ -136,10 +149,7 @@ fn run(args: Vec<String>) -> ExitCode {
             .map_or(0, |off| region.base as u64 + off as u64),
     };
 
-    if let Err(message) = patch::patch(&mut module, &layout) {
-        eprintln!("bfjit: {message}");
-        return ExitCode::FAILURE;
-    }
+    patch::patch(&mut module, &layout).map_err(patch_failure)?;
 
     unsafe {
         // Writable phase: code, read-only data, and the "dynamic link"
@@ -150,26 +160,43 @@ fn run(args: Vec<String>) -> ExitCode {
             region.write_u64(offset, function);
         }
 
-        if let Err(status) = executable_status(region.make_executable()) {
-            return status;
-        }
+        executable_status(region.make_executable())?;
+    }
 
-        // Flush coverage counters (see the extern block above) before the
-        // jump: the generated entry never returns and exits the process via
-        // a path that skips the profile writer.
-        #[cfg(coverage)]
-        {
-            // Safety: this FFI function is only linked in coverage builds
-            // (where the profiling runtime that defines it is linked too)
-            // and takes no arguments and touches no Rust state.
+    Ok(ReadyRegion { region })
+}
+
+/// A region that has passed through [`prepare_image`] and is in its final,
+/// read+execute state: the only thing left to do with it is jump in, which
+/// is exactly what [`jump`] does and the only thing its private field lets
+/// a caller outside this module do.
+struct ReadyRegion {
+    region: exec::JitRegion,
+}
+
+/// The one-line irreversible tail of `run`'s happy path: flush coverage
+/// counters (the generated entry never returns through normal control
+/// flow, so nothing after this would otherwise get the chance) and jump.
+/// Kept separate from `prepare_image` so that function can return
+/// normally — and be tested — right up until this point.
+unsafe fn jump(ready: ReadyRegion) -> ! {
+    // Flush coverage counters (see the extern block above) before the
+    // jump: the generated entry never returns and exits the process via
+    // a path that skips the profile writer.
+    #[cfg(coverage)]
+    {
+        // Safety: this FFI function is only linked in coverage builds
+        // (where the profiling runtime that defines it is linked too)
+        // and takes no arguments and touches no Rust state.
+        unsafe {
             __llvm_profile_write_file();
         }
-
-        // Jump. The generated entry never returns — it runs the program
-        // and exits the process with the program's own exit status and
-        // I/O, so nothing after this line executes.
-        region.enter()
     }
+
+    // Jump. The generated entry never returns — it runs the program and
+    // exits the process with the program's own exit status and I/O, so
+    // nothing after this line executes.
+    unsafe { ready.region.enter() }
 }
 
 fn parse_source(input: &str, source: &str) -> Result<Vec<bfformat::Op>, String> {
@@ -193,6 +220,23 @@ fn executable_status(result: Result<(), String>) -> Result<(), ExitCode> {
         eprintln!("bfjit: {message}");
         ExitCode::FAILURE
     })
+}
+
+/// Reports a `JitRegion::alloc` failure (out-of-memory, or any other OS
+/// refusal to map the image) and turns it into the CLI's exit status.
+/// Pulled out of `run()`'s match arm so the message-formatting and
+/// `FAILURE` mapping can be driven directly from a test, the same way
+/// `executable_status` already is for the W^X flip.
+fn alloc_failure(message: String) -> ExitCode {
+    eprintln!("bfjit: {message}");
+    ExitCode::FAILURE
+}
+
+/// Reports a `patch::patch` failure (an unbound label or an out-of-range
+/// fixup — always a codegen bug, never user input) the same way.
+fn patch_failure(message: String) -> ExitCode {
+    eprintln!("bfjit: {message}");
+    ExitCode::FAILURE
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -289,6 +333,26 @@ mod tests {
     }
 
     #[test]
+    fn prepare_image_reports_a_patch_failure_as_a_cli_failure() {
+        // Same recipe patch.rs's own unbound_label_is_reported uses: a
+        // fixup pointing at label 0, left unbound (u32::MAX). codegen::emit
+        // never produces one of these itself — it's how patch::patch's own
+        // error arm is reached in a unit test — so building the Module by
+        // hand here is the right thing, not a shortcut around it.
+        let mut e = codegen::Emitter::new(1);
+        e.x86_rel32(codegen::PatchTarget::Label(0));
+        let module = codegen::Module {
+            code: e.code,
+            labels: e.labels, // label 0 left unbound (u32::MAX)
+            fixups: e.fixups,
+            rodata: e.rodata,
+            spans: e.spans,
+        };
+        let status = prepare_image(module, Target::host());
+        assert_eq!(status.err(), Some(ExitCode::FAILURE));
+    }
+
+    #[test]
     fn executable_protection_errors_become_cli_failures() {
         assert_eq!(
             executable_status(Err("protection denied".to_string())),
@@ -296,6 +360,24 @@ mod tests {
         );
         assert_eq!(executable_status(Ok(())), Ok(()));
     }
+
+    #[test]
+    fn alloc_failure_is_reported_as_a_cli_failure() {
+        assert_eq!(
+            alloc_failure("out of memory".to_string()),
+            ExitCode::FAILURE
+        );
+    }
+
+    #[test]
+    fn patch_failure_is_reported_as_a_cli_failure() {
+        assert_eq!(
+            patch_failure("fixup references unbound label 3".to_string()),
+            ExitCode::FAILURE
+        );
+    }
+
+
 
     /// Runs parse_args over a synthetic argv (program name first).
     fn parsed(args: &[&str]) -> Result<String, String> {
