@@ -431,3 +431,67 @@ fn write_source(tag: &str, source: &str) -> PathBuf {
     fs::write(&source_path, source).expect("writing test program");
     source_path
 }
+
+// ---------------------------------------------------------------------------
+// JitRegion::alloc failure — e2e
+// ---------------------------------------------------------------------------
+
+/// Verifies that an OS-level allocation failure inside `prepare_image`
+/// (the `JitRegion::alloc` path) is surfaced as a clean CLI failure (exit 1)
+/// rather than a panic or silent misbehaviour.
+///
+/// Strategy: run the real `bfjit` binary in a child shell with `ulimit -v`
+/// capping virtual memory to something far too small to hold any JIT region,
+/// then assert the child exits 1 and prints a human-readable error to stderr.
+///
+/// Skipped automatically on platforms where `ulimit -v` has no effect
+/// (Windows, macOS with SIP).  Set `BFJIT_SKIP_OOM_TEST=1` to opt out on
+/// any platform.
+#[test]
+#[cfg(target_os = "linux")]
+fn alloc_failure_in_prepare_image_is_reported_as_a_cli_failure() {
+    if std::env::var("BFJIT_SKIP_OOM_TEST").is_ok() {
+        eprintln!("skipping: BFJIT_SKIP_OOM_TEST is set");
+        return;
+    }
+
+    // Write a trivial (but valid) BF program so the error happens at alloc,
+    // not at parse or codegen.
+    let dir = std::env::temp_dir().join("bfjit-e2e-oom");
+    fs::create_dir_all(&dir).expect("creating temp dir");
+    let source_path = dir.join("program.bf");
+    fs::write(&source_path, "+.").expect("writing test program");
+
+    let bfjit = env!("CARGO_BIN_EXE_bfjit");
+
+    // ulimit -v is in KiB.  32 MiB is enough for the shell + loader but
+    // not nearly enough for a JIT mmap region (which asks for the full
+    // program image rounded up to page size, plus guard pages).
+    let ulimit_kb = 32 * 1024; // 32 MiB
+
+    let out = Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "ulimit -v {ulimit_kb} && exec {bfjit} {path}",
+            ulimit_kb = ulimit_kb,
+            bfjit = bfjit,
+            path = source_path.display(),
+        ))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("spawning constrained bfjit subprocess");
+
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "expected exit 1; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.is_empty(),
+        "expected a human-readable error on stderr, got silence"
+    );
+}
