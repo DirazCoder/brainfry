@@ -422,11 +422,11 @@ mod tests {
                 factor: 2,
             },
             Op::MulAdd {
-                offset: i32::MAX,
+                offset: i32::MAX as isize,
                 factor: 2,
             },
             Op::MulAdd {
-                offset: i32::MIN,
+                offset: i32::MIN as isize,
                 factor: 2,
             },
             Op::Scan { stride: 4095 },

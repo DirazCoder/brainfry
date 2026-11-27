@@ -169,6 +169,35 @@ fn emit_op(e: &mut Emitter, op: &Op, i: usize, rt: &Rt) {
             e.span(format!("op {i}: Zero — mov byte [r12], 0"));
             zero_cell(e);
         }
+        Op::AddAt { offset, delta } => {
+            e.span(format!(
+                "op {i}: AddAt {{ offset: {offset}, delta: {delta} }}"
+            ));
+            emit_signed_offset_check(e, offset, rt);
+            add_cell_at(e, offset as i32, delta);
+        }
+        Op::ZeroAt { offset } => {
+            e.span(format!("op {i}: ZeroAt {{ offset: {offset} }}"));
+            emit_signed_offset_check(e, offset, rt);
+            store_cell_at(e, offset as i32, 0);
+        }
+        Op::SetAt { offset, value } => {
+            e.span(format!(
+                "op {i}: SetAt {{ offset: {offset}, value: {value} }}"
+            ));
+            emit_signed_offset_check(e, offset, rt);
+            store_cell_at(e, offset as i32, value);
+        }
+        Op::BoundsCheck {
+            min_offset,
+            max_offset,
+        } => {
+            e.span(format!(
+                "op {i}: BoundsCheck {{ min_offset: {min_offset}, max_offset: {max_offset} }}"
+            ));
+            emit_signed_offset_check(e, min_offset, rt);
+            emit_signed_offset_check(e, max_offset, rt);
+        }
         Op::MoveRight(n) => {
             e.span(format!("op {i}: MoveRight({n}) — bounds check + grow"));
             // rax = cell + n. If rax >= end (unsigned) the destination cell
@@ -252,6 +281,22 @@ fn emit_op(e: &mut Emitter, op: &Op, i: usize, rt: &Rt) {
     }
 }
 
+fn emit_signed_offset_check(e: &mut Emitter, offset: isize, rt: &Rt) {
+    let magnitude = offset.unsigned_abs();
+    if magnitude > u32::MAX as usize {
+        jmp(
+            e,
+            if offset < 0 {
+                rt.err_underflow
+            } else {
+                rt.err_cap
+            },
+        );
+    } else {
+        emit_bounds_checked_offset(e, magnitude as u32, offset >= 0, rt);
+    }
+}
+
 /// Computes `r12 + offset` into `rax`, applying the same bounds policy a
 /// literal `MoveRight`/`MoveLeft` by that many cells would have applied:
 /// growing the tape on the right, erroring on underflow on the left. Both
@@ -303,7 +348,7 @@ fn emit_bounds_checked_offset(e: &mut Emitter, magnitude: u32, is_right: bool, r
 
 /// `MulAdd { offset, factor }`: add `[r12] * factor` into the cell at
 /// `r12 + offset`, wrapping mod 256 like every other cell write.
-fn emit_mul_add(e: &mut Emitter, offset: i32, factor: u8, rt: &Rt) {
+fn emit_mul_add(e: &mut Emitter, offset: isize, factor: u8, rt: &Rt) {
     // al = value in the source cell. If it's already 0 the loop this
     // replaces would never have run, so skip the write to that cell
     // entirely (its address might not even be valid to touch, e.g. one
@@ -325,7 +370,7 @@ fn emit_mul_add(e: &mut Emitter, offset: i32, factor: u8, rt: &Rt) {
     // leave it (its own `push rax` re-aligns to 16 for its internal
     // calls), so pushing anything ahead of that call here would throw off
     // every subsequent aligned call inside grow.
-    emit_bounds_checked_offset(e, offset.unsigned_abs(), offset >= 0, rt);
+    emit_signed_offset_check(e, offset, rt);
     // rax now holds the checked target address; move it out of the way so
     // rax is free again for the 8-bit multiply, which the x86 ALU only
     // offers in the al/ax form (mul r/m8 -> ax = al * r/m8, with the
@@ -337,6 +382,18 @@ fn emit_mul_add(e: &mut Emitter, offset: i32, factor: u8, rt: &Rt) {
     add_al_to_mem(e, RDX); // [rdx] = [rdx] + al, wrapping mod 256 in hardware
 
     e.bind_here(done);
+}
+
+fn add_cell_at(e: &mut Emitter, offset: i32, delta: u8) {
+    e.bytes(&[0x41, 0x80, 0x84, 0x24]);
+    e.bytes(&offset.to_le_bytes());
+    e.bytes(&[delta]);
+}
+
+fn store_cell_at(e: &mut Emitter, offset: i32, value: u8) {
+    e.bytes(&[0x41, 0xC6, 0x84, 0x24]);
+    e.bytes(&offset.to_le_bytes());
+    e.bytes(&[value]);
 }
 
 /// `Scan { stride }`: step the cell pointer by `stride` cells at a time
@@ -1404,12 +1461,19 @@ mod tests {
 
     #[test]
     fn offsets_past_the_imm32_reach_go_through_registers() {
-        // i32::MIN's magnitude (2^31) exceeds i32::MAX, so both the MulAdd
-        // bounds check and the Scan stride take the register-constant
-        // paths on the leftward side.
+        // The large signed offsets take the distinct error paths, while
+        // the i32 minimum still exercises the register-constant path.
         let ops = [
             Op::MulAdd {
-                offset: i32::MIN,
+                offset: i32::MIN as isize,
+                factor: 1,
+            },
+            Op::MulAdd {
+                offset: isize::MIN,
+                factor: 1,
+            },
+            Op::MulAdd {
+                offset: isize::MAX,
                 factor: 1,
             },
             Op::Scan { stride: i32::MIN },

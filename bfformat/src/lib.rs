@@ -11,7 +11,7 @@ pub const MAGIC: [u8; 4] = *b"BFRY";
 /// Bumped whenever the on-disk layout changes in a way old runtimes can't
 /// read. The runtime checks this and refuses mismatched files rather than
 /// guessing at a format it doesn't understand.
-pub const FORMAT_VERSION: u8 = 1;
+pub const FORMAT_VERSION: u8 = 2;
 
 /// Upper bound on how many ops `read_from` pre-allocates before reading
 /// the body. The file's declared op count is attacker-controlled input:
@@ -100,10 +100,26 @@ impl Program {
                 }
                 Op::Output | Op::Input | Op::Zero => {}
                 Op::MulAdd { offset, factor } => {
-                    out.write_all(&offset.to_le_bytes())?;
+                    out.write_all(&(*offset as i64).to_le_bytes())?;
                     out.write_all(&[*factor])?;
                 }
                 Op::Scan { stride } => out.write_all(&stride.to_le_bytes())?,
+                Op::AddAt { offset, delta } => {
+                    out.write_all(&(*offset as i64).to_le_bytes())?;
+                    out.write_all(&[*delta])?;
+                }
+                Op::ZeroAt { offset } => out.write_all(&(*offset as i64).to_le_bytes())?,
+                Op::SetAt { offset, value } => {
+                    out.write_all(&(*offset as i64).to_le_bytes())?;
+                    out.write_all(&[*value])?;
+                }
+                Op::BoundsCheck {
+                    min_offset,
+                    max_offset,
+                } => {
+                    out.write_all(&(*min_offset as i64).to_le_bytes())?;
+                    out.write_all(&(*max_offset as i64).to_le_bytes())?;
+                }
             }
         }
 
@@ -200,11 +216,26 @@ fn read_op<R: Read>(input: &mut R) -> Result<Op, FormatError> {
         },
         8 => Op::Zero,
         9 => Op::MulAdd {
-            offset: read_i32(input)?,
+            offset: read_i64(input)? as isize,
             factor: read_u8(input)?,
         },
         10 => Op::Scan {
             stride: read_i32(input)?,
+        },
+        11 => Op::AddAt {
+            offset: read_i64(input)? as isize,
+            delta: read_u8(input)?,
+        },
+        12 => Op::ZeroAt {
+            offset: read_i64(input)? as isize,
+        },
+        13 => Op::SetAt {
+            offset: read_i64(input)? as isize,
+            value: read_u8(input)?,
+        },
+        14 => Op::BoundsCheck {
+            min_offset: read_i64(input)? as isize,
+            max_offset: read_i64(input)? as isize,
         },
         other => return Err(FormatError::UnknownOpTag(other)),
     };
@@ -236,6 +267,14 @@ fn read_i32<R: Read>(input: &mut R) -> Result<i32, FormatError> {
     Ok(i32::from_le_bytes(buf))
 }
 
+fn read_i64<R: Read>(input: &mut R) -> Result<i64, FormatError> {
+    let mut buf = [0u8; 8];
+    input
+        .read_exact(&mut buf)
+        .map_err(|_| FormatError::Truncated)?;
+    Ok(i64::from_le_bytes(buf))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -261,6 +300,19 @@ mod tests {
                     factor: 3,
                 },
                 Op::Scan { stride: 1 },
+                Op::AddAt {
+                    offset: -3,
+                    delta: 9,
+                },
+                Op::ZeroAt { offset: 4 },
+                Op::SetAt {
+                    offset: 5,
+                    value: 255,
+                },
+                Op::BoundsCheck {
+                    min_offset: -7,
+                    max_offset: 11,
+                },
             ],
         };
 
@@ -283,6 +335,14 @@ mod tests {
                     factor: 255,
                 },
                 Op::Scan { stride: -3 },
+                Op::AddAt {
+                    offset: isize::MIN,
+                    delta: 1,
+                },
+                Op::BoundsCheck {
+                    min_offset: -100_000,
+                    max_offset: 200_000,
+                },
             ],
         };
 
@@ -291,6 +351,30 @@ mod tests {
 
         let restored = Program::read_from(&bytes[..]).unwrap();
         assert_eq!(restored.ops, program.ops);
+    }
+
+    #[test]
+    fn rejects_out_of_range_and_mismatched_jump_pairs() {
+        let cases = [
+            (
+                vec![Op::JumpIfZero { target: 1 }],
+                "jump target 1 is out of range (program has 1 instructions)",
+            ),
+            (
+                vec![
+                    Op::JumpIfZero { target: 1 },
+                    Op::JumpIfNonZero { target: 1 },
+                ],
+                "jump at instruction 0 does not pair with a matching bracket",
+            ),
+        ];
+
+        for (ops, expected) in cases {
+            let mut bytes = Vec::new();
+            Program { ops }.write_to(&mut bytes).unwrap();
+            let error = Program::read_from(&bytes[..]).unwrap_err();
+            assert_eq!(error.to_string(), expected);
+        }
     }
 
     #[test]
@@ -310,7 +394,7 @@ mod tests {
         assert!(matches!(err, FormatError::UnsupportedVersion(_)));
         assert_eq!(
             err.to_string(),
-            "bytecode format version 2 is not supported by this runtime"
+            "bytecode format version 3 is not supported by this runtime"
         );
     }
 
@@ -340,8 +424,8 @@ mod tests {
                 "bytecode file is truncated or corrupt".to_string(),
             ),
             (
-                FormatError::UnknownOpTag(11),
-                "unknown instruction tag 11 in bytecode".to_string(),
+                FormatError::UnknownOpTag(15),
+                "unknown instruction tag 15 in bytecode".to_string(),
             ),
             (
                 FormatError::InvalidJumpTarget { target: 9, len: 3 },
@@ -384,9 +468,9 @@ mod tests {
         let mut bytes = MAGIC.to_vec();
         bytes.push(FORMAT_VERSION);
         bytes.extend_from_slice(&1u32.to_le_bytes());
-        bytes.push(11); // no tag 11 exists
+        bytes.push(15); // no tag 15 exists
         let err = Program::read_from(&bytes[..]).unwrap_err();
-        assert!(matches!(err, FormatError::UnknownOpTag(11)));
+        assert!(matches!(err, FormatError::UnknownOpTag(15)));
     }
 
     #[test]
@@ -400,8 +484,8 @@ mod tests {
         }
         // Every operand-carrying tag, each with its operand missing: Add's
         // u8, Sub's u8, MoveRight's u32, MoveLeft's u32, both jump targets'
-        // u32, MulAdd's i32, and Scan's i32.
-        for tag in [0u8, 1, 2, 3, 6, 7, 9, 10] {
+        // u32, MulAdd's i64, Scan's i32, and each new signed offset.
+        for tag in [0u8, 1, 2, 3, 6, 7, 9, 10, 11, 12, 13, 14] {
             let err = Program::read_from(&with_body(tag)[..]).unwrap_err();
             assert!(matches!(err, FormatError::Truncated), "tag {tag}: {err:?}");
         }
@@ -411,15 +495,28 @@ mod tests {
     fn mul_add_with_offset_but_no_factor_is_truncated() {
         // The operand-sweep test below truncates MulAdd after the tag, so
         // only the offset read ever fails there; this file carries the
-        // full i32 offset and stops, driving the *factor* read's error
+        // full i64 offset and stops, driving the *factor* read's error
         // path as well.
         let mut bytes = MAGIC.to_vec();
         bytes.push(FORMAT_VERSION);
         bytes.extend_from_slice(&1u32.to_le_bytes());
         bytes.push(9); // MulAdd
-        bytes.extend_from_slice(&0i32.to_le_bytes()); // offset present
+        bytes.extend_from_slice(&0i64.to_le_bytes()); // offset present
         let err = Program::read_from(&bytes[..]).unwrap_err();
         assert!(matches!(err, FormatError::Truncated));
+    }
+
+    #[test]
+    fn offset_op_missing_trailing_operand_is_truncated() {
+        for tag in [11u8, 13, 14] {
+            let mut bytes = MAGIC.to_vec();
+            bytes.push(FORMAT_VERSION);
+            bytes.extend_from_slice(&1u32.to_le_bytes());
+            bytes.push(tag);
+            bytes.extend_from_slice(&0i64.to_le_bytes());
+            let error = Program::read_from(&bytes[..]).unwrap_err();
+            assert!(matches!(error, FormatError::Truncated), "tag {tag}");
+        }
     }
 
     /// A writer that succeeds for the first `n` write calls and fails
@@ -464,13 +561,26 @@ mod tests {
                     factor: 2,
                 },
                 Op::Scan { stride: -1 },
+                Op::AddAt {
+                    offset: -2,
+                    delta: 3,
+                },
+                Op::ZeroAt { offset: -3 },
+                Op::SetAt {
+                    offset: 4,
+                    value: 5,
+                },
+                Op::BoundsCheck {
+                    min_offset: -4,
+                    max_offset: 5,
+                },
             ],
         };
 
-        // 4 header writes + 11 tag bytes + 8 operands = 23 write calls;
+        // 3 header writes + 15 tags + 16 operands = 34 write calls.
         // failing at each position in turn covers every `?` (the n =
         // total_writes case is the all-succeed sanity below).
-        let total_writes = 4 + 11 + 8;
+        let total_writes = 3 + 15 + 16;
         for n in 0..total_writes {
             let mut sink = FailAfter { remaining_ok: n };
             assert!(

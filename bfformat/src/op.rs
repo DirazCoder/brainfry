@@ -28,10 +28,10 @@ pub enum Op {
     /// "multiply this value and dump it over there" written as a decrement
     /// loop. `offset` is signed since the target cell can be on either side
     /// of the tape head; `factor` is a u8 because the loop body can only add
-    /// a bounded amount per iteration before folding would itself change
-    /// behavior (see optimize.rs for the exact conditions).
+    /// a wrapping amount per iteration (see optimize.rs for the exact
+    /// conditions).
     MulAdd {
-        offset: i32,
+        offset: isize,
         factor: u8,
     },
     /// Step the tape head by `stride` cells at a time until landing on a
@@ -42,6 +42,28 @@ pub enum Op {
     /// scans left.
     Scan {
         stride: i32,
+    },
+    /// Add a wrapping byte delta to a fixed cell relative to the pointer.
+    AddAt {
+        offset: isize,
+        delta: u8,
+    },
+    /// Set a fixed cell relative to the pointer to zero.
+    ZeroAt {
+        offset: isize,
+    },
+    /// Store a constant byte to a fixed cell relative to the pointer.
+    SetAt {
+        offset: isize,
+        value: u8,
+    },
+    /// Check that all pointer positions in the inclusive offset interval
+    /// are valid, growing the tape through `max_offset` when necessary.
+    /// Used when a straight-line movement window is replaced by one final
+    /// pointer move, so intermediate bounds effects remain observable.
+    BoundsCheck {
+        min_offset: isize,
+        max_offset: isize,
     },
 }
 
@@ -62,6 +84,10 @@ impl Op {
             Op::Zero => 8,
             Op::MulAdd { .. } => 9,
             Op::Scan { .. } => 10,
+            Op::AddAt { .. } => 11,
+            Op::ZeroAt { .. } => 12,
+            Op::SetAt { .. } => 13,
+            Op::BoundsCheck { .. } => 14,
         }
     }
 }
@@ -90,8 +116,21 @@ mod tests {
                 factor: 0,
             },
             Op::Scan { stride: 0 },
+            Op::AddAt {
+                offset: 0,
+                delta: 0,
+            },
+            Op::ZeroAt { offset: 0 },
+            Op::SetAt {
+                offset: 0,
+                value: 0,
+            },
+            Op::BoundsCheck {
+                min_offset: 0,
+                max_offset: 0,
+            },
         ];
         let tags: Vec<u8> = ops.iter().map(Op::tag).collect();
-        assert_eq!(tags, (0..=10).collect::<Vec<u8>>());
+        assert_eq!(tags, (0..=14).collect::<Vec<u8>>());
     }
 }

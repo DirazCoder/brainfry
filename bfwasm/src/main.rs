@@ -22,10 +22,12 @@ const USAGE: &str = "usage: bfwasm [options] <input.bf>
 options:
   --target <target>      output target: wasi (default) or browser
   -o, --output <file>    output path (default extension follows target)
+  --split                write a browser .js loader and adjacent .wasm module
 
 Compiles to a standalone WASI .wasm module by default. Use --target browser
 to write a self-contained JavaScript file with an inline WASI shim. An output
 path ending in .js also selects browser mode unless --target wasi is explicit.
+Use --split with a browser target to write the .wasm module beside the loader.
 
 Examples:
   bfwasm program.bf
@@ -40,7 +42,7 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    let (input, output, target) = match parse_args(args) {
+    let (input, output, target, split) = match parse_args(args) {
         Ok(parsed) => parsed,
         Err(message) => {
             eprintln!("{message}\n\n{USAGE}");
@@ -68,13 +70,39 @@ fn main() -> ExitCode {
     let ops = optimize::optimize(raw_ops);
 
     let module = codegen::compile(&ops);
-    let output_bytes = match target {
-        Target::Wasi => module,
-        Target::Browser => browser::compile(&module).into_bytes(),
-    };
     let output_path = match output {
         Some(output) => output,
         None => default_output_path(&input, target),
+    };
+
+    if split {
+        let (wasm_output_path, wasm_filename) = match split_wasm_path(&output_path) {
+            Ok(paths) => paths,
+            Err(message) => {
+                eprintln!("{message}\n\n{USAGE}");
+                return ExitCode::FAILURE;
+            }
+        };
+        if let Err(err) = fs::write(&wasm_output_path, &module) {
+            eprintln!("couldn't write {wasm_output_path}: {err}");
+            return ExitCode::FAILURE;
+        }
+        let output_bytes = browser::compile_split(&wasm_filename).into_bytes();
+        if let Err(err) = fs::write(&output_path, &output_bytes) {
+            eprintln!("couldn't write {output_path}: {err}");
+            return ExitCode::FAILURE;
+        }
+        println!(
+            "compiled {input} -> {output_path} and {wasm_output_path} ({} instructions, {} bytes)",
+            ops.len(),
+            output_bytes.len()
+        );
+        return ExitCode::SUCCESS;
+    }
+
+    let output_bytes = match target {
+        Target::Wasi => module,
+        Target::Browser => browser::compile(&module).into_bytes(),
     };
 
     if let Err(err) = fs::write(&output_path, &output_bytes) {
@@ -124,10 +152,11 @@ fn resolve_target(explicit: Option<Target>, output: Option<&str>) -> Target {
     })
 }
 
-fn parse_args(args: Vec<String>) -> Result<(String, Option<String>, Target), String> {
+fn parse_args(args: Vec<String>) -> Result<(String, Option<String>, Target, bool), String> {
     let mut input: Option<String> = None;
     let mut output: Option<String> = None;
     let mut target: Option<Target> = None;
+    let mut split = false;
 
     let mut args = args.into_iter().skip(1);
     while let Some(arg) = args.next() {
@@ -139,6 +168,7 @@ fn parse_args(args: Vec<String>) -> Result<(String, Option<String>, Target), Str
                 };
                 target = Some(parse_target(&value)?);
             }
+            "--split" => split = true,
             "-o" | "--output" => {
                 output = Some(args.next().ok_or("--output needs a value")?);
             }
@@ -156,7 +186,27 @@ fn parse_args(args: Vec<String>) -> Result<(String, Option<String>, Target), Str
 
     let input = input.ok_or("no input file given")?;
     let target = resolve_target(target, output.as_deref());
-    Ok((input, output, target))
+    if split && target != Target::Browser {
+        return Err("--split requires the browser target".into());
+    }
+    Ok((input, output, target, split))
+}
+
+fn split_wasm_path(js_output_path: &str) -> Result<(String, String), String> {
+    let js_path = Path::new(js_output_path);
+    if js_path
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("wasm"))
+    {
+        return Err("--split cannot use a .wasm loader path".into());
+    }
+    let wasm_path = js_path.with_extension("wasm");
+    let wasm_filename = wasm_path
+        .file_name()
+        .ok_or("--split output path must include a filename")?
+        .to_string_lossy()
+        .into_owned();
+    Ok((wasm_path.to_string_lossy().into_owned(), wasm_filename))
 }
 
 fn default_output_path(input_path: &str, target: Target) -> String {
@@ -228,7 +278,7 @@ mod tests {
                 "--target".into(),
                 "browser".into()
             ]),
-            Ok(("program.bf".into(), None, Target::Browser))
+            Ok(("program.bf".into(), None, Target::Browser, false))
         );
     }
 
@@ -242,6 +292,61 @@ mod tests {
                 "unknown".into()
             ]),
             Err("unknown target: unknown".into())
+        );
+    }
+
+    #[test]
+    fn split_requires_browser_target_after_extension_inference() {
+        assert_eq!(
+            parse_args(vec![
+                "bfwasm".into(),
+                "program.bf".into(),
+                "--target".into(),
+                "browser".into(),
+                "--split".into()
+            ]),
+            Ok(("program.bf".into(), None, Target::Browser, true))
+        );
+        assert_eq!(
+            parse_args(vec![
+                "bfwasm".into(),
+                "program.bf".into(),
+                "-o".into(),
+                "program.js".into(),
+                "--split".into()
+            ]),
+            Ok((
+                "program.bf".into(),
+                Some("program.js".into()),
+                Target::Browser,
+                true
+            ))
+        );
+        assert_eq!(
+            parse_args(vec![
+                "bfwasm".into(),
+                "program.bf".into(),
+                "--target".into(),
+                "wasi".into(),
+                "--split".into()
+            ]),
+            Err("--split requires the browser target".into())
+        );
+    }
+
+    #[test]
+    fn split_wasm_path_uses_loader_stem_and_rejects_collision() {
+        assert_eq!(
+            split_wasm_path("dist/app.js"),
+            Ok(("dist/app.wasm".into(), "app.wasm".into()))
+        );
+        assert_eq!(
+            split_wasm_path("app.WASM"),
+            Err("--split cannot use a .wasm loader path".into())
+        );
+        assert_eq!(
+            split_wasm_path(std::path::MAIN_SEPARATOR_STR),
+            Err("--split output path must include a filename".into())
         );
     }
 

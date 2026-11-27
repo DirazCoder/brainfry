@@ -424,6 +424,40 @@ fn emit_op(out: &mut String, op: &Op, pad: &str) {
         Op::Input => out.push_str(&format!(
             "{pad}{{ const c = readIn(); if (c >= 0) {{ tape[ptr] = c; }} }}\n"
         )),
+        Op::AddAt { offset, delta } => out.push_str(&format!(
+            "{pad}{{ const t = ptr + {offset};\n\
+             {pad}  if (t < 0) {{ die(\"runtime error: pointer moved left of cell 0\"); }}\n\
+             {pad}  if (t >= TAPE_MAX) {{ die(\"runtime error: tape limit exceeded (1073741824 bytes)\"); }}\n\
+             {pad}  if (t >= tape.length) {{ grow(t); }}\n\
+             {pad}  tape[ptr + {offset}] += {delta};\n\
+             {pad}}}\n"
+        )),
+        Op::ZeroAt { offset } => out.push_str(&format!(
+            "{pad}{{ const t = ptr + {offset};\n\
+             {pad}  if (t < 0) {{ die(\"runtime error: pointer moved left of cell 0\"); }}\n\
+             {pad}  if (t >= TAPE_MAX) {{ die(\"runtime error: tape limit exceeded (1073741824 bytes)\"); }}\n\
+             {pad}  if (t >= tape.length) {{ grow(t); }}\n\
+             {pad}  tape[ptr + {offset}] = 0;\n\
+             {pad}}}\n"
+        )),
+        Op::SetAt { offset, value } => out.push_str(&format!(
+            "{pad}{{ const t = ptr + {offset};\n\
+             {pad}  if (t < 0) {{ die(\"runtime error: pointer moved left of cell 0\"); }}\n\
+             {pad}  if (t >= TAPE_MAX) {{ die(\"runtime error: tape limit exceeded (1073741824 bytes)\"); }}\n\
+             {pad}  if (t >= tape.length) {{ grow(t); }}\n\
+             {pad}  tape[ptr + {offset}] = {value};\n\
+             {pad}}}\n"
+        )),
+        Op::BoundsCheck {
+            min_offset,
+            max_offset,
+        } => out.push_str(&format!(
+            "{pad}{{ const lo = ptr + {min_offset}; const hi = ptr + {max_offset};\n\
+             {pad}  if (lo < 0) {{ die(\"runtime error: pointer moved left of cell 0\"); }}\n\
+             {pad}  if (lo >= TAPE_MAX || hi >= TAPE_MAX) {{ die(\"runtime error: tape limit exceeded (1073741824 bytes)\"); }}\n\
+             {pad}  if (hi >= tape.length) {{ grow(hi); }}\n\
+             {pad}}}\n"
+        )),
         // Source-cell zero is a full skip — no bounds check, no write —
         // exactly like the interpreter's `if value != 0` guard, since the
         // loop this op replaces never ran on a zero cell either. Built
@@ -438,6 +472,10 @@ fn emit_op(out: &mut String, op: &Op, pad: &str) {
                 "  if (t < 0) { die(\"runtime error: pointer moved left of cell 0\"); }\n",
             );
             out.push_str(pad);
+            out.push_str(
+                "  if (t >= TAPE_MAX) { die(\"runtime error: tape limit exceeded (1073741824 bytes)\"); }\n",
+            );
+            out.push_str(pad);
             out.push_str("  if (t >= tape.length) { grow(t); }\n");
             out.push_str(&format!("{pad}  tape[t] += v * {factor};\n"));
             out.push_str(pad);
@@ -450,6 +488,10 @@ fn emit_op(out: &mut String, op: &Op, pad: &str) {
             out.push_str(pad);
             out.push_str(
                 "  if (ptr < 0) { die(\"runtime error: pointer moved left of cell 0\"); }\n",
+            );
+            out.push_str(pad);
+            out.push_str(
+                "  if (ptr >= TAPE_MAX) { die(\"runtime error: tape limit exceeded (1073741824 bytes)\"); }\n",
             );
             out.push_str(pad);
             out.push_str("  if (ptr >= tape.length) { grow(ptr); }\n");
@@ -493,7 +535,16 @@ mod tests {
 
     #[test]
     fn ir_ops_lower_to_the_documented_statements() {
-        let js = compiled("+-><.");
+        let js = compile(
+            &[
+                Op::Add(1),
+                Op::Sub(1),
+                Op::MoveRight(1),
+                Op::MoveLeft(1),
+                Op::Output,
+            ],
+            "test.bf",
+        );
         assert!(js.contains("tape[ptr] += 1;"), "Add: {js}");
         assert!(js.contains("tape[ptr] -= 1;"), "Sub: {js}");
         assert!(js.contains("ptr += 1;"), "MoveRight: {js}");
@@ -506,22 +557,33 @@ mod tests {
 
     #[test]
     fn zero_lowering_uses_the_documented_form() {
-        let js = compiled("+++[-]");
+        let js = compile(&[Op::Zero], "test.bf");
         assert!(js.contains("tape[ptr] = 0;"));
-        // The raw decrement loop must be gone.
-        assert!(!js.contains("while (tape[ptr] !== 0) {\n  tape[ptr] -= 1;"));
+        // The known-zero program is eliminated by the shared optimizer.
+        let folded = compiled("+++[-]");
+        assert!(!folded.contains("while (tape[ptr] !== 0) {\n  tape[ptr] -= 1;"));
     }
 
     #[test]
     fn mul_add_lowering_uses_offset_and_factor() {
-        let js = compiled("+++[->++<]");
+        let js = compile(
+            &[
+                Op::Add(3),
+                Op::MulAdd {
+                    offset: 1,
+                    factor: 2,
+                },
+                Op::Zero,
+            ],
+            "test.bf",
+        );
         assert!(js.contains("const t = ptr + 1;"));
         assert!(js.contains("tape[t] += v * 2;"));
     }
 
     #[test]
     fn scan_lowering_is_a_guarded_while() {
-        let js = compiled("[>]");
+        let js = compile(&[Op::Scan { stride: 1 }], "test.bf");
         assert!(js.contains("while (tape[ptr] !== 0) {\n    ptr += 1;"));
         assert!(js.contains("if (ptr >= tape.length) { grow(ptr); }"));
     }
@@ -604,8 +666,18 @@ mod tests {
         // 1198 ops (alternating `>+` never folds) plus a loop: past the
         // threshold, the loop body becomes a function and the while stays
         // as the calling skeleton.
-        let source = format!("{}{}", ">+".repeat(599), "[.]");
-        let js = compiled(&source);
+        let mut ops = Vec::new();
+        for _ in 0..599 {
+            ops.push(Op::MoveRight(1));
+            ops.push(Op::Add(1));
+        }
+        let open = ops.len() as u32;
+        ops.extend([
+            Op::JumpIfZero { target: open + 2 },
+            Op::Output,
+            Op::JumpIfNonZero { target: open },
+        ]);
+        let js = compile(&ops, "test.bf");
         // Ids are shared between S and L in emission order: the straight
         // run first takes S0, so the loop body takes L1.
         assert!(js.contains("function L1() {"), "no L function: {js}");
@@ -625,7 +697,12 @@ mod tests {
     fn big_flat_programs_chunk_the_straight_runs() {
         // 1200 ops with no loops at all (alternating `>+` never folds): the
         // one long run still must not leave a giant single function behind.
-        let js = compiled(&">+".repeat(600));
+        let mut ops = Vec::new();
+        for _ in 0..600 {
+            ops.push(Op::MoveRight(1));
+            ops.push(Op::Add(1));
+        }
+        let js = compile(&ops, "test.bf");
         assert!(js.contains("function S0() {"), "no S function: {js}");
         assert!(js.contains("S0();"), "{js}");
         assert!(!js.contains("function L"), "no loops, no L functions: {js}");

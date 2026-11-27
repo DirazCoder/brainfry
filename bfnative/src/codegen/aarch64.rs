@@ -182,6 +182,41 @@ fn emit_op(e: &mut Emitter, op: &Op, i: usize, rt: &Rt) {
             e.span(format!("op {i}: Zero — strb wzr, [x19]"));
             strb_wzr(e, CELL);
         }
+        Op::AddAt { offset, delta } => {
+            e.span(format!(
+                "op {i}: AddAt {{ offset: {offset}, delta: {delta} }}"
+            ));
+            emit_signed_offset_check(e, offset, rt);
+            mov_reg(e, X9, X0);
+            ldrb_w(e, X10, X9);
+            add_w_imm(e, X10, X10, delta as u32);
+            strb_w(e, X10, X9);
+        }
+        Op::ZeroAt { offset } => {
+            e.span(format!("op {i}: ZeroAt {{ offset: {offset} }}"));
+            emit_signed_offset_check(e, offset, rt);
+            mov_reg(e, X9, X0);
+            strb_wzr(e, X9);
+        }
+        Op::SetAt { offset, value } => {
+            e.span(format!(
+                "op {i}: SetAt {{ offset: {offset}, value: {value} }}"
+            ));
+            emit_signed_offset_check(e, offset, rt);
+            mov_reg(e, X9, X0);
+            movz(e, X10, value as u32);
+            strb_w(e, X10, X9);
+        }
+        Op::BoundsCheck {
+            min_offset,
+            max_offset,
+        } => {
+            e.span(format!(
+                "op {i}: BoundsCheck {{ min_offset: {min_offset}, max_offset: {max_offset} }}"
+            ));
+            emit_signed_offset_check(e, min_offset, rt);
+            emit_signed_offset_check(e, max_offset, rt);
+        }
         Op::MoveRight(n) => {
             e.span(format!("op {i}: MoveRight({n}) — bounds check + grow"));
             // x0 = cell + n; if x0 >= end (unsigned) call grow, which
@@ -262,6 +297,22 @@ fn emit_op(e: &mut Emitter, op: &Op, i: usize, rt: &Rt) {
     }
 }
 
+fn emit_signed_offset_check(e: &mut Emitter, offset: isize, rt: &Rt) {
+    let magnitude = offset.unsigned_abs();
+    if magnitude > u32::MAX as usize {
+        b_label(
+            e,
+            if offset < 0 {
+                rt.err_underflow
+            } else {
+                rt.err_cap
+            },
+        );
+    } else {
+        emit_bounds_checked_offset(e, magnitude as u32, offset >= 0, rt);
+    }
+}
+
 /// The bracket-jump trampoline. Layout (label `i` is already bound by the
 /// caller at the first instruction):
 ///
@@ -339,7 +390,7 @@ fn emit_bounds_checked_offset(e: &mut Emitter, magnitude: u32, is_right: bool, r
 /// target sharing the same source cell, followed by a single trailing Zero
 /// op. Zeroing here too would make every MulAdd after the first in such a
 /// group read 0 instead of the real value.
-fn emit_mul_add(e: &mut Emitter, offset: i32, factor: u8, rt: &Rt) {
+fn emit_mul_add(e: &mut Emitter, offset: isize, factor: u8, rt: &Rt) {
     // x9 = value in the source cell. If it's already 0 the loop this
     // replaces would never have run, so skip the write to that cell
     // entirely (its address might not even be valid to touch, e.g. one
@@ -354,7 +405,7 @@ fn emit_mul_add(e: &mut Emitter, offset: i32, factor: u8, rt: &Rt) {
     // source value is *reloaded from the cell* after the check, exactly the
     // way the x86-64 backend reloads al after its bounds check: the cell
     // itself is the only storage guaranteed to survive the call.
-    emit_bounds_checked_offset(e, offset.unsigned_abs(), offset >= 0, rt);
+    emit_signed_offset_check(e, offset, rt);
     // x0 now holds the checked target address.
     mov_reg(e, X9, X0); // x9 = target address, freed from x0 for the mul call
     ldrb_w(e, X11, CELL); // x11 = [x19] again — reloaded, not parked
@@ -1174,6 +1225,32 @@ mod tests {
     }
 
     #[test]
+    fn immediate_subtraction_and_constant_materialization_cover_both_sizes() {
+        let mut e = Emitter::new(0);
+        sub_w_imm(&mut e, X9, CELL, 7);
+        assert_eq!(w32(&e.code, 0), 0x5100_1E69);
+
+        let mut expected = Emitter::new(0);
+        sub_w_imm(&mut expected, X9, X9, 7);
+        let mut zero = Emitter::new(0);
+        strb_wzr(&mut zero, CELL);
+        let module = crate::codegen::emit(
+            &[Op::Sub(7), Op::Zero],
+            crate::target::Target::from_name("linux-aarch64").unwrap(),
+        );
+        assert!(module.code.windows(4).any(|word| word == expected.code));
+        assert!(module.code.windows(4).any(|word| word == zero.code));
+
+        let mut small = Emitter::new(0);
+        mov_imm32(&mut small, X10, 7);
+        assert_eq!(small.code.len(), 4);
+
+        let mut large = Emitter::new(0);
+        mov_imm32(&mut large, X10, 0x1_0000);
+        assert_eq!(large.code.len(), 8);
+    }
+
+    #[test]
     fn grow_call_is_bl_not_b() {
         // bf_grow returns, so MoveRight must reach it with bl (0x94......),
         // never a plain b.
@@ -1260,7 +1337,7 @@ mod tests {
     #[test]
     fn mul_add_negative_offset_checks_underflow() {
         let ops = [Op::MulAdd {
-            offset: -5,
+            offset: isize::MIN,
             factor: 1,
         }];
         let m = crate::codegen::emit(
@@ -1364,6 +1441,14 @@ mod tests {
             },
             Op::MulAdd {
                 offset: -5000,
+                factor: 1,
+            },
+            Op::MulAdd {
+                offset: isize::MAX,
+                factor: 1,
+            },
+            Op::MulAdd {
+                offset: isize::MIN,
                 factor: 1,
             },
             Op::Scan { stride: 5000 },

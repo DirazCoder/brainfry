@@ -18,7 +18,8 @@ makes missing runtimes and compilers fatal for CI. `--only-node` runs only
 the bfjs and bfwasm Node.js lanes, without executing the other backends.
 
 stdout, stderr, and exit status must match bfrun byte-for-byte. Browser lanes
-use empty stdin because browser execution has EOF semantics.
+without configured browser hooks use empty stdin because browser execution has
+EOF semantics; the split-loader lane supplies corpus stdin through __bfwasm.
 The corpus is the 27-program set from differential_test.py (deep nesting,
 multiplication loops, tape growth to 200k cells, wraparound, EOF semantics,
 stdin echo, runtime-error paths) plus Erik Bosman's mandelbrot.b — the same
@@ -49,12 +50,15 @@ are architecture-independent). Provide any subset.
 from contextlib import contextmanager
 import argparse
 import base64
+from functools import partial
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 import os
 import platform
 import shutil
 import subprocess
 import sys
 import tempfile
+from threading import Thread
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -64,9 +68,9 @@ EXE = ".exe" if os.name == "nt" else ""
 
 
 @contextmanager
-def temporary_directory():
+def temporary_directory(directory=None):
     """Create a temp directory, retrying transient Windows executable locks."""
-    td = tempfile.mkdtemp()
+    td = tempfile.mkdtemp(dir=directory)
     try:
         yield td
     finally:
@@ -471,6 +475,11 @@ def compile_artifact(binary, source, extension, td):
     return result, output_path
 
 
+class QuietHTTPRequestHandler(SimpleHTTPRequestHandler):
+    def log_message(self, _format, *_args):
+        pass
+
+
 class BrowserHarness:
     """One Playwright browser instance per engine for the entire corpus."""
 
@@ -478,17 +487,32 @@ class BrowserHarness:
         self.playwright = sync_playwright().start()
         self.browsers = {}
         self.pages = {}
+        self.http_root = tempfile.TemporaryDirectory(prefix="bfwasm-browser-")
+        self.http_server = None
+        self.http_thread = None
         try:
+            with open(os.path.join(self.http_root.name, "index.html"), "w") as f:
+                f.write("<!doctype html><meta charset=utf-8><title>bf</title>")
+            handler = partial(QuietHTTPRequestHandler,
+                             directory=self.http_root.name)
+            self.http_server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+            self.http_thread = Thread(target=self.http_server.serve_forever,
+                                      daemon=True)
+            self.http_thread.start()
+            self.http_url = f"http://127.0.0.1:{self.http_server.server_port}/"
             for name in ("chromium", "firefox", "webkit"):
                 browser = getattr(self.playwright, name).launch()
                 page = browser.new_page()
-                page.set_content(
-                    "<!doctype html><meta charset=utf-8><title>bf</title>"
-                    "<script>window.__bf={out:[],err:[],thrown:false};"
+                capture_script = (
+                    "window.__bf={out:[],err:[],thrown:false};"
                     "console.log=(...a)=>window.__bf.out.push(String(a[0]));"
                     "console.error=(...a)=>window.__bf.err.push(String(a[0]));"
                     "window.addEventListener('error',()=>{window.__bf.thrown=true});"
-                    "</script>")
+                )
+                page.add_init_script(capture_script)
+                page.set_content(
+                    "<!doctype html><meta charset=utf-8><title>bf</title>"
+                    f"<script>{capture_script}</script>")
                 self.browsers[name] = browser
                 self.pages[name] = page
         except Exception:
@@ -589,6 +613,48 @@ class BrowserHarness:
                 stderr += b"\n"
             return page.evaluate("window.__bfwasmExitCode"), stdout, stderr
 
+    def run_wasm_split(self, engine, source, stdin):
+        with temporary_directory(self.http_root.name) as td:
+            source_path = os.path.join(td, "p.bf")
+            js_path = os.path.join(td, "p.js")
+            with open(source_path, "w") as f:
+                f.write(source)
+            result = subprocess.run(
+                [BFWASM, source_path, "--target", "browser", "--split",
+                 "-o", js_path],
+                capture_output=True)
+            if result.returncode != 0:
+                return result.returncode, result.stdout, result.stderr
+
+            relative_dir = os.path.basename(td)
+            page = self.pages[engine]
+            page.goto(self.http_url + "index.html")
+            page.evaluate(
+                """({ input, useBytes }) => {
+                  const capture = { stdout: [], stderr: [] };
+                  globalThis.__bfwasmCapture = capture;
+                  globalThis.__bfwasm = {
+                    stdin: useBytes ? new Uint8Array(input) : "",
+                    onStdout(chunk) { capture.stdout.push(...chunk); },
+                    onStderr(chunk) { capture.stderr.push(...chunk); }
+                  };
+                  delete globalThis.__bfwasmExitCode;
+                }""",
+                {"input": list(stdin.encode()), "useBytes": bool(stdin)})
+            page.evaluate(
+                "url => import(url)",
+                self.http_url + relative_dir + "/p.js")
+            page.wait_for_function(
+                "typeof globalThis.__bfwasmExitCode === 'number'",
+                timeout=30000)
+            exit_code, stdout, stderr = page.evaluate(
+                """() => [
+                  globalThis.__bfwasmExitCode,
+                  globalThis.__bfwasmCapture.stdout,
+                  globalThis.__bfwasmCapture.stderr
+                ]""")
+            return exit_code, bytes(stdout), bytes(stderr)
+
     def close(self):
         for browser in self.browsers.values():
             browser.close()
@@ -596,6 +662,14 @@ class BrowserHarness:
         if self.playwright:
             self.playwright.stop()
             self.playwright = None
+        if self.http_server:
+            self.http_server.shutdown()
+            self.http_server.server_close()
+            self.http_server = None
+        if self.http_thread:
+            self.http_thread.join(timeout=5)
+            self.http_thread = None
+        self.http_root.cleanup()
 
 
 def run_c(source, stdin):
@@ -784,6 +858,9 @@ def main(argv=None) -> int:
                         (f"bfwasm-js({engine})",
                          (browser_ref,
                           browser_harness.run_wasm_browser_output(engine, source))),
+                        (f"bfwasm-split({engine})",
+                         (ref,
+                          browser_harness.run_wasm_split(engine, source, stdin))),
                     ])
 
         for lane, path in aarch64_lanes:

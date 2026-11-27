@@ -562,7 +562,7 @@ mod tests {
     }
 
     #[test]
-    fn absurd_set_growth_is_a_clean_error() {
+    fn absurd_set_growth_reports_the_tape_limit() {
         let (_, dbg) = script(
             "+",
             &[
@@ -570,7 +570,10 @@ mod tests {
                 "set ptr = 1000000000000000000",
             ],
         );
-        assert!(dbg.contains("error: failed to grow tape"), "{dbg}");
+        assert!(
+            dbg.contains("error: tape limit exceeded (1073741824 bytes)"),
+            "{dbg}"
+        );
     }
 
     #[test]

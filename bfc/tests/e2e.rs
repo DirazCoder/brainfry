@@ -118,7 +118,7 @@ fn compiles_and_writes_a_loadable_bfry_file() {
     // and a body the loader accepts.
     let bytes = fs::read(&output_path).expect("reading compiled program");
     assert_eq!(&bytes[..4], b"BFRY");
-    assert_eq!(bytes[4], 1);
+    assert_eq!(bytes[4], bfformat::FORMAT_VERSION);
     let program = bfformat::Program::read_from(&bytes[..]).expect("loading compiled program");
     assert!(!program.ops.is_empty());
 }

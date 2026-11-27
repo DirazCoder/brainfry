@@ -326,6 +326,8 @@ bfwasm program.bf -o out.wasm             # standalone WASI module
 wasmtime run program.wasm                 # any WASI preview1 runtime
 bfwasm program.bf --target browser        # writes a self-contained program.js
 bfwasm program.bf -o out.js               # .js extension infers browser target
+bfwasm program.bf --target browser --split # writes program.js and program.wasm
+bfwasm program.bf -o dist/app.js --split   # writes dist/app.js and dist/app.wasm
 bfwasm program.bf --target wasi -o out.js # explicit target overrides inference
 ```
 
@@ -334,8 +336,26 @@ The `browser` target writes one self-contained JavaScript file: it embeds the
 same compiled module as base64 and supplies an inline `wasi_snapshot_preview1`
 shim. It needs no separate `.wasm` file, network request, or external runtime,
 so it can run from `file://`, a browser console, or a `<script type="module">`.
-The shim treats input as EOF, sends buffered program output to `console.log`
-and errors to `console.error`, and exposes the final status as
+The optional `--split` mode instead writes a small ES module loader and an
+adjacent `.wasm` asset. The loader fetches that asset relative to itself and
+falls back to `arrayBuffer()` if streaming instantiation is unavailable or
+fails; serve the pair over HTTP when browser origin rules prevent `file://`
+fetches.
+
+Both browser modes expose optional hooks through `globalThis.__bfwasm`, which
+must be set before the loader runs:
+
+```js
+globalThis.__bfwasm = {
+  stdin: "input bytes", // or a Uint8Array
+  onStdout: chunk => console.log("stdout bytes:", chunk),
+  onStderr: chunk => console.error("stderr bytes:", chunk),
+};
+```
+
+Without hooks, input is EOF and buffered output is flushed to `console.log` /
+`console.error` on exit. Output hooks receive live `Uint8Array` chunks during
+WASI writes. Both modes expose the final status as
 `globalThis.__bfwasmExitCode`.
 
 Semantics are `bfrun`'s: 30,000 starting cells, 8-bit wrapping, EOF leaving

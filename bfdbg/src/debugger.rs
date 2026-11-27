@@ -52,6 +52,7 @@ use std::io::Write;
 
 /// Classic Brainfuck starting tape size, matching `bfrun`/`bfinterp`.
 pub const INITIAL_TAPE_SIZE: usize = 30_000;
+const TAPE_LIMIT: usize = 1 << 30;
 
 /// Default undo-history capacity: 1 Mi steps is ~24 MB of records, deep
 /// enough to rewind out of any realistic mistake without OOM-ing on a
@@ -104,6 +105,7 @@ struct UndoRecord {
     pc: usize,
     ptr: usize,
     cell: u8,
+    extra_cell: Option<(usize, u8)>,
     counted: bool,
 }
 
@@ -597,6 +599,9 @@ impl Debugger {
             self.pc = rec.pc;
             self.ptr = rec.ptr;
             self.tape[rec.ptr] = rec.cell;
+            if let Some((index, value)) = rec.extra_cell {
+                self.tape[index] = value;
+            }
             if rec.counted {
                 self.steps = self.steps.saturating_sub(1);
             }
@@ -652,12 +657,17 @@ impl Debugger {
     fn execute_one(&mut self, prog_out: &mut dyn Write) -> Result<(), String> {
         let (pc, ptr, cell) = (self.pc, self.ptr, self.tape[self.ptr]);
         let op = self.ops[pc];
+        let extra_cell = self.modified_target(op).map(|index| {
+            let value = self.tape.get(index).copied().unwrap_or(0);
+            (index, value)
+        });
         let result = self.perform(op, prog_out);
         let counted = result.is_ok();
         self.undo_push(UndoRecord {
             pc,
             ptr,
             cell,
+            extra_cell: if counted { extra_cell } else { None },
             counted,
         });
         if counted {
@@ -674,6 +684,9 @@ impl Debugger {
             Op::Sub(n) => self.tape[self.ptr] = self.tape[self.ptr].wrapping_sub(n),
             Op::MoveRight(n) => {
                 self.ptr += n as usize;
+                if self.ptr >= TAPE_LIMIT {
+                    return Err("tape limit exceeded (1073741824 bytes)".to_string());
+                }
                 if self.ptr >= self.tape.len() {
                     self.grow_to_at_least(self.ptr)?;
                 }
@@ -708,6 +721,38 @@ impl Debugger {
                 }
             }
             Op::Zero => self.tape[self.ptr] = 0,
+            Op::AddAt { offset, delta } => {
+                let target = self.offset_cell(offset)?;
+                if target >= self.tape.len() {
+                    self.grow_to_at_least(target)?;
+                }
+                self.tape[target] = self.tape[target].wrapping_add(delta);
+            }
+            Op::ZeroAt { offset } => {
+                let target = self.offset_cell(offset)?;
+                if target >= self.tape.len() {
+                    self.grow_to_at_least(target)?;
+                }
+                self.tape[target] = 0;
+            }
+            Op::SetAt { offset, value } => {
+                let target = self.offset_cell(offset)?;
+                if target >= self.tape.len() {
+                    self.grow_to_at_least(target)?;
+                }
+                self.tape[target] = value;
+            }
+            Op::BoundsCheck {
+                min_offset,
+                max_offset,
+            } => {
+                let min = self.offset_cell(min_offset)?;
+                let max = self.offset_cell(max_offset)?;
+                let target = max.max(min);
+                if target >= self.tape.len() {
+                    self.grow_to_at_least(target)?;
+                }
+            }
             Op::MulAdd { offset, factor } => {
                 // Only reachable if someone constructs a Debugger over
                 // optimized ops; kept identical to bfinterp for that case.
@@ -722,7 +767,7 @@ impl Debugger {
             }
             Op::Scan { stride } => {
                 while self.tape[self.ptr] != 0 {
-                    let target = self.offset_cell(stride)?;
+                    let target = self.offset_cell(stride as isize)?;
                     if target >= self.tape.len() {
                         self.grow_to_at_least(target)?;
                     }
@@ -733,19 +778,33 @@ impl Debugger {
         Ok(())
     }
 
-    fn offset_cell(&self, offset: i32) -> Result<usize, String> {
-        let new_cell = self.ptr as i64 + offset as i64;
+    fn offset_cell(&self, offset: isize) -> Result<usize, String> {
+        let new_cell = self.ptr as i128 + offset as i128;
         if new_cell < 0 {
             Err("pointer moved left of cell 0".to_string())
+        } else if new_cell >= TAPE_LIMIT as i128 {
+            Err("tape limit exceeded (1073741824 bytes)".to_string())
         } else {
             Ok(new_cell as usize)
         }
+    }
+
+    fn modified_target(&self, op: Op) -> Option<usize> {
+        let offset = match op {
+            Op::AddAt { offset, .. } | Op::ZeroAt { offset } | Op::SetAt { offset, .. } => offset,
+            Op::MulAdd { offset, .. } if self.tape[self.ptr] != 0 => offset,
+            _ => return None,
+        };
+        self.offset_cell(offset).ok()
     }
 
     /// `bfinterp`'s grow policy: grow to exactly cover the index, and
     /// fail cleanly instead of aborting on absurd sizes.
     fn grow_to_at_least(&mut self, index: usize) -> Result<(), String> {
         debug_assert!(index >= self.tape.len());
+        if index >= TAPE_LIMIT {
+            return Err("tape limit exceeded (1073741824 bytes)".to_string());
+        }
         let additional = index + 1 - self.tape.len();
         self.tape
             .try_reserve(additional)
@@ -891,6 +950,13 @@ fn op_label(op: Option<&Op>) -> String {
         Some(Op::Zero) => "Zero".to_string(),
         Some(Op::MulAdd { offset, factor }) => format!("MulAdd({offset}, {factor})"),
         Some(Op::Scan { stride }) => format!("Scan({stride})"),
+        Some(Op::AddAt { offset, delta }) => format!("AddAt({offset}, {delta})"),
+        Some(Op::ZeroAt { offset }) => format!("ZeroAt({offset})"),
+        Some(Op::SetAt { offset, value }) => format!("SetAt({offset}, {value})"),
+        Some(Op::BoundsCheck {
+            min_offset,
+            max_offset,
+        }) => format!("BoundsCheck({min_offset}, {max_offset})"),
         None => "(no op)".to_string(),
     }
 }
@@ -1628,6 +1694,126 @@ mod tests {
     }
 
     #[test]
+    fn offset_ops_grow_and_rewind_target_cells() {
+        let ops = vec![
+            Op::Add(3),
+            Op::AddAt {
+                offset: 1,
+                delta: 4,
+            },
+            Op::ZeroAt { offset: 1 },
+            Op::SetAt {
+                offset: 1,
+                value: 9,
+            },
+            Op::MulAdd {
+                offset: 1,
+                factor: 2,
+            },
+            Op::BoundsCheck {
+                min_offset: 0,
+                max_offset: 30_000,
+            },
+        ];
+        let mut d = Debugger::new(ops, "optimized".into(), DEFAULT_UNDO_LIMIT);
+        for _ in 0..5 {
+            assert_eq!(d.step(&mut Vec::new()), Stop::Ran);
+        }
+        assert_eq!(d.cell_at(1), 15);
+        assert_eq!(d.back(1), 1);
+        assert_eq!(d.cell_at(1), 9);
+        assert_eq!(d.pc(), 4);
+        assert_eq!(d.run(&mut Vec::new()), Stop::Finished);
+        assert_eq!(d.cell_at(1), 15);
+        assert_eq!(d.tape_len(), 30_001);
+    }
+
+    #[test]
+    fn offset_cell_reports_underflow_cap_and_valid_indices() {
+        let d = dbg_for("");
+        assert_eq!(d.offset_cell(1), Ok(1));
+        assert_eq!(
+            d.offset_cell(-1),
+            Err("pointer moved left of cell 0".into())
+        );
+        assert_eq!(
+            d.offset_cell(TAPE_LIMIT as isize),
+            Err("tape limit exceeded (1073741824 bytes)".into())
+        );
+    }
+
+    #[test]
+    fn offset_operations_report_underflow_and_tape_limit_errors() {
+        for op in [
+            Op::AddAt {
+                offset: -1,
+                delta: 1,
+            },
+            Op::ZeroAt { offset: -1 },
+            Op::SetAt {
+                offset: -1,
+                value: 1,
+            },
+            Op::BoundsCheck {
+                min_offset: -1,
+                max_offset: 0,
+            },
+            Op::BoundsCheck {
+                min_offset: 0,
+                max_offset: TAPE_LIMIT as isize,
+            },
+        ] {
+            let mut d = Debugger::new(vec![op], "optimized".into(), DEFAULT_UNDO_LIMIT);
+            let expected = if matches!(
+                op,
+                Op::BoundsCheck {
+                    min_offset: 0,
+                    max_offset: _
+                }
+            ) {
+                "tape limit exceeded (1073741824 bytes)"
+            } else {
+                "pointer moved left of cell 0"
+            };
+            assert_eq!(
+                d.step(&mut Vec::new()),
+                Stop::Errored(expected.into()),
+                "{op:?}"
+            );
+        }
+
+        let mut d = Debugger::new(
+            vec![Op::MoveRight(TAPE_LIMIT as u32)],
+            "optimized".into(),
+            DEFAULT_UNDO_LIMIT,
+        );
+        assert_eq!(
+            d.step(&mut Vec::new()),
+            Stop::Errored("tape limit exceeded (1073741824 bytes)".into())
+        );
+    }
+
+    #[test]
+    fn modified_target_skips_zero_muladd_sources() {
+        let mut d = dbg_for("");
+        assert_eq!(
+            d.modified_target(Op::MulAdd {
+                offset: 1,
+                factor: 2
+            }),
+            None
+        );
+        d.set_cell(0, 1).unwrap();
+        assert_eq!(
+            d.modified_target(Op::MulAdd {
+                offset: 1,
+                factor: 2
+            }),
+            Some(1)
+        );
+    }
+
+    #[test]
     fn scan_ops_execute_like_bfinterp() {
         // Scan on a zero cell doesn't move at all.
         let mut d = Debugger::new(vec![Op::Scan { stride: 1 }], "z".into(), DEFAULT_UNDO_LIMIT);
@@ -1674,28 +1860,42 @@ mod tests {
         let mut d = dbg_for("+");
         assert_eq!(
             d.set_cell(1_000_000_000_000_000_000, 1).unwrap_err(),
-            "failed to grow tape"
+            "tape limit exceeded (1073741824 bytes)"
         );
         assert_eq!(
             d.set_ptr(1_000_000_000_000_000_000).unwrap_err(),
-            "failed to grow tape"
+            "tape limit exceeded (1073741824 bytes)"
         );
     }
 
     #[test]
     fn allocation_failure_through_every_growing_op_is_a_clean_error() {
         with_alloc_cap(|| {
-            let far = 2_000_000_000;
+            let far_offset = 2_000_000isize;
+            let far_stride = 2_000_000i32;
             for ops in [
-                vec![Op::MoveRight(u32::MAX)],
+                vec![Op::MoveRight(2_000_000)],
+                vec![Op::AddAt {
+                    offset: 2_000_000,
+                    delta: 1,
+                }],
+                vec![Op::ZeroAt { offset: 2_000_000 }],
+                vec![Op::SetAt {
+                    offset: 2_000_000,
+                    value: 1,
+                }],
+                vec![Op::BoundsCheck {
+                    min_offset: 0,
+                    max_offset: 2_000_000,
+                }],
                 vec![
                     Op::Add(1),
                     Op::MulAdd {
-                        offset: far,
+                        offset: far_offset,
                         factor: 1,
                     },
                 ],
-                vec![Op::Add(1), Op::Scan { stride: far }],
+                vec![Op::Add(1), Op::Scan { stride: far_stride }],
             ] {
                 let mut d = Debugger::new(ops, "z".into(), DEFAULT_UNDO_LIMIT);
                 assert_eq!(
@@ -1777,6 +1977,19 @@ mod tests {
                 factor: 3,
             },
             Op::Scan { stride: 1 },
+            Op::AddAt {
+                offset: 2,
+                delta: 3,
+            },
+            Op::ZeroAt { offset: 2 },
+            Op::SetAt {
+                offset: 2,
+                value: 4,
+            },
+            Op::BoundsCheck {
+                min_offset: -1,
+                max_offset: 2,
+            },
         ];
         let d = Debugger::new(ops.to_vec(), "z".into(), DEFAULT_UNDO_LIMIT);
         for (i, want) in [
@@ -1791,6 +2004,10 @@ mod tests {
             "Zero",
             "MulAdd(2, 3)",
             "Scan(1)",
+            "AddAt(2, 3)",
+            "ZeroAt(2)",
+            "SetAt(2, 4)",
+            "BoundsCheck(-1, 2)",
         ]
         .into_iter()
         .enumerate()

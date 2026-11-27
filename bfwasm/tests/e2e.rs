@@ -207,6 +207,141 @@ fn browser_output_write_failure_is_reported() {
 }
 
 #[test]
+fn split_browser_target_writes_default_loader_and_wasm_sidecar() {
+    let dir = temp_dir("split-default");
+    let source_path = write_source(&dir, "+.");
+    let (status, stdout, stderr) = run_args(
+        "split-default",
+        &[
+            &source_path,
+            Path::new("--target"),
+            Path::new("browser"),
+            Path::new("--split"),
+        ],
+    );
+    assert!(status.success(), "stderr: {stderr}");
+    assert!(stdout.contains("program.js"), "{stdout}");
+    assert!(dir.join("program.wasm").exists());
+    let bytes = fs::read(dir.join("program.wasm")).expect("reading split wasm output");
+    assert_eq!(&bytes[..4], b"\0asm");
+    let loader = fs::read_to_string(dir.join("program.js")).expect("reading split loader");
+    assert!(loader.contains("new URL(\"./program.wasm\", import.meta.url)"));
+    assert!(loader.contains("WebAssembly.instantiateStreaming"));
+    assert!(loader.contains("response.arrayBuffer()"));
+}
+
+#[test]
+fn split_browser_output_uses_custom_loader_stem_and_infers_target() {
+    let dir = temp_dir("split-custom");
+    let source_path = write_source(&dir, "+.");
+    let output_dir = dir.join("dist");
+    fs::create_dir_all(&output_dir).expect("creating output directory");
+    let js_path = output_dir.join("app.js");
+    let (status, stdout, stderr) = run_args(
+        "split-custom",
+        &[
+            &source_path,
+            Path::new("-o"),
+            &js_path,
+            Path::new("--split"),
+        ],
+    );
+    assert!(status.success(), "stderr: {stderr}");
+    assert!(stdout.contains("dist"), "{stdout}");
+    assert!(js_path.exists());
+    assert!(output_dir.join("app.wasm").exists());
+    let loader = fs::read_to_string(js_path).expect("reading custom split loader");
+    assert!(loader.contains("new URL(\"./app.wasm\", import.meta.url)"));
+}
+
+#[test]
+fn split_is_rejected_for_wasi_target() {
+    let dir = temp_dir("split-wasi");
+    let source_path = write_source(&dir, "+.");
+    let (status, _, stderr) = run_args(
+        "split-wasi",
+        &[
+            &source_path,
+            Path::new("--target"),
+            Path::new("wasi"),
+            Path::new("--split"),
+        ],
+    );
+    assert_eq!(status.code(), Some(1));
+    assert!(
+        stderr.contains("--split requires the browser target"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("usage: bfwasm"), "{stderr}");
+}
+
+#[test]
+fn split_rejects_a_wasm_loader_path() {
+    let dir = temp_dir("split-wasm-loader");
+    let source_path = write_source(&dir, "+.");
+    let output_path = dir.join("program.wasm");
+    let (status, _, stderr) = run_args(
+        "split-wasm-loader",
+        &[
+            &source_path,
+            Path::new("--target"),
+            Path::new("browser"),
+            Path::new("--split"),
+            Path::new("-o"),
+            &output_path,
+        ],
+    );
+    assert_eq!(status.code(), Some(1));
+    assert!(
+        stderr.contains("--split cannot use a .wasm loader path"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn split_wasm_sidecar_write_failure_is_reported() {
+    let dir = temp_dir("split-wasm-write-failure");
+    let source_path = write_source(&dir, "+.");
+    let js_path = dir.join("missing-directory").join("program.js");
+    let (status, _, stderr) = run_args(
+        "split-wasm-write-failure",
+        &[
+            &source_path,
+            Path::new("--target"),
+            Path::new("browser"),
+            Path::new("--split"),
+            Path::new("-o"),
+            &js_path,
+        ],
+    );
+    assert_eq!(status.code(), Some(1));
+    assert!(stderr.contains("couldn't write"), "{stderr}");
+    assert!(stderr.contains("program.wasm"), "{stderr}");
+}
+
+#[test]
+fn split_loader_write_failure_is_reported_after_sidecar_write() {
+    let dir = temp_dir("split-loader-write-failure");
+    let source_path = write_source(&dir, "+.");
+    let js_path = dir.join("program.js");
+    fs::create_dir_all(&js_path).expect("creating loader path as a directory");
+    let (status, _, stderr) = run_args(
+        "split-loader-write-failure",
+        &[
+            &source_path,
+            Path::new("--target"),
+            Path::new("browser"),
+            Path::new("--split"),
+            Path::new("-o"),
+            &js_path,
+        ],
+    );
+    assert_eq!(status.code(), Some(1));
+    assert!(stderr.contains("couldn't write"), "{stderr}");
+    assert!(dir.join("program.wasm").exists());
+}
+
+#[test]
 fn compiles_a_well_formed_module() {
     let dir = temp_dir("success");
     let source_path = write_source(&dir, HELLO_WORLD);

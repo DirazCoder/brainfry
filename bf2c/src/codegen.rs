@@ -134,12 +134,30 @@ pub fn compile(ops: &[Op], source_name: &str) -> String {
 
 /// Whether an op emits a reference to the `grow` helper.
 fn needs_grow(op: &Op) -> bool {
-    matches!(op, Op::MoveRight(_) | Op::MulAdd { .. } | Op::Scan { .. })
+    match op {
+        Op::MoveRight(_) => true,
+        Op::MulAdd { offset, .. }
+        | Op::AddAt { offset, .. }
+        | Op::ZeroAt { offset }
+        | Op::SetAt { offset, .. } => *offset > 0,
+        Op::Scan { stride } => *stride > 0,
+        Op::BoundsCheck { max_offset, .. } => *max_offset > 0,
+        _ => false,
+    }
 }
 
 /// Whether an op emits a reference to the `die` helper directly.
 fn needs_die(op: &Op) -> bool {
-    matches!(op, Op::MoveLeft(_) | Op::MulAdd { .. } | Op::Scan { .. })
+    match op {
+        Op::MoveLeft(_) => true,
+        Op::MulAdd { offset, .. }
+        | Op::AddAt { offset, .. }
+        | Op::ZeroAt { offset }
+        | Op::SetAt { offset, .. } => *offset < 0,
+        Op::Scan { stride } => *stride < 0,
+        Op::BoundsCheck { min_offset, .. } => *min_offset < 0,
+        _ => false,
+    }
 }
 
 /// The fixed prologue: includes, tape globals, `die`, `grow`, and
@@ -304,6 +322,56 @@ fn emit_op(out: &mut String, op: &Op, pad: &str) {
         Op::Add(n) => out.push_str(&format!("{pad}*p += {n};\n")),
         Op::Sub(n) => out.push_str(&format!("{pad}*p -= {n};\n")),
         Op::Zero => out.push_str(&format!("{pad}*p = 0;\n")),
+        Op::AddAt { offset, delta } => {
+            if *offset == 0 {
+                out.push_str(&format!("{pad}*p += {delta};\n"));
+            } else {
+                emit_offset_guard(out, pad, *offset);
+                out.push_str(&format!("{pad}p[{offset}] += {delta};\n"));
+            }
+        }
+        Op::ZeroAt { offset } => {
+            if *offset == 0 {
+                out.push_str(&format!("{pad}*p = 0;\n"));
+            } else {
+                emit_offset_guard(out, pad, *offset);
+                out.push_str(&format!("{pad}p[{offset}] = 0;\n"));
+            }
+        }
+        Op::SetAt { offset, value } => {
+            if *offset == 0 {
+                out.push_str(&format!("{pad}*p = {value};\n"));
+            } else {
+                emit_offset_guard(out, pad, *offset);
+                out.push_str(&format!("{pad}p[{offset}] = {value};\n"));
+            }
+        }
+        Op::BoundsCheck {
+            min_offset,
+            max_offset,
+        } => {
+            if *min_offset == 0 && *max_offset == 0 {
+                return;
+            }
+            out.push_str(&format!(
+                "{pad}{{ ptrdiff_t lo = p - tape + ({min_offset}); ptrdiff_t hi = p - tape + ({max_offset});\n"
+            ));
+            out.push_str(&format!(
+                "{pad}    if (lo < 0) {{ die(\"runtime error: pointer moved left of cell 0\"); }}\n"
+            ));
+            if *max_offset > 0 {
+                out.push_str(&format!(
+                    "{pad}    if (lo >= (ptrdiff_t)TAPE_MAX || hi >= (ptrdiff_t)TAPE_MAX) {{ die(\"runtime error: tape limit exceeded (1073741824 bytes)\"); }}\n"
+                ));
+                out.push_str(&format!(
+                    "{pad}    if ((size_t)lo >= tape_len) {{ grow((size_t)lo); }}\n"
+                ));
+                out.push_str(&format!(
+                    "{pad}    if ((size_t)hi >= tape_len) {{ grow((size_t)hi); }}\n"
+                ));
+            }
+            out.push_str(&format!("{pad}}}\n"));
+        }
         // Right moves add first, then grow if the index landed past the
         // end: `p += n` itself stays within one-past-the-end territory
         // for the folded counts real programs produce.
@@ -328,19 +396,19 @@ fn emit_op(out: &mut String, op: &Op, pad: &str) {
         // negative offsets die at the underflow check instead of walking
         // a pointer below the array.
         Op::MulAdd { offset, factor } => {
-            out.push_str(pad);
-            out.push_str("if (*p != 0) {\n");
-            out.push_str(&format!("{pad}    ptrdiff_t t = p - tape + {offset};\n"));
-            out.push_str(pad);
-            out.push_str(
-                "    if (t < 0) { die(\"runtime error: pointer moved left of cell 0\"); }\n",
-            );
-            out.push_str(pad);
-            out.push_str("    if ((size_t)t >= tape_len) { grow((size_t)t); }\n");
-            out.push_str(&format!(
-                "{pad}    p[{offset}] += (uint8_t)(*p * {factor});\n"
-            ));
-            out.push_str(&format!("{pad}}}\n"));
+            if *offset == 0 {
+                out.push_str(&format!(
+                    "{pad}if (*p != 0) {{ *p += (uint8_t)(*p * {factor}); }}\n"
+                ));
+            } else {
+                out.push_str(pad);
+                out.push_str("if (*p != 0) {\n");
+                emit_offset_guard(out, &format!("{pad}    "), *offset);
+                out.push_str(&format!(
+                    "{pad}    p[{offset}] += (uint8_t)(*p * {factor});\n"
+                ));
+                out.push_str(&format!("{pad}}}\n"));
+            }
         }
         Op::Scan { stride } => {
             out.push_str(pad);
@@ -350,14 +418,34 @@ fn emit_op(out: &mut String, op: &Op, pad: &str) {
             out.push_str(
                 "    if (t < 0) { die(\"runtime error: pointer moved left of cell 0\"); }\n",
             );
-            out.push_str(pad);
-            out.push_str("    if ((size_t)t >= tape_len) { grow((size_t)t); }\n");
+            if *stride > 0 {
+                out.push_str(pad);
+                out.push_str(
+                    "    if (t >= (ptrdiff_t)TAPE_MAX) { die(\"runtime error: tape limit exceeded (1073741824 bytes)\"); }\n",
+                );
+                out.push_str(pad);
+                out.push_str("    if ((size_t)t >= tape_len) { grow((size_t)t); }\n");
+            }
             out.push_str(&format!("{pad}    p += {stride};\n"));
             out.push_str(&format!("{pad}}}\n"));
         }
         Op::JumpIfZero { .. } | Op::JumpIfNonZero { .. } => {
             unreachable!("jump ops are consumed by emit_block's loop arm")
         }
+    }
+
+    fn emit_offset_guard(out: &mut String, pad: &str, offset: isize) {
+        out.push_str(&format!(
+            "{pad}{{ ptrdiff_t t = p - tape + ({offset});\n\
+             {pad}    if (t < 0) {{ die(\"runtime error: pointer moved left of cell 0\"); }}\n"
+        ));
+        if offset > 0 {
+            out.push_str(&format!(
+                "{pad}    if (t >= (ptrdiff_t)TAPE_MAX) {{ die(\"runtime error: tape limit exceeded (1073741824 bytes)\"); }}\n\
+                 {pad}    if ((size_t)t >= tape_len) {{ grow((size_t)t); }}\n"
+            ));
+        }
+        out.push_str(&format!("{pad}}}\n"));
     }
 }
 
@@ -387,7 +475,16 @@ mod tests {
 
     #[test]
     fn ir_ops_lower_to_the_documented_statements() {
-        let c = compiled("+-><.");
+        let c = compile(
+            &[
+                Op::Add(1),
+                Op::Sub(1),
+                Op::MoveRight(1),
+                Op::MoveLeft(1),
+                Op::Output,
+            ],
+            "test.bf",
+        );
         assert!(c.contains("*p += 1;"), "Add: {c}");
         assert!(c.contains("*p -= 1;"), "Sub: {c}");
         assert!(c.contains("p += 1;"), "MoveRight: {c}");
@@ -397,21 +494,183 @@ mod tests {
 
     #[test]
     fn zero_lowering_is_a_plain_store() {
-        let c = compiled("+++[-]");
+        let c = compile(&[Op::Zero], "test.bf");
         assert!(c.contains("*p = 0;"));
-        assert!(!c.contains("while (*p != 0) {\n    *p -= 1;"));
+        let folded = compiled("+++[-]");
+        assert!(!folded.contains("while (*p != 0) {\n    *p -= 1;"));
     }
 
     #[test]
     fn mul_add_uses_direct_pointer_arithmetic() {
-        let c = compiled("+++[->++<]");
+        let c = compile(
+            &[
+                Op::Add(3),
+                Op::MulAdd {
+                    offset: 1,
+                    factor: 2,
+                },
+                Op::Zero,
+            ],
+            "test.bf",
+        );
         assert!(c.contains("p[1] += (uint8_t)(*p * 2);"), "{c}");
-        assert!(c.contains("ptrdiff_t t = p - tape + 1;"));
+        assert!(c.contains("ptrdiff_t t = p - tape + (1);"));
+    }
+
+    #[test]
+    fn offset_ops_emit_bounds_guards_only_when_needed() {
+        let c = compile(
+            &[
+                Op::AddAt {
+                    offset: 1,
+                    delta: 3,
+                },
+                Op::ZeroAt { offset: -1 },
+                Op::SetAt {
+                    offset: 0,
+                    value: 7,
+                },
+                Op::BoundsCheck {
+                    min_offset: -2,
+                    max_offset: 0,
+                },
+                Op::BoundsCheck {
+                    min_offset: 0,
+                    max_offset: 0,
+                },
+            ],
+            "test.bf",
+        );
+        assert!(c.contains("p[1] += 3;"), "{c}");
+        assert!(c.contains("p[-1] = 0;"), "{c}");
+        assert!(c.contains("*p = 7;"), "{c}");
+        assert!(c.contains("p - tape + (-1)"), "{c}");
+        assert!(c.contains("p - tape + (-2)"), "{c}");
+        assert!(c.contains("static void grow("), "{c}");
+        assert!(c.contains("static void die("), "{c}");
+
+        let no_growth = compile(
+            &[
+                Op::ZeroAt { offset: -1 },
+                Op::BoundsCheck {
+                    min_offset: -2,
+                    max_offset: 0,
+                },
+                Op::SetAt {
+                    offset: 0,
+                    value: 7,
+                },
+            ],
+            "test.bf",
+        );
+        assert!(!no_growth.contains("static void grow("), "{no_growth}");
+
+        let growth = compile(
+            &[
+                Op::BoundsCheck {
+                    min_offset: 0,
+                    max_offset: 2,
+                },
+                Op::MulAdd {
+                    offset: 0,
+                    factor: 3,
+                },
+            ],
+            "test.bf",
+        );
+        assert!(growth.contains("static void grow("), "{growth}");
+        assert!(growth.contains("*p += (uint8_t)(*p * 3);"), "{growth}");
+    }
+
+    #[test]
+    fn direct_ir_exercises_offset_zero_and_scan_directions() {
+        let c = compile(
+            &[
+                Op::AddAt {
+                    offset: 0,
+                    delta: 1,
+                },
+                Op::AddAt {
+                    offset: -1,
+                    delta: 2,
+                },
+                Op::ZeroAt { offset: 0 },
+                Op::ZeroAt { offset: 1 },
+                Op::SetAt {
+                    offset: 0,
+                    value: 3,
+                },
+                Op::SetAt {
+                    offset: -2,
+                    value: 4,
+                },
+                Op::BoundsCheck {
+                    min_offset: 0,
+                    max_offset: 0,
+                },
+                Op::MulAdd {
+                    offset: 0,
+                    factor: 5,
+                },
+                Op::MulAdd {
+                    offset: -1,
+                    factor: 6,
+                },
+                Op::Scan { stride: -1 },
+                Op::Scan { stride: 0 },
+            ],
+            "test.bf",
+        );
+        assert!(c.contains("*p += 1;"), "{c}");
+        assert!(c.contains("p[-1] += 2;"), "{c}");
+        assert!(c.contains("p[-2] = 4;"), "{c}");
+        assert!(c.contains("*p += (uint8_t)(*p * 5);"), "{c}");
+        assert!(c.contains("p[-1] += (uint8_t)(*p * 6);"), "{c}");
+        assert!(c.contains("p += -1;"), "{c}");
+        assert!(c.contains("p += 0;"), "{c}");
+    }
+
+    #[test]
+    fn helper_predicates_and_emit_op_cover_signed_offsets() {
+        assert!(needs_grow(&Op::Scan { stride: 1 }));
+        assert!(!needs_grow(&Op::Scan { stride: 0 }));
+        assert!(needs_die(&Op::Scan { stride: -1 }));
+        assert!(needs_grow(&Op::BoundsCheck {
+            min_offset: 0,
+            max_offset: 1
+        }));
+        assert!(needs_die(&Op::BoundsCheck {
+            min_offset: -1,
+            max_offset: 0
+        }));
+
+        let mut output = String::new();
+        for op in [
+            Op::ZeroAt { offset: 1 },
+            Op::SetAt {
+                offset: 1,
+                value: 2,
+            },
+            Op::BoundsCheck {
+                min_offset: 0,
+                max_offset: 0,
+            },
+            Op::MulAdd {
+                offset: 0,
+                factor: 2,
+            },
+            Op::Scan { stride: 1 },
+        ] {
+            emit_op(&mut output, &op, "");
+        }
+        assert!(output.contains("p[1] = 0;"));
+        assert!(output.contains("p[1] = 2;"));
+        assert!(output.contains("*p += (uint8_t)(*p * 2);"));
     }
 
     #[test]
     fn scan_is_a_guarded_move_loop() {
-        let c = compiled("[>]");
+        let c = compiled("+[>]");
         assert!(c.contains("while (*p != 0) {"), "{c}");
         assert!(c.contains("ptrdiff_t t = p - tape + 1;"));
         assert!(c.contains("p += 1;"));
@@ -448,7 +707,7 @@ mod tests {
     fn error_wording_matches_the_other_backends_byte_for_byte() {
         // Needs both a left move (direct die reference) and a right move
         // (grow, which carries the cap and realloc-failure messages).
-        let c = compiled("+<>");
+        let c = compiled("<>");
         assert!(c.contains("\"runtime error: pointer moved left of cell 0\""));
         assert!(c.contains("\"runtime error: tape limit exceeded (1073741824 bytes)\""));
         assert!(c.contains("\"runtime error: failed to grow tape\""));

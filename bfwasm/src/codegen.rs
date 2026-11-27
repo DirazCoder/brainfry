@@ -119,6 +119,7 @@ const OP_I32_EQZ: u8 = 0x45;
 const OP_I32_NE: u8 = 0x47;
 const OP_I32_LT_S: u8 = 0x48;
 const OP_I32_GT_S: u8 = 0x4a;
+const OP_I32_GE_U: u8 = 0x4f;
 const OP_I32_ADD: u8 = 0x6a;
 const OP_I32_SUB: u8 = 0x6b;
 const OP_I32_MUL: u8 = 0x6c;
@@ -139,6 +140,7 @@ const WASI_PROC_EXIT: u32 = 2;
 /// index space.
 const FN_START: u32 = 3;
 const FN_UNDERFLOW: u32 = 4;
+const FN_TAPE_LIMIT: u32 = 5;
 
 /// Type-section slot for `(i32) -> ()`, which is `proc_exit`'s signature.
 const TYPE_EXIT: u32 = 2;
@@ -146,10 +148,12 @@ const TYPE_EXIT: u32 = 2;
 /// Exactly what bfrun and bfnative print when the pointer walks left of
 /// cell 0; the differential harness compares stderr byte for byte.
 const UNDERFLOW_MSG: &str = "runtime error: pointer moved left of cell 0\n";
+const TAPE_LIMIT_MSG: &str = "runtime error: tape limit exceeded (1073741824 bytes)\n";
 
 /// Lives in the reserved I/O page, past the iovec (16 bytes) and the
 /// one-byte data buffer, so it can't collide with the tape.
 const UNDERFLOW_MSG_OFFSET: u32 = IO_SCRATCH_OFFSET + 32;
+const TAPE_LIMIT_MSG_OFFSET: u32 = UNDERFLOW_MSG_OFFSET + UNDERFLOW_MSG.len() as u32;
 
 /// Converts a `MoveRight`/`MoveLeft` magnitude to a signed cell delta.
 /// `Op`'s move counts are `u32`, but every address in this backend is a
@@ -188,7 +192,11 @@ pub fn compile(ops: &[Op]) -> Vec<u8> {
     section(
         &mut module,
         SECTION_CODE,
-        &code_section(&body.code, &underflow_function_body()),
+        &code_section(
+            &body.code,
+            &underflow_function_body(),
+            &tape_limit_function_body(),
+        ),
     );
     section(&mut module, SECTION_DATA, &data_section());
 
@@ -238,11 +246,12 @@ fn import_func(out: &mut Vec<u8>, module: &str, name: &str, type_index: u32) {
     uleb(out, type_index as u64);
 }
 
-/// Two locally-defined functions, `_start` and the underflow helper, both
-/// `() -> ()` (type index 1).
+/// Three locally-defined functions, `_start` and the two runtime error
+/// helpers, all `() -> ()` (type index 1).
 fn function_section() -> Vec<u8> {
     let mut out = Vec::new();
-    uleb(&mut out, 2);
+    uleb(&mut out, 3);
+    uleb(&mut out, 1);
     uleb(&mut out, 1);
     uleb(&mut out, 1);
     out
@@ -280,10 +289,10 @@ fn export_entry(out: &mut Vec<u8>, name: &str, kind: u8, index: u32) {
     uleb(out, index as u64);
 }
 
-fn code_section(start_body: &[u8], underflow_body: &[u8]) -> Vec<u8> {
+fn code_section(start_body: &[u8], underflow_body: &[u8], tape_limit_body: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
-    uleb(&mut out, 2);
-    for body in [start_body, underflow_body] {
+    uleb(&mut out, 3);
+    for body in [start_body, underflow_body, tape_limit_body] {
         uleb(&mut out, body.len() as u64);
         out.extend_from_slice(body);
     }
@@ -295,15 +304,23 @@ fn code_section(start_body: &[u8], underflow_body: &[u8]) -> Vec<u8> {
 /// this apart from a codegen bug (exit status and stderr both differed
 /// from every other backend), so underflow goes through here instead.
 fn underflow_function_body() -> Vec<u8> {
+    runtime_error_function_body(UNDERFLOW_MSG, UNDERFLOW_MSG_OFFSET)
+}
+
+fn tape_limit_function_body() -> Vec<u8> {
+    runtime_error_function_body(TAPE_LIMIT_MSG, TAPE_LIMIT_MSG_OFFSET)
+}
+
+fn runtime_error_function_body(message: &str, message_offset: u32) -> Vec<u8> {
     let mut body = Body { code: Vec::new() };
     uleb(&mut body.code, 0); // no locals
 
     body.const_i32(IO_SCRATCH_OFFSET as i32);
-    body.const_i32(UNDERFLOW_MSG_OFFSET as i32);
+    body.const_i32(message_offset as i32);
     body.code.push(OP_I32_STORE); // iovec.buf
     body.mem_arg(2, 0);
     body.const_i32(IO_SCRATCH_OFFSET as i32);
-    body.const_i32(UNDERFLOW_MSG.len() as i32);
+    body.const_i32(message.len() as i32);
     body.code.push(OP_I32_STORE); // iovec.len
     body.mem_arg(2, 4);
 
@@ -317,16 +334,20 @@ fn underflow_function_body() -> Vec<u8> {
     body.code
 }
 
-/// One active segment copying `UNDERFLOW_MSG` into the I/O page at
-/// instantiation time.
+/// Active segments copying runtime error messages into the I/O page.
 fn data_section() -> Vec<u8> {
     let mut out = Vec::new();
-    uleb(&mut out, 1);
-    uleb(&mut out, 0); // flag 0: active, memory 0
-    out.push(OP_I32_CONST);
-    sleb(&mut out, UNDERFLOW_MSG_OFFSET as i64);
-    out.push(OP_END);
-    byte_vec(&mut out, UNDERFLOW_MSG.as_bytes());
+    uleb(&mut out, 2);
+    for (offset, message) in [
+        (UNDERFLOW_MSG_OFFSET, UNDERFLOW_MSG),
+        (TAPE_LIMIT_MSG_OFFSET, TAPE_LIMIT_MSG),
+    ] {
+        uleb(&mut out, 0); // flag 0: active, memory 0
+        out.push(OP_I32_CONST);
+        sleb(&mut out, offset as i64);
+        out.push(OP_END);
+        byte_vec(&mut out, message.as_bytes());
+    }
     out
 }
 
@@ -472,6 +493,38 @@ impl Body {
             Op::Zero => self.store_cell_const(0),
             Op::MulAdd { offset, factor } => self.emit_mul_add(*offset, *factor),
             Op::Scan { stride } => self.emit_scan(*stride),
+            Op::AddAt { offset, delta } => {
+                self.bounds_checked_target(*offset);
+                self.code.push(OP_LOCAL_GET);
+                uleb(&mut self.code, 2);
+                self.code.push(OP_I32_LOAD8_U);
+                self.mem_arg(0, 0);
+                self.const_i32(*delta as i32);
+                self.code.push(OP_I32_ADD);
+                self.code.push(OP_I32_STORE8);
+                self.mem_arg(0, 0);
+            }
+            Op::ZeroAt { offset } => {
+                self.bounds_checked_target(*offset);
+                self.const_i32(0);
+                self.code.push(OP_I32_STORE8);
+                self.mem_arg(0, 0);
+            }
+            Op::SetAt { offset, value } => {
+                self.bounds_checked_target(*offset);
+                self.const_i32(*value as i32);
+                self.code.push(OP_I32_STORE8);
+                self.mem_arg(0, 0);
+            }
+            Op::BoundsCheck {
+                min_offset,
+                max_offset,
+            } => {
+                self.bounds_checked_target(*min_offset);
+                self.code.push(OP_DROP);
+                self.bounds_checked_target(*max_offset);
+                self.code.push(OP_DROP);
+            }
             // Resolved to structured branches by emit_block/emit_loop —
             // never reached as a standalone op.
             Op::JumpIfZero { .. } | Op::JumpIfNonZero { .. } => {
@@ -599,6 +652,7 @@ impl Body {
     /// a leftward move or negative offset can only be landing on memory
     /// already committed, so only the underflow check above applies there.
     fn emit_grow_check_for(&mut self, addr_local: u32) {
+        self.emit_cap_check_for(addr_local);
         // needed_pages = (addr / PAGE_SIZE) + 1 — the page index the
         // address falls in, made 1-based so it's a page *count* covering
         // up to and including that page.
@@ -631,6 +685,19 @@ impl Body {
         self.code.push(OP_I32_LT_S);
         self.trap_if(); // grow failed (returned -1)
         self.code.push(OP_END); // if
+    }
+
+    fn emit_cap_check_for(&mut self, addr_local: u32) {
+        self.code.push(OP_LOCAL_GET);
+        uleb(&mut self.code, addr_local as u64);
+        self.const_i32(1 << 30);
+        self.code.push(OP_I32_GE_U);
+        self.code.push(OPCODE_IF);
+        self.code.push(BLOCKTYPE_EMPTY);
+        self.code.push(OP_CALL);
+        uleb(&mut self.code, FN_TAPE_LIMIT as u64);
+        self.code.push(OP_UNREACHABLE);
+        self.code.push(OP_END);
     }
 
     /// Writes the iovec WASI expects at `IO_SCRATCH_OFFSET`: a `buf`
@@ -728,10 +795,18 @@ impl Body {
     /// `bfnative::codegen::{x86_64,aarch64}::emit_bounds_checked_offset`,
     /// which every native backend already runs before a `MulAdd`/`Scan`
     /// store for exactly this reason.
-    fn bounds_checked_target(&mut self, offset: i32) {
+    fn bounds_checked_target(&mut self, offset: isize) {
+        if offset < i32::MIN as isize {
+            self.call_runtime_error(FN_UNDERFLOW);
+            return;
+        }
+        if offset > i32::MAX as isize {
+            self.call_runtime_error(FN_TAPE_LIMIT);
+            return;
+        }
         self.code.push(OP_LOCAL_GET);
         uleb(&mut self.code, 0);
-        self.const_i32(offset);
+        self.const_i32(offset as i32);
         self.code.push(OP_I32_ADD);
         self.code.push(OP_LOCAL_TEE);
         uleb(&mut self.code, 2); // $target (local 2, declared in Body::new)
@@ -748,6 +823,12 @@ impl Body {
         uleb(&mut self.code, 2); // leave the checked address on the stack
     }
 
+    fn call_runtime_error(&mut self, function: u32) {
+        self.code.push(OP_CALL);
+        uleb(&mut self.code, function as u64);
+        self.code.push(OP_UNREACHABLE);
+    }
+
     /// `[->+<]`-style fold: add `factor * cell[$ptr]` into `cell[$ptr +
     /// offset]`. `offset` is a cell count, not a byte count, but since
     /// cells are one byte each here the two are the same number.
@@ -761,7 +842,7 @@ impl Body {
     /// source value — exactly the bug this comment used to not warn about;
     /// see `bfnative::codegen::{x86_64,aarch64}::emit_mul_add`'s matching
     /// comment, which this backend didn't follow the first time around.
-    fn emit_mul_add(&mut self, offset: i32, factor: u8) {
+    fn emit_mul_add(&mut self, offset: isize, factor: u8) {
         // The loop this replaced never ran when the source cell was zero,
         // so the target must not even be bounds-checked then: a folded
         // `[-<<+>>]` near cell 0 is fine as long as the source is empty.
@@ -938,7 +1019,7 @@ mod tests {
                     i += 1; // memory index byte
                 }
                 OP_UNREACHABLE | OP_I32_EQZ | OP_I32_NE | OP_I32_LT_S | OP_I32_GT_S
-                | OP_I32_ADD | OP_I32_SUB | OP_I32_MUL | OP_I32_DIV_U => {
+                | OP_I32_GE_U | OP_I32_ADD | OP_I32_SUB | OP_I32_MUL | OP_I32_DIV_U => {
                     // no operands
                 }
                 other => panic!(
@@ -1089,6 +1170,39 @@ mod tests {
         assert!(!module.is_empty());
         // The function body must contain a real i32.sub (0x6b) opcode.
         assert!(module.contains(&0x6b), "no i32.sub in module");
+    }
+
+    #[test]
+    fn current_and_offset_store_ops_emit() {
+        let module = compile(&[
+            Op::Add(1),
+            Op::Zero,
+            Op::AddAt {
+                offset: 1,
+                delta: 2,
+            },
+            Op::ZeroAt { offset: -1 },
+            Op::SetAt {
+                offset: 0,
+                value: 3,
+            },
+            Op::BoundsCheck {
+                min_offset: 0,
+                max_offset: 1,
+            },
+        ]);
+        assert!(!module.is_empty());
+        assert!(module.contains(&OP_I32_STORE8));
+        assert!(module.contains(&OP_I32_LOAD8_U));
+    }
+
+    #[test]
+    fn out_of_i32_offsets_use_runtime_error_paths() {
+        for offset in [i32::MIN as isize - 1, i32::MAX as isize + 1] {
+            let mut body = Body::new();
+            body.bounds_checked_target(offset);
+            assert!(body.code.contains(&OP_UNREACHABLE));
+        }
     }
 
     #[test]

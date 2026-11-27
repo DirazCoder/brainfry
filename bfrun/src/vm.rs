@@ -6,6 +6,7 @@ use std::io;
 /// hold -- unlike the original spec, where that's undefined behavior or a
 /// crash depending on the implementation.
 const INITIAL_TAPE_SIZE: usize = 30_000;
+const TAPE_LIMIT: usize = 1 << 30;
 
 #[derive(Debug)]
 pub enum RunError {
@@ -17,6 +18,7 @@ pub enum RunError {
     /// `bfnative`'s MSG_GROW wording so error-path differential runs keep
     /// comparing equal across backends.
     GrowFailed,
+    TapeLimitExceeded,
     Io(io::Error),
 }
 
@@ -27,6 +29,9 @@ impl std::fmt::Display for RunError {
                 write!(f, "pointer moved left of cell 0")
             }
             RunError::GrowFailed => write!(f, "failed to grow tape"),
+            RunError::TapeLimitExceeded => {
+                write!(f, "tape limit exceeded (1073741824 bytes)")
+            }
             RunError::Io(err) => write!(f, "I/O error: {err}"),
         }
     }
@@ -85,6 +90,9 @@ impl Vm {
                     *cell = cell.wrapping_sub(n);
                 }
                 Op::MoveRight(n) => {
+                    if n as usize >= TAPE_LIMIT - self.pointer {
+                        return Err(RunError::TapeLimitExceeded);
+                    }
                     self.pointer += n as usize;
                     self.grow_if_needed()?;
                 }
@@ -121,6 +129,29 @@ impl Vm {
                 Op::Zero => {
                     *self.current_cell() = 0;
                 }
+                Op::AddAt { offset, delta } => {
+                    let target = self.offset_pointer(offset)?;
+                    self.grow_to_at_least(target)?;
+                    self.tape[target] = self.tape[target].wrapping_add(delta);
+                }
+                Op::ZeroAt { offset } => {
+                    let target = self.offset_pointer(offset)?;
+                    self.grow_to_at_least(target)?;
+                    self.tape[target] = 0;
+                }
+                Op::SetAt { offset, value } => {
+                    let target = self.offset_pointer(offset)?;
+                    self.grow_to_at_least(target)?;
+                    self.tape[target] = value;
+                }
+                Op::BoundsCheck {
+                    min_offset,
+                    max_offset,
+                } => {
+                    let min = self.offset_pointer(min_offset)?;
+                    let max = self.offset_pointer(max_offset)?;
+                    self.grow_to_at_least(max.max(min))?;
+                }
                 Op::MulAdd { offset, factor } => {
                     // Does NOT zero the source cell: a spread loop folds
                     // into multiple MulAdds sharing one source cell,
@@ -137,7 +168,7 @@ impl Vm {
                 }
                 Op::Scan { stride } => {
                     while *self.current_cell() != 0 {
-                        self.pointer = self.offset_pointer(stride)?;
+                        self.pointer = self.offset_pointer(stride as isize)?;
                         self.grow_if_needed()?;
                     }
                 }
@@ -167,6 +198,9 @@ impl Vm {
     /// rather than a runtime error. `try_reserve` first means the resize
     /// itself can no longer fail.
     fn grow_to_at_least(&mut self, index: usize) -> Result<(), RunError> {
+        if index >= TAPE_LIMIT {
+            return Err(RunError::TapeLimitExceeded);
+        }
         if index >= self.tape.len() {
             let additional = index + 1 - self.tape.len();
             self.tape
@@ -179,10 +213,12 @@ impl Vm {
 
     /// Applies a signed offset to the current pointer, erroring on underflow
     /// the same way `MoveLeft` does rather than silently wrapping.
-    fn offset_pointer(&self, offset: i32) -> Result<usize, RunError> {
-        let new_pointer = self.pointer as i64 + offset as i64;
+    fn offset_pointer(&self, offset: isize) -> Result<usize, RunError> {
+        let new_pointer = self.pointer as i128 + offset as i128;
         if new_pointer < 0 {
             Err(RunError::PointerUnderflow)
+        } else if new_pointer >= TAPE_LIMIT as i128 {
+            Err(RunError::TapeLimitExceeded)
         } else {
             Ok(new_pointer as usize)
         }
@@ -203,11 +239,11 @@ mod tests {
     }
 
     #[test]
-    fn impossible_tape_growth_returns_grow_failed() {
+    fn tape_limit_is_checked_before_allocation() {
         let mut vm = Vm::new();
         assert!(matches!(
             vm.grow_to_at_least(usize::MAX - 1),
-            Err(RunError::GrowFailed)
+            Err(RunError::TapeLimitExceeded)
         ));
     }
 
@@ -326,6 +362,116 @@ mod tests {
     }
 
     #[test]
+    fn offset_ops_update_cells_and_check_tape_limits() {
+        let vm = run_ops(&[
+            Op::Add(6),
+            Op::AddAt {
+                offset: 1,
+                delta: 3,
+            },
+            Op::ZeroAt { offset: 1 },
+            Op::SetAt {
+                offset: 2,
+                value: 8,
+            },
+            Op::BoundsCheck {
+                min_offset: 0,
+                max_offset: INITIAL_TAPE_SIZE as isize,
+            },
+            Op::MoveRight(2),
+            Op::Output,
+        ]);
+        assert_eq!(vm.pointer, 2);
+        assert_eq!(vm.tape[0], 6);
+        assert_eq!(vm.tape[1], 0);
+        assert_eq!(vm.tape[2], 8);
+        assert_eq!(vm.tape.len(), INITIAL_TAPE_SIZE + 1);
+
+        let mut vm = Vm::new();
+        assert!(matches!(
+            vm.run(&[Op::AddAt {
+                offset: TAPE_LIMIT as isize,
+                delta: 1
+            }]),
+            Err(RunError::TapeLimitExceeded)
+        ));
+        let mut vm = Vm::new();
+        assert!(matches!(
+            vm.run(&[Op::BoundsCheck {
+                min_offset: 0,
+                max_offset: TAPE_LIMIT as isize
+            }]),
+            Err(RunError::TapeLimitExceeded)
+        ));
+    }
+
+    #[test]
+    fn far_offset_ops_and_right_moves_obey_the_tape_cap() {
+        for op in [
+            Op::AddAt {
+                offset: 40_000,
+                delta: 3,
+            },
+            Op::ZeroAt { offset: 40_000 },
+            Op::SetAt {
+                offset: 40_000,
+                value: 7,
+            },
+            Op::BoundsCheck {
+                min_offset: 0,
+                max_offset: 40_000,
+            },
+        ] {
+            let mut vm = Vm::new();
+            vm.run(&[op]).unwrap();
+            assert!(vm.tape.len() > 40_000, "{op:?}");
+        }
+
+        let mut vm = Vm::new();
+        assert!(matches!(
+            vm.run(&[Op::MoveRight(TAPE_LIMIT as u32)]),
+            Err(RunError::TapeLimitExceeded)
+        ));
+        let mut vm = Vm::new();
+        assert!(matches!(
+            vm.run(&[Op::AddAt {
+                offset: -1,
+                delta: 1
+            }]),
+            Err(RunError::PointerUnderflow)
+        ));
+        let mut vm = Vm::new();
+        assert!(matches!(
+            vm.run(&[Op::ZeroAt {
+                offset: TAPE_LIMIT as isize
+            }]),
+            Err(RunError::TapeLimitExceeded)
+        ));
+        let mut vm = Vm::new();
+        assert!(matches!(
+            vm.run(&[Op::SetAt {
+                offset: -1,
+                value: 1
+            }]),
+            Err(RunError::PointerUnderflow)
+        ));
+        let mut vm = Vm::new();
+        assert!(matches!(
+            vm.run(&[Op::BoundsCheck {
+                min_offset: -1,
+                max_offset: 0
+            }]),
+            Err(RunError::PointerUnderflow)
+        ));
+    }
+
+    #[test]
+    fn zero_source_scan_does_not_move() {
+        let vm = run_ops(&[Op::Scan { stride: i32::MAX }]);
+        assert_eq!(vm.pointer, 0);
+    }
+
+    #[test]
     fn grow_failed_message_matches_bfnative_wording() {
         // bfnative's MSG_GROW is "runtime error: failed to grow tape\n" and
         // bfrun's main prints "runtime error: {err}" -- the differential
@@ -340,6 +486,10 @@ mod tests {
         assert_eq!(
             RunError::PointerUnderflow.to_string(),
             "pointer moved left of cell 0"
+        );
+        assert_eq!(
+            RunError::TapeLimitExceeded.to_string(),
+            "tape limit exceeded (1073741824 bytes)"
         );
         assert_eq!(
             RunError::Io(io::Error::other("pipe broke")).to_string(),
@@ -519,25 +669,44 @@ mod tests {
         with_alloc_cap(|| {
             let mut vm = Vm::new();
             let result = vm.run(&[Op::MoveRight(u32::MAX)]);
+            assert!(matches!(result, Err(RunError::TapeLimitExceeded)));
+
+            let mut vm = Vm::new();
+            let result = vm.run(&[Op::MoveRight(2_000_000)]);
             assert!(matches!(result, Err(RunError::GrowFailed)));
+
+            for op in [
+                Op::AddAt {
+                    offset: 2_000_000,
+                    delta: 1,
+                },
+                Op::ZeroAt { offset: 2_000_000 },
+                Op::SetAt {
+                    offset: 2_000_000,
+                    value: 1,
+                },
+                Op::BoundsCheck {
+                    min_offset: 0,
+                    max_offset: 2_000_000,
+                },
+            ] {
+                let mut vm = Vm::new();
+                let result = vm.run(&[op]);
+                assert!(matches!(result, Err(RunError::GrowFailed)), "{op:?}");
+            }
 
             let mut vm = Vm::new();
             let result = vm.run(&[
                 Op::Add(1),
                 Op::MulAdd {
-                    offset: 2_000_000_000,
+                    offset: 2_000_000,
                     factor: 1,
                 },
             ]);
             assert!(matches!(result, Err(RunError::GrowFailed)));
 
             let mut vm = Vm::new();
-            let result = vm.run(&[
-                Op::Add(1),
-                Op::Scan {
-                    stride: 2_000_000_000,
-                },
-            ]);
+            let result = vm.run(&[Op::Add(1), Op::Scan { stride: 2_000_000 }]);
             assert!(matches!(result, Err(RunError::GrowFailed)));
         });
     }

@@ -33,6 +33,7 @@ use std::io::{self, Read, Write};
 /// `INITIAL_TAPE_SIZE`. The tape grows past this automatically if a program
 /// moves further right than it can hold.
 pub const INITIAL_TAPE_SIZE: usize = 30_000;
+const TAPE_LIMIT: usize = 1 << 30;
 
 #[derive(Debug)]
 pub enum RunError {
@@ -41,6 +42,7 @@ pub enum RunError {
     PointerUnderflow,
     /// The tape couldn't be grown (allocation failure) — same as `bfrun`.
     GrowFailed,
+    TapeLimitExceeded,
     Io(io::Error),
 }
 
@@ -54,6 +56,9 @@ impl std::fmt::Display for RunError {
                 write!(f, "pointer moved left of cell 0")
             }
             RunError::GrowFailed => write!(f, "failed to grow tape"),
+            RunError::TapeLimitExceeded => {
+                write!(f, "tape limit exceeded (1073741824 bytes)")
+            }
             RunError::Io(err) => write!(f, "I/O error: {err}"),
         }
     }
@@ -88,6 +93,9 @@ pub fn run(ops: &[Op], stdin: &mut dyn Read, stdout: &mut dyn Write) -> Result<(
             Op::Add(n) => tape[cell] = tape[cell].wrapping_add(n),
             Op::Sub(n) => tape[cell] = tape[cell].wrapping_sub(n),
             Op::MoveRight(n) => {
+                if n as usize >= TAPE_LIMIT - cell {
+                    return Err(RunError::TapeLimitExceeded);
+                }
                 cell += n as usize;
                 // Grow to exactly the cell we just landed on — bfrun's
                 // grow-if-needed policy, not a doubling scheme.
@@ -126,6 +134,37 @@ pub fn run(ops: &[Op], stdin: &mut dyn Read, stdout: &mut dyn Write) -> Result<(
                 }
             }
             Op::Zero => tape[cell] = 0,
+            Op::AddAt { offset, delta } => {
+                let target = offset_cell(cell, offset)?;
+                if target >= tape.len() {
+                    grow_to_at_least(&mut tape, target)?;
+                }
+                tape[target] = tape[target].wrapping_add(delta);
+            }
+            Op::ZeroAt { offset } => {
+                let target = offset_cell(cell, offset)?;
+                if target >= tape.len() {
+                    grow_to_at_least(&mut tape, target)?;
+                }
+                tape[target] = 0;
+            }
+            Op::SetAt { offset, value } => {
+                let target = offset_cell(cell, offset)?;
+                if target >= tape.len() {
+                    grow_to_at_least(&mut tape, target)?;
+                }
+                tape[target] = value;
+            }
+            Op::BoundsCheck {
+                min_offset,
+                max_offset,
+            } => {
+                let min = offset_cell(cell, min_offset)?;
+                let max = offset_cell(cell, max_offset)?;
+                if max >= tape.len() || min >= tape.len() {
+                    grow_to_at_least(&mut tape, max.max(min))?;
+                }
+            }
             Op::MulAdd { offset, factor } => {
                 // Does NOT zero the source cell: the optimizer emits one
                 // MulAdd per spread target followed by a single trailing
@@ -144,7 +183,7 @@ pub fn run(ops: &[Op], stdin: &mut dyn Read, stdout: &mut dyn Write) -> Result<(
             }
             Op::Scan { stride } => {
                 while tape[cell] != 0 {
-                    cell = offset_cell(cell, stride)?;
+                    cell = offset_cell(cell, stride as isize)?;
                     if cell >= tape.len() {
                         grow_to_at_least(&mut tape, cell)?;
                     }
@@ -160,10 +199,12 @@ pub fn run(ops: &[Op], stdin: &mut dyn Read, stdout: &mut dyn Write) -> Result<(
 
 /// Applies a signed offset to a cell index, erroring on underflow the same
 /// way `MoveLeft` does rather than silently wrapping.
-fn offset_cell(cell: usize, offset: i32) -> Result<usize, RunError> {
-    let new_cell = cell as i64 + offset as i64;
+fn offset_cell(cell: usize, offset: isize) -> Result<usize, RunError> {
+    let new_cell = cell as i128 + offset as i128;
     if new_cell < 0 {
         Err(RunError::PointerUnderflow)
+    } else if new_cell >= TAPE_LIMIT as i128 {
+        Err(RunError::TapeLimitExceeded)
     } else {
         Ok(new_cell as usize)
     }
@@ -175,6 +216,9 @@ fn offset_cell(cell: usize, offset: i32) -> Result<usize, RunError> {
 /// error. `try_reserve` first means the resize itself can no longer fail.
 fn grow_to_at_least(tape: &mut Vec<u8>, index: usize) -> Result<(), RunError> {
     debug_assert!(index >= tape.len());
+    if index >= TAPE_LIMIT {
+        return Err(RunError::TapeLimitExceeded);
+    }
     let additional = index + 1 - tape.len();
     tape.try_reserve(additional)
         .map_err(|_| RunError::GrowFailed)?;
@@ -223,7 +267,7 @@ mod tests {
         let mut tape = vec![0u8; INITIAL_TAPE_SIZE];
         assert!(matches!(
             grow_to_at_least(&mut tape, usize::MAX - 1),
-            Err(RunError::GrowFailed)
+            Err(RunError::TapeLimitExceeded)
         ));
     }
 
@@ -264,6 +308,110 @@ mod tests {
         let (out, result) = interp(&ops, "");
         assert!(result.is_ok());
         assert_eq!(out, Vec::<u8>::new());
+    }
+
+    #[test]
+    fn offset_ops_update_cells_and_enforce_bounds() {
+        let ops = [
+            Op::Add(5),
+            Op::AddAt {
+                offset: 1,
+                delta: 2,
+            },
+            Op::ZeroAt { offset: 1 },
+            Op::SetAt {
+                offset: 2,
+                value: 7,
+            },
+            Op::BoundsCheck {
+                min_offset: 0,
+                max_offset: INITIAL_TAPE_SIZE as isize,
+            },
+            Op::MoveRight(2),
+            Op::Output,
+        ];
+        let (out, result) = interp(&ops, "");
+        assert!(result.is_ok());
+        assert_eq!(out, vec![7]);
+
+        assert!(matches!(
+            interp(
+                &[Op::AddAt {
+                    offset: TAPE_LIMIT as isize,
+                    delta: 1
+                }],
+                ""
+            )
+            .1,
+            Err(RunError::TapeLimitExceeded)
+        ));
+        assert!(matches!(
+            interp(
+                &[Op::BoundsCheck {
+                    min_offset: 0,
+                    max_offset: TAPE_LIMIT as isize
+                }],
+                ""
+            )
+            .1,
+            Err(RunError::TapeLimitExceeded)
+        ));
+        let (out, result) = interp(&[Op::Scan { stride: i32::MAX }], "");
+        assert!(result.is_ok());
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn offset_writes_and_scans_grow_the_tape() {
+        for op in [
+            Op::AddAt {
+                offset: 40_000,
+                delta: 3,
+            },
+            Op::ZeroAt { offset: 40_000 },
+            Op::SetAt {
+                offset: 40_000,
+                value: 7,
+            },
+            Op::BoundsCheck {
+                min_offset: 0,
+                max_offset: 40_000,
+            },
+        ] {
+            let (_, result) = interp(&[op], "");
+            assert!(result.is_ok(), "{op:?}: {result:?}");
+        }
+
+        let (_, result) = interp(
+            &[
+                Op::Add(1),
+                Op::MulAdd {
+                    offset: 40_000,
+                    factor: 2,
+                },
+            ],
+            "",
+        );
+        assert!(result.is_ok());
+        let (_, result) = interp(&[Op::Add(1), Op::Scan { stride: 40_000 }], "");
+        assert!(result.is_ok());
+        assert!(matches!(
+            interp(&[Op::MoveRight(TAPE_LIMIT as u32)], "").1,
+            Err(RunError::TapeLimitExceeded)
+        ));
+    }
+
+    #[test]
+    fn offset_cell_covers_valid_underflow_and_tape_limit() {
+        assert!(matches!(offset_cell(1, -1), Ok(0)));
+        assert!(matches!(
+            offset_cell(0, -1),
+            Err(RunError::PointerUnderflow)
+        ));
+        assert!(matches!(
+            offset_cell(0, TAPE_LIMIT as isize),
+            Err(RunError::TapeLimitExceeded)
+        ));
     }
 
     #[test]
@@ -345,6 +493,10 @@ mod tests {
         );
         assert_eq!(RunError::GrowFailed.to_string(), "failed to grow tape");
         assert_eq!(
+            RunError::TapeLimitExceeded.to_string(),
+            "tape limit exceeded (1073741824 bytes)"
+        );
+        assert_eq!(
             RunError::Io(io::Error::other("bad fd")).to_string(),
             "I/O error: bad fd"
         );
@@ -376,7 +528,7 @@ mod tests {
             &[
                 Op::Add(1),
                 Op::MulAdd {
-                    offset: INITIAL_TAPE_SIZE as i32,
+                    offset: INITIAL_TAPE_SIZE as isize,
                     factor: 2,
                 },
                 Op::MoveRight(INITIAL_TAPE_SIZE as u32),
@@ -473,11 +625,10 @@ mod tests {
     fn impossible_growth_is_a_clean_error_not_an_abort() {
         // try_reserve fails instantly with a capacity overflow (no
         // allocation is attempted) once the reservation exceeds isize::MAX
-        // bytes — the exact condition the guard maps to GrowFailed instead
-        // of letting the resize abort the process.
+        // bytes — the exact condition the tape cap rejects before resize.
         let mut tape = vec![0u8; INITIAL_TAPE_SIZE];
         let result = grow_to_at_least(&mut tape, usize::MAX - 1);
-        assert!(matches!(result, Err(RunError::GrowFailed)));
+        assert!(matches!(result, Err(RunError::TapeLimitExceeded)));
         assert_eq!(tape.len(), INITIAL_TAPE_SIZE);
     }
 
@@ -574,13 +725,39 @@ mod tests {
                 &mut Cursor::new(b""),
                 &mut Vec::new(),
             );
+            assert!(matches!(result, Err(RunError::TapeLimitExceeded)));
+
+            let result = run(
+                &[Op::MoveRight(2_000_000)],
+                &mut Cursor::new(b""),
+                &mut Vec::new(),
+            );
             assert!(matches!(result, Err(RunError::GrowFailed)));
+
+            for op in [
+                Op::AddAt {
+                    offset: 2_000_000,
+                    delta: 1,
+                },
+                Op::ZeroAt { offset: 2_000_000 },
+                Op::SetAt {
+                    offset: 2_000_000,
+                    value: 1,
+                },
+                Op::BoundsCheck {
+                    min_offset: 0,
+                    max_offset: 2_000_000,
+                },
+            ] {
+                let result = run(&[op], &mut Cursor::new(b""), &mut Vec::new());
+                assert!(matches!(result, Err(RunError::GrowFailed)), "{op:?}");
+            }
 
             let result = run(
                 &[
                     Op::Add(1),
                     Op::MulAdd {
-                        offset: 2_000_000_000,
+                        offset: 2_000_000,
                         factor: 1,
                     },
                 ],
@@ -590,12 +767,7 @@ mod tests {
             assert!(matches!(result, Err(RunError::GrowFailed)));
 
             let result = run(
-                &[
-                    Op::Add(1),
-                    Op::Scan {
-                        stride: 2_000_000_000,
-                    },
-                ],
+                &[Op::Add(1), Op::Scan { stride: 2_000_000 }],
                 &mut Cursor::new(b""),
                 &mut Vec::new(),
             );
