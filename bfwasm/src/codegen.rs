@@ -1186,6 +1186,7 @@ mod tests {
                 offset: 0,
                 value: 3,
             },
+            Op::Scan { stride: 1 },
             Op::BoundsCheck {
                 min_offset: 0,
                 max_offset: 1,
