@@ -507,7 +507,7 @@ fn spawn_with_capped_vmem(bfjit: &str, source: &str) -> std::process::Output {
         rlim_max: u64,
     }
 
-    extern "C" {
+    unsafe extern "C" {
         fn setrlimit(resource: i32, rlim: *const Rlimit) -> i32;
     }
 
@@ -585,7 +585,7 @@ fn spawn_with_capped_vmem(bfjit: &str, source: &str) -> std::process::Output {
     }
 
     #[link(name = "kernel32")]
-    extern "system" {
+    unsafe extern "system" {
         fn CreateJobObjectW(attrs: *mut std::ffi::c_void, name: *const u16) -> HANDLE;
         fn SetInformationJobObject(
             job: HANDLE,
@@ -632,12 +632,12 @@ fn spawn_with_capped_vmem(bfjit: &str, source: &str) -> std::process::Output {
         CloseHandle(job);
 
         // Resume the child now that the Job limit is in place.
-        extern "system" {
+        unsafe extern "system" {
             fn ResumeThread(thread: HANDLE) -> u32;
         }
         // We can't get the main thread handle from std::process::Child, so
         // we resume via NtResumeProcess (single-threaded child at this point).
-        extern "system" {
+        unsafe extern "system" {
             fn NtResumeProcess(process: HANDLE) -> i32;
         }
         NtResumeProcess(child.as_raw_handle() as HANDLE);
