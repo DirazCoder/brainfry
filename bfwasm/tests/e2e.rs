@@ -73,6 +73,16 @@ fn output_flag_without_a_value_fails() {
 }
 
 #[test]
+fn target_flag_without_a_value_fails() {
+    let dir = temp_dir("target-no-value");
+    let source_path = write_source(&dir, "+.");
+    let (status, _, stderr) = run_args("target-no-value", &[&source_path, Path::new("--target")]);
+    assert_eq!(status.code(), Some(1));
+    assert!(stderr.contains("--target needs a value"), "{stderr}");
+    assert!(stderr.contains("usage: bfwasm"), "{stderr}");
+}
+
+#[test]
 fn more_than_one_input_file_is_rejected() {
     let dir = temp_dir("two-inputs");
     let a = write_source(&dir, "+.");
@@ -107,6 +117,91 @@ fn output_in_a_missing_directory_fails_cleanly() {
     let source_path = write_source(&dir, "+.");
     let bad_output = dir.join("no-such-dir").join("program.wasm");
     let (status, _, stderr) = run_args("bad-output", &[&source_path, Path::new("-o"), &bad_output]);
+    assert_eq!(status.code(), Some(1));
+    assert!(stderr.contains("couldn't write"), "{stderr}");
+}
+
+#[test]
+fn browser_target_writes_a_self_contained_javascript_file_by_default() {
+    let dir = temp_dir("browser-target");
+    let source_path = write_source(&dir, HELLO_WORLD);
+    let (status, stdout, stderr) = run_args(
+        "browser-target",
+        &[&source_path, Path::new("--target"), Path::new("browser")],
+    );
+    assert!(status.success(), "stderr: {stderr}");
+    assert!(stdout.contains("program.js"), "{stdout}");
+    let generated = fs::read_to_string(dir.join("program.js")).expect("reading browser output");
+    assert!(generated.contains("wasi_snapshot_preview1"));
+    assert!(generated.contains("WebAssembly.instantiate"));
+    assert!(generated.contains("atob(\""));
+    assert!(!generated.contains("fetch("));
+    assert!(!generated.contains("program.wasm"));
+}
+
+#[test]
+fn javascript_output_extension_infers_browser_target() {
+    let dir = temp_dir("browser-inferred");
+    let source_path = write_source(&dir, "+.");
+    let output_path = dir.join("inferred.js");
+    let (status, stdout, stderr) = run_args(
+        "browser-inferred",
+        &[&source_path, Path::new("-o"), &output_path],
+    );
+    assert!(status.success(), "stderr: {stderr}");
+    assert!(stdout.contains("inferred.js"), "{stdout}");
+    let generated = fs::read_to_string(output_path).expect("reading inferred browser output");
+    assert!(generated.contains("wasi_snapshot_preview1"));
+}
+
+#[test]
+fn explicit_wasi_target_overrides_javascript_extension_inference() {
+    let dir = temp_dir("wasi-explicit");
+    let source_path = write_source(&dir, "+.");
+    let output_path = dir.join("explicit.js");
+    let (status, _, stderr) = run_args(
+        "wasi-explicit",
+        &[
+            &source_path,
+            Path::new("-o"),
+            &output_path,
+            Path::new("--target"),
+            Path::new("wasi"),
+        ],
+    );
+    assert!(status.success(), "stderr: {stderr}");
+    let bytes = fs::read(output_path).expect("reading explicit WASI output");
+    assert_eq!(&bytes[..4], b"\0asm");
+}
+
+#[test]
+fn unknown_target_fails_with_a_usage_error() {
+    let dir = temp_dir("unknown-target");
+    let source_path = write_source(&dir, "+.");
+    let (status, _, stderr) = run_args(
+        "unknown-target",
+        &[&source_path, Path::new("--target"), Path::new("native")],
+    );
+    assert_eq!(status.code(), Some(1));
+    assert!(stderr.contains("unknown target: native"), "{stderr}");
+    assert!(stderr.contains("usage: bfwasm"), "{stderr}");
+}
+
+#[test]
+fn browser_output_write_failure_is_reported() {
+    let dir = temp_dir("browser-write-failure");
+    let source_path = write_source(&dir, "+.");
+    let output_path = dir.join("missing-directory").join("program.js");
+    let (status, _, stderr) = run_args(
+        "browser-write-failure",
+        &[
+            &source_path,
+            Path::new("--target"),
+            Path::new("browser"),
+            Path::new("-o"),
+            &output_path,
+        ],
+    );
     assert_eq!(status.code(), Some(1));
     assert!(stderr.contains("couldn't write"), "{stderr}");
 }

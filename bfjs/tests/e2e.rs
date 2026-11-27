@@ -274,6 +274,32 @@ fn underflow_is_a_clean_error_under_node() {
 }
 
 #[test]
+fn tape_limit_error_is_byte_exact_under_node() {
+    if !have_node() {
+        eprintln!("note: node not found — skipping execution test");
+        return;
+    }
+    let dir = temp_dir("tape-limit");
+    let output_path = compile_program(&dir, &">".repeat(30_000));
+    let generated = fs::read_to_string(&output_path).expect("reading generated js");
+    let testable_limit =
+        generated.replace("const TAPE_MAX = 1073741824;", "const TAPE_MAX = 30000;");
+    assert_ne!(
+        generated, testable_limit,
+        "generated tape limit should be present"
+    );
+    fs::write(&output_path, testable_limit).expect("setting small test tape limit");
+
+    let (status, stdout, stderr) = run_node(&output_path, b"").expect("node run");
+    assert_eq!(status.code(), Some(1));
+    assert_eq!(stdout, b"");
+    assert_eq!(
+        stderr,
+        b"runtime error: tape limit exceeded (1073741824 bytes)\n"
+    );
+}
+
+#[test]
 fn folded_ops_execute_correctly_under_node() {
     if !have_node() {
         eprintln!("note: node not found — skipping execution test");

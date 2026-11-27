@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""Seven-way differential test harness: bfinterp vs bfrun vs bfnative vs
-bfjit vs bfwasm vs bfjs vs bf2c.
+"""Differential test harness for the Brainfry execution backends.
 
 Every program in the corpus is run through the execution strategies fed
 by one shared parser/optimizer front end:
@@ -10,20 +9,16 @@ by one shared parser/optimizer front end:
   3. `bfrun`            — bytecode VM (via bfc; the project's ground truth)
   4. `bfnative`         — ahead-of-time native executable
   5. `bfjit`            — JIT: same codegen as bfnative, executed in memory
-  6. `bfwasm`           — compiles to a standalone .wasm, run under wasmtime
-  7. `bfjs`             — transpiles to a standalone .js, run under node
-  8. `bf2c`             — transpiles to portable C99, compiled with cc and run
+  6. `bfwasm`           — standalone .wasm run under wasmtime and Node's WASI API
+  7. `bfjs`             — standalone .js run under Node.js and browser engines
+  8. `bf2c`             — portable C99 compiled with a host C compiler and run
 
-bfwasm is a soft dependency: if the `wasmtime` Python package isn't
-installed, that lane is skipped (with a note) rather than failing the run,
-since it's an external runtime rather than something `cargo build` produces.
-The two transpiler lanes follow the same rule for their host tools: bfjs
-needs a `node` on PATH, bf2c needs a C compiler (cc/gcc/clang, probed by
-compiling a trivial program). A missing one skips that lane instead of
-failing — GitHub's runners have node everywhere and a C compiler on the
-Unix images, so in practice both lanes run everywhere but Windows-C.
+Optional runtimes can be skipped during local development; `--require-all`
+makes missing runtimes and compilers fatal for CI. `--only-node` runs only
+the bfjs and bfwasm Node.js lanes, without executing the other backends.
 
-stdout, stderr, and exit status must be byte-identical across all of them.
+stdout, stderr, and exit status must match bfrun byte-for-byte. Browser lanes
+use empty stdin because browser execution has EOF semantics.
 The corpus is the 27-program set from differential_test.py (deep nesting,
 multiplication loops, tape growth to 200k cells, wraparound, EOF semantics,
 stdin echo, runtime-error paths) plus Erik Bosman's mandelbrot.b — the same
@@ -33,7 +28,8 @@ If bfinterp's naive path disagrees with the others, that is a bug in
 bfinterp specifically: it is the newest, least-optimized implementation.
 
 Usage:
-    python3 scripts/differential_test_all.py [repo-root]
+    python3 scripts/differential_test_all.py [repo-root] [--only-node]
+    python3 scripts/differential_test_all.py [repo-root] [--require-all]
 
 Optional aarch64-under-QEMU mode (execution test of the arm64 JIT under
 user-mode emulation, mirroring the bfnative harness's QEMU_AARCH64
@@ -51,7 +47,10 @@ are architecture-independent). Provide any subset.
 """
 
 from contextlib import contextmanager
+import argparse
+import base64
 import os
+import platform
 import shutil
 import subprocess
 import sys
@@ -59,7 +58,7 @@ import tempfile
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-ROOT = sys.argv[1] if len(sys.argv) > 1 else os.path.dirname(HERE)
+ROOT = os.path.dirname(HERE)
 
 EXE = ".exe" if os.name == "nt" else ""
 
@@ -97,6 +96,12 @@ try:
 except ImportError:
     HAVE_WASMTIME = False
 
+try:
+    from playwright.sync_api import sync_playwright
+    HAVE_PLAYWRIGHT = True
+except ImportError:
+    HAVE_PLAYWRIGHT = False
+
 
 def _probe(cmd, timeout=60):
     """Runs a command; True iff it exits 0 (crash/missing binary = False)."""
@@ -112,15 +117,75 @@ def find_host_node():
     return "node" if _probe(["node", "-e", "0"]) else None
 
 
+def find_msvc_vcvars():
+    """Find Visual Studio's vcvarsall.bat when cl.exe isn't already on PATH."""
+    install = os.environ.get("VSINSTALLDIR")
+    if not install:
+        program_files = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
+        vswhere = os.path.join(program_files, "Microsoft Visual Studio",
+                               "Installer", "vswhere.exe")
+        if os.path.exists(vswhere):
+            result = subprocess.run(
+                [vswhere, "-latest", "-products", "*", "-requires",
+                 "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+                 "-property", "installationPath"],
+                capture_output=True, text=True, timeout=30)
+            if result.returncode == 0:
+                install = result.stdout.strip()
+    if not install:
+        return None
+    vcvars = os.path.join(install, "VC", "Auxiliary", "Build", "vcvarsall.bat")
+    return vcvars if os.path.exists(vcvars) else None
+
+
+def _msvc_batch_command(vcvars, arch, command, batch_path):
+    with open(batch_path, "w", newline="") as batch:
+        batch.write("@echo off\r\n")
+        batch.write(f'call "{vcvars}" {arch} >nul\r\n')
+        batch.write("if errorlevel 1 exit /b %errorlevel%\r\n")
+        batch.write(command + "\r\n")
+    return [os.environ.get("ComSpec", "cmd.exe"), "/d", "/c", batch_path]
+
+
+def _probe_msvc(compiler):
+    with tempfile.TemporaryDirectory() as td:
+        src = os.path.join(td, "probe.c")
+        exe = os.path.join(td, "probe.exe")
+        obj = os.path.join(td, "probe.obj")
+        with open(src, "w") as f:
+            f.write("int main(void) { return 0; }\n")
+        if compiler[0] == "direct":
+            cmd = [compiler[1], "/nologo", "/Fe" + exe, src]
+        else:
+            vcvars, arch = compiler[1], compiler[2]
+            command = f'cl /nologo /Fo"{obj}" /Fe"{exe}" "{src}"'
+            cmd = _msvc_batch_command(
+                vcvars, arch, command, os.path.join(td, "probe-msvc.cmd"))
+        return _probe(cmd)
+
+
 def find_host_cc():
-    """The first C compiler on PATH that compiles a trivial program."""
+    """Find a working C compiler, including MSVC on Windows."""
     for cc in ("cc", "gcc", "clang"):
         with tempfile.TemporaryDirectory() as td:
             src = os.path.join(td, "probe.c")
+            exe = os.path.join(td, "probe" + EXE)
             with open(src, "w") as f:
                 f.write("int main(void) { return 0; }\n")
-            if _probe([cc, "-o", os.path.join(td, "probe"), src]):
-                return cc
+            if _probe([cc, "-o", exe, src]):
+                return ("native", cc)
+    if os.name == "nt":
+        cl = shutil.which("cl")
+        if cl:
+            compiler = ("direct", cl)
+            if _probe_msvc(compiler):
+                return ("msvc", compiler)
+        vcvars = find_msvc_vcvars()
+        if vcvars:
+            arch = "arm64" if platform.machine().lower() in ("arm64", "aarch64") else "amd64"
+            compiler = ("vcvars", vcvars, arch)
+            if _probe_msvc(compiler):
+                return ("msvc", compiler)
     return None
 
 
@@ -360,6 +425,29 @@ def run_wasm(source, stdin):
         return exit_code, out, err
 
 
+def run_wasm_node(source, stdin):
+    """Compile bfwasm and execute it through Node's built-in WASI preview1."""
+    with tempfile.TemporaryDirectory() as td:
+        src = os.path.join(td, "p.bf")
+        wasm_path = os.path.join(td, "p.wasm")
+        runner = os.path.join(td, "run-wasi.mjs")
+        with open(src, "w") as f:
+            f.write(source)
+        c = subprocess.run([BFWASM, src, "-o", wasm_path], capture_output=True)
+        if c.returncode != 0:
+            return c.returncode, c.stdout, c.stderr
+        with open(runner, "w") as f:
+            f.write(
+                'import { readFileSync } from "node:fs";\n'
+                'import { WASI } from "node:wasi";\n'
+                'const wasi = new WASI({ version: "preview1", args: [], env: {}, preopens: {} });\n'
+                'const { instance } = await WebAssembly.instantiate('
+                'readFileSync(process.argv[2]), wasi.getImportObject());\n'
+                'process.exitCode = wasi.start(instance) ?? 0;\n'
+            )
+        return run_cmd([NODE, "--no-warnings", runner, wasm_path], stdin, td)
+
+
 def run_js(source, stdin):
     """bfjs -> execute the produced .js under node."""
     with tempfile.TemporaryDirectory() as td:
@@ -373,19 +461,167 @@ def run_js(source, stdin):
         return run_cmd([NODE, js_path], stdin, td)
 
 
+def compile_artifact(binary, source, extension, td):
+    source_path = os.path.join(td, "p.bf")
+    output_path = os.path.join(td, "p" + extension)
+    with open(source_path, "w") as f:
+        f.write(source)
+    result = subprocess.run([binary, source_path, "-o", output_path],
+                            capture_output=True)
+    return result, output_path
+
+
+class BrowserHarness:
+    """One Playwright browser instance per engine for the entire corpus."""
+
+    def __init__(self):
+        self.playwright = sync_playwright().start()
+        self.browsers = {}
+        self.pages = {}
+        try:
+            for name in ("chromium", "firefox", "webkit"):
+                browser = getattr(self.playwright, name).launch()
+                page = browser.new_page()
+                page.set_content(
+                    "<!doctype html><meta charset=utf-8><title>bf</title>"
+                    "<script>window.__bf={out:[],err:[],thrown:false};"
+                    "console.log=(...a)=>window.__bf.out.push(String(a[0]));"
+                    "console.error=(...a)=>window.__bf.err.push(String(a[0]));"
+                    "window.addEventListener('error',()=>{window.__bf.thrown=true});"
+                    "</script>")
+                self.browsers[name] = browser
+                self.pages[name] = page
+        except Exception:
+            self.close()
+            raise
+
+    def run_js(self, engine, source, stdin):
+        with tempfile.TemporaryDirectory() as td:
+            result, js_path = compile_artifact(BFJS, source, ".js", td)
+            if result.returncode != 0:
+                return result.returncode, result.stdout, result.stderr
+            page = self.pages[engine]
+            page.evaluate("window.__bf={out:[],err:[],thrown:false}")
+            with open(js_path, encoding="utf-8") as f:
+                js = f.read()
+            page.add_script_tag(content=js.removeprefix("#!/usr/bin/env node\n"))
+            captured = page.evaluate("window.__bf")
+            output = "".join(captured["out"])
+            stdout = bytes(ord(char) for char in output)
+            stderr = "".join(captured["err"]).encode("utf-8")
+            if stderr:
+                stderr += b"\n"
+            return (1 if captured["thrown"] else 0), stdout, stderr
+
+    def run_wasm(self, engine, source, stdin):
+        with tempfile.TemporaryDirectory() as td:
+            result, wasm_path = compile_artifact(BFWASM, source, ".wasm", td)
+            if result.returncode != 0:
+                return result.returncode, result.stdout, result.stderr
+            with open(wasm_path, "rb") as f:
+                wasm = base64.b64encode(f.read()).decode("ascii")
+            page = self.pages[engine]
+            exit_code, stdout, stderr = page.evaluate(
+                """async (encoded) => {
+                  const raw = atob(encoded);
+                  const bytes = Uint8Array.from(raw, c => c.charCodeAt(0));
+                  let memory;
+                  let exitCode = 0;
+                  let stdout = [];
+                  let stderr = [];
+                  const wasi = {
+                    fd_read(_fd, _iovs, _count, nread) {
+                      new DataView(memory.buffer).setUint32(nread, 0, true);
+                      return 0;
+                    },
+                    fd_write(fd, iovs, count, nwritten) {
+                      const view = new DataView(memory.buffer);
+                      let written = 0;
+                      for (let i = 0; i < count; i++) {
+                        const base = iovs + i * 8;
+                        const ptr = view.getUint32(base, true);
+                        const len = view.getUint32(base + 4, true);
+                        const sink = fd === 1 ? stdout : stderr;
+                        for (let j = 0; j < len; j++) sink.push(view.getUint8(ptr + j));
+                        written += len;
+                      }
+                      view.setUint32(nwritten, written, true);
+                      return 0;
+                    },
+                    proc_exit(code) { exitCode = code; throw { wasiExit: true }; }
+                  };
+                  const { instance } = await WebAssembly.instantiate(bytes, {
+                    wasi_snapshot_preview1: wasi
+                  });
+                  memory = instance.exports.memory;
+                  try { instance.exports._start(); }
+                  catch (error) {
+                    if (!error || error.wasiExit !== true) exitCode = 134;
+                  }
+                  return [exitCode, stdout, stderr];
+                }""", wasm)
+            return exit_code, bytes(stdout), bytes(stderr)
+
+    def run_wasm_browser_output(self, engine, source):
+        with tempfile.TemporaryDirectory() as td:
+            source_path = os.path.join(td, "p.bf")
+            js_path = os.path.join(td, "p.js")
+            with open(source_path, "w") as f:
+                f.write(source)
+            result = subprocess.run(
+                [BFWASM, source_path, "--target", "browser", "-o", js_path],
+                capture_output=True)
+            if result.returncode != 0:
+                return result.returncode, result.stdout, result.stderr
+
+            page = self.pages[engine]
+            page.evaluate(
+                "window.__bf={out:[],err:[],thrown:false};"
+                "delete window.__bfwasmExitCode")
+            with open(js_path, encoding="utf-8") as f:
+                page.add_script_tag(content=f.read())
+            page.wait_for_function(
+                "typeof window.__bfwasmExitCode === 'number'", timeout=30000)
+            captured = page.evaluate("window.__bf")
+            stdout = bytes(ord(char) for char in "".join(captured["out"]))
+            stderr = "".join(captured["err"]).encode("utf-8")
+            if stderr:
+                stderr += b"\n"
+            return page.evaluate("window.__bfwasmExitCode"), stdout, stderr
+
+    def close(self):
+        for browser in self.browsers.values():
+            browser.close()
+        self.browsers.clear()
+        if self.playwright:
+            self.playwright.stop()
+            self.playwright = None
+
+
 def run_c(source, stdin):
     """bf2c -> compile the produced C99 with the host cc, then execute."""
     with temporary_directory() as td:
         src = os.path.join(td, "p.bf")
         c_path = os.path.join(td, "p.c")
-        exe = os.path.join(td, "p")
+        exe = os.path.join(td, "p" + EXE)
+        obj = os.path.join(td, "p.obj")
         with open(src, "w") as f:
             f.write(source)
         c = subprocess.run([BF2C, src, "-o", c_path], capture_output=True)
         if c.returncode != 0:
             return c.returncode, c.stdout, c.stderr
-        k = subprocess.run([CC, "-O2", "-o", exe, c_path],
-                           capture_output=True, timeout=600)
+        if CC[0] == "msvc":
+            compiler = CC[1]
+            if compiler[0] == "direct":
+                cmd = [compiler[1], "/nologo", "/O2", "/Fe" + exe, c_path]
+            else:
+                command = f'cl /nologo /O2 /Fo"{obj}" /Fe"{exe}" "{c_path}"'
+                cmd = _msvc_batch_command(
+                    compiler[1], compiler[2], command,
+                    os.path.join(td, "compile-msvc.cmd"))
+        else:
+            cmd = [CC[1], "-O2", "-o", exe, c_path]
+        k = subprocess.run(cmd, capture_output=True, timeout=600)
         if k.returncode != 0:
             return k.returncode, k.stdout, k.stderr
         return run_cmd([exe], stdin, td)
@@ -428,25 +664,76 @@ def run_emulated_bfrun(binary, emulator, source, stdin):
         return run_cmd([emulator, binary, bfry], stdin, td)
 
 
-def main() -> int:
-    tools = [BFC, BFRUN, BFNATIVE, BFINTERP, BFJIT, BFWASM, BFJS, BF2C]
+def main(argv=None) -> int:
+    global ROOT, BFC, BFRUN, BFNATIVE, BFINTERP, BFJIT, BFWASM, BFJS, BF2C
+    global MANDELBROT
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("repo_root", nargs="?", default=ROOT)
+    parser.add_argument("--only-node", action="store_true",
+                        help="run only bfjs and bfwasm via Node.js")
+    parser.add_argument("--require-all", action="store_true",
+                        help="fail if any runtime/compiler required by selected lanes is missing")
+    args = parser.parse_args(argv)
+    ROOT = os.path.abspath(args.repo_root)
+    release = os.path.join(ROOT, "target", "release")
+    BFC = os.path.join(release, "bfc" + EXE)
+    BFRUN = os.path.join(release, "bfrun" + EXE)
+    BFNATIVE = os.path.join(release, "bfnative" + EXE)
+    BFINTERP = os.path.join(release, "bfinterp" + EXE)
+    BFJIT = os.path.join(release, "bfjit" + EXE)
+    BFWASM = os.path.join(release, "bfwasm" + EXE)
+    BFJS = os.path.join(release, "bfjs" + EXE)
+    BF2C = os.path.join(release, "bf2c" + EXE)
+    MANDELBROT = os.path.join(ROOT, "tests", "mandelbrot.b")
+
+    tools = [BFC, BFRUN, BFWASM, BFJS]
+    if not args.only_node:
+        tools.extend([BFNATIVE, BFINTERP, BFJIT, BF2C])
     missing = [t for t in tools if not os.path.exists(t)]
     if missing:
         print(f"missing {missing[0]} — run `cargo build --release` first")
         return 1
 
-    if not HAVE_WASMTIME:
-        print("note: `wasmtime` Python package not installed — "
-              "skipping the bfwasm lane (pip install wasmtime)\n")
+    unavailable = []
     if NODE is None:
-        print("note: no `node` on PATH — skipping the bfjs lane\n")
-    if CC is None:
-        print("note: no C compiler on PATH — skipping the bf2c lane\n")
+        unavailable.append("node")
+    if not args.only_node:
+        if not HAVE_WASMTIME:
+            unavailable.append("wasmtime Python package")
+        if CC is None:
+            unavailable.append("C compiler (cc, gcc, clang, or cl.exe)")
+        if not HAVE_PLAYWRIGHT:
+            unavailable.append("playwright Python package")
+    if unavailable and args.require_all:
+        print("required test dependencies missing: " + ", ".join(unavailable))
+        return 1
+    if NODE is None and args.only_node:
+        print("the --only-node lane requires a working node on PATH")
+        return 1
+    if not args.only_node:
+        if not HAVE_WASMTIME:
+            print("note: `wasmtime` Python package not installed — "
+                  "skipping the bfwasm wasmtime lane (pip install wasmtime)\n")
+        if CC is None:
+            print("note: no working C compiler — skipping the bf2c lane\n")
+        if not HAVE_PLAYWRIGHT:
+            print("note: `playwright` Python package not installed — "
+                  "skipping browser lanes\n")
+    browser_harness = None
+    if HAVE_PLAYWRIGHT and not args.only_node:
+        try:
+            browser_harness = BrowserHarness()
+        except Exception as error:
+            if args.require_all:
+                print(f"could not launch required Playwright browsers: {error}")
+                return 1
+            print(f"note: could not launch Playwright browsers — skipping browser lanes: {error}")
 
     corpus = CORPUS + load_mandelbrot()
 
     aarch64_lanes = []
-    if QEMU_AARCH64 and os.path.exists(QEMU_AARCH64):
+    if not args.only_node and QEMU_AARCH64 and os.path.exists(QEMU_AARCH64):
         for env, path in [
             ("bfjit", BFJIT_AARCH64),
             ("bfnative", BFNATIVE_AARCH64),
@@ -463,19 +750,42 @@ def main() -> int:
     comparisons = 0
     for name, source, stdin in corpus:
         ref = run_ref(source, stdin)
-        results = [
-            ("bfinterp", run_source_tool(BFINTERP, source, stdin)),
-            ("bfinterp --optimize",
-             run_source_tool(BFINTERP, source, stdin, ["--optimize"])),
-            ("bfnative", run_native(source, stdin)),
-            ("bfjit", run_source_tool(BFJIT, source, stdin)),
-        ]
-        if HAVE_WASMTIME:
-            results.append(("bfwasm", run_wasm(source, stdin)))
-        if NODE is not None:
-            results.append(("bfjs", run_js(source, stdin)))
-        if CC is not None:
-            results.append(("bf2c", run_c(source, stdin)))
+        results = []
+        if args.only_node:
+            results.extend([
+                ("bfwasm(node:wasi)", run_wasm_node(source, stdin)),
+                ("bfjs(node)", run_js(source, stdin)),
+            ])
+        else:
+            results.extend([
+                ("bfinterp", run_source_tool(BFINTERP, source, stdin)),
+                ("bfinterp --optimize",
+                 run_source_tool(BFINTERP, source, stdin, ["--optimize"])),
+                ("bfnative", run_native(source, stdin)),
+                ("bfjit", run_source_tool(BFJIT, source, stdin)),
+            ])
+            if HAVE_WASMTIME:
+                results.append(("bfwasm(wasmtime)", run_wasm(source, stdin)))
+            if NODE is not None:
+                results.extend([
+                    ("bfwasm(node:wasi)", run_wasm_node(source, stdin)),
+                    ("bfjs(node)", run_js(source, stdin)),
+                ])
+            if CC is not None:
+                results.append(("bf2c", run_c(source, stdin)))
+            if browser_harness is not None:
+                browser_ref = run_ref(source, "")
+                for engine in ("chromium", "firefox", "webkit"):
+                    results.extend([
+                        (f"bfjs({engine})",
+                         (browser_ref, browser_harness.run_js(engine, source, ""))),
+                        (f"bfwasm({engine})",
+                         (browser_ref, browser_harness.run_wasm(engine, source, ""))),
+                        (f"bfwasm-js({engine})",
+                         (browser_ref,
+                          browser_harness.run_wasm_browser_output(engine, source))),
+                    ])
+
         for lane, path in aarch64_lanes:
             if lane == "bfrun":
                 results.append((f"{lane}(qemu)",
@@ -490,24 +800,29 @@ def main() -> int:
                                 run_emulated(path, QEMU_AARCH64,
                                              source, stdin)))
 
-        ok = all(ref == r for _, r in results)
+        ok = True
         comparisons += len(results)
+        for label, result in results:
+            expected, actual = result if isinstance(result, tuple) and len(result) == 2 and \
+                isinstance(result[0], tuple) else (ref, result)
+            if expected != actual:
+                ok = False
+                lane_failures += 1
+                print(f"       ref   : exit={expected[0]} stdout={expected[1]!r} "
+                      f"stderr={expected[2]!r}")
+                print(f"       {label:20s}: exit={actual[0]} stdout={actual[1]!r} "
+                      f"stderr={actual[2]!r}")
         status = "ok " if ok else "FAIL"
         print(f"[{status}] {name}: exit {ref[0]}, stdout {len(ref[1])}B, "
               f"{len(results)} lanes")
         if not ok:
             failures += 1
-            lane_failures += sum(1 for _, r in results if r != ref)
-            print(f"       ref   : exit={ref[0]} stdout={ref[1]!r} "
-                  f"stderr={ref[2]!r}")
-            for label, r in results:
-                if r != ref:
-                    print(f"       {label:20s}: exit={r[0]} stdout={r[1]!r} "
-                          f"stderr={r[2]!r}")
 
     print(f"\n{len(corpus) - failures}/{len(corpus)} programs: "
           f"{comparisons - lane_failures}/{comparisons} executions match bfrun exactly "
           f"(stdout, stderr, exit status)")
+    if browser_harness is not None:
+        browser_harness.close()
     return 1 if failures else 0
 
 

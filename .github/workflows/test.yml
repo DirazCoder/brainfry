@@ -2,6 +2,7 @@ name: test
 
 on:
   push:
+  pull_request:
   workflow_dispatch:
 
 jobs:
@@ -43,6 +44,10 @@ jobs:
           toolchain: stable
           targets: ${{ matrix.target }}
           components: clippy
+
+      - name: cargo fmt
+        shell: bash
+        run: cargo fmt --all -- --check
 
       - name: build
         shell: bash
@@ -106,24 +111,20 @@ jobs:
         with:
           python-version: "3.x"
 
-      - name: install wasmtime (bfwasm lane runtime)
+      - name: install differential test runtimes
         shell: bash
         run: |
-          # Soft dependency: the harness skips the bfwasm lane if this is
-          # missing. Warn loudly instead of failing, since not every
-          # runner arch necessarily has a wasmtime wheel.
-          python3 -m pip install wasmtime \
-            || echo "::warning::wasmtime wheel unavailable on ${{ matrix.target }}, bfwasm lane will be skipped"
+          python3 -m pip install wasmtime playwright
+          python3 -m playwright install chromium firefox webkit
+          if [[ "${{ runner.os }}" == "Linux" ]]; then
+            python3 -m playwright install-deps chromium firefox webkit
+          fi
 
-      - name: run differential test harness
+      - name: stage native executables for the harness
         shell: bash
         run: |
-          # The harness looks for binaries under target/release (its
-          # layout for a plain `cargo build --release`), but this matrix
-          # cross-compiles with --target, which puts them under
-          # target/<triple>/release instead. Make the plain path resolve
-          # to this run's actual output rather than teaching the script
-          # about per-target directories, since it's also used locally.
+          # The harness uses target/release locally. Copy this matrix target's
+          # binaries there once so the Node-only lanes need no other builds.
           EXE=""
           [[ "${{ matrix.target }}" == *windows* ]] && EXE=".exe"
           SRC="target/${{ matrix.target }}/release"
@@ -131,7 +132,30 @@ jobs:
           for bin in bfc bfrun bfnative bfinterp bfjit bfwasm bfjs bf2c bfdbg; do
             cp "$SRC/$bin$EXE" "target/release/$bin$EXE"
           done
-          python3 scripts/differential_test_all.py .
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: differential test (Node.js 22)
+        shell: bash
+        run: python3 scripts/differential_test_all.py . --only-node --require-all
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: differential test (Node.js 24)
+        shell: bash
+        run: python3 scripts/differential_test_all.py . --only-node --require-all
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "26"
+
+      - name: full differential and browser test suite (Node.js 26)
+        shell: bash
+        run: python3 scripts/differential_test_all.py . --require-all
 
       # Runs after the other checks so a coverage gap doesn't hide their results.
       # A script because cargo-llvm-cov has no --fail-under-branches.

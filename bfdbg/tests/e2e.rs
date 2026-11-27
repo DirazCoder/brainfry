@@ -285,6 +285,25 @@ fn watchpoints_trigger_on_pointer_and_cell() {
 }
 
 #[test]
+fn cli_combines_breakpoint_watchpoint_live_edit_and_time_travel() {
+    let dir = temp_dir("combined-debug");
+    let source_path = write_source(&dir, "++>+.");
+    let (status, prog, dbg) = session(
+        &[],
+        &source_path,
+        "break 1\nwatch ptr 1\nrun\nstep\nstep\nset cell[1] = 65\nback\nback\nclear 1\nunwatch ptr\nrun\nquit\n",
+    );
+    assert_eq!(status.code(), Some(0));
+    assert_eq!(prog, vec![b'B']);
+    let dbg = String::from_utf8_lossy(&dbg);
+    assert!(dbg.contains("stopped — breakpoint at op 2/5"), "{dbg}");
+    assert!(dbg.contains("stopped — watchpoint: ptr == 1"), "{dbg}");
+    assert!(dbg.contains("cell 1 = 65"), "{dbg}");
+    assert!(dbg.matches("stepped back 1 op(s)").count() >= 2, "{dbg}");
+    assert!(dbg.contains("program finished — 5 steps executed"), "{dbg}");
+}
+
+#[test]
 fn feed_and_stdin_file_fill_the_input_queue() {
     let dir = temp_dir("feed");
     // `, . [-] ,` — read a byte, print it, clear the cell, then read

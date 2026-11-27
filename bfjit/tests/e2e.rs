@@ -431,4 +431,3 @@ fn write_source(tag: &str, source: &str) -> PathBuf {
     fs::write(&source_path, source).expect("writing test program");
     source_path
 }
-

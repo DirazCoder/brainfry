@@ -31,9 +31,9 @@ to get from an interpreter":
 5. **`bfwasm`** — compile straight to a standalone `.wasm` module: WASI
    imports for I/O, linear memory for the tape, structured control flow
    for loops. Runs on any WASI-preview1 runtime (`wasmtime`, `wasmer`,
-   Node with `--experimental-wasi-unstable-preview1`, a browser with a
-   WASI shim) instead of a specific OS/CPU pair — the one backend in this
-   project whose output isn't tied to the machine it was compiled on.
+   Node's built-in `node:wasi` API, or a browser with a WASI shim) instead
+   of a specific OS/CPU pair — the one backend whose output isn't tied
+   to the machine it was compiled on.
 6. **`bfjs`** — compile to a standalone `.js` file: a `Uint8Array` tape,
    guarded moves with doubling growth, and a host-detecting I/O layer. The
    output runs natively anywhere JavaScript does — Node, Bun, Deno, a
@@ -321,14 +321,22 @@ the Rust compiler supports.)
 ## Usage: bfwasm
 
 ```
-bfwasm program.bf              # writes program.wasm
-bfwasm program.bf -o out.wasm  # or pick the output name yourself
-wasmtime run program.wasm      # any WASI preview1 runtime
+bfwasm program.bf                         # writes program.wasm (WASI by default)
+bfwasm program.bf -o out.wasm             # standalone WASI module
+wasmtime run program.wasm                 # any WASI preview1 runtime
+bfwasm program.bf --target browser        # writes a self-contained program.js
+bfwasm program.bf -o out.js               # .js extension infers browser target
+bfwasm program.bf --target wasi -o out.js # explicit target overrides inference
 ```
 
-The output is a standalone WASI module, not a browser one. It does its I/O
-through `fd_read` and `fd_write`, which browsers don't provide, so running
-it on a web page means supplying a WASI shim yourself.
+The default `wasi` target remains a standalone WASI Preview1 `.wasm` module.
+The `browser` target writes one self-contained JavaScript file: it embeds the
+same compiled module as base64 and supplies an inline `wasi_snapshot_preview1`
+shim. It needs no separate `.wasm` file, network request, or external runtime,
+so it can run from `file://`, a browser console, or a `<script type="module">`.
+The shim treats input as EOF, sends buffered program output to `console.log`
+and errors to `console.error`, and exposes the final status as
+`globalThis.__bfwasmExitCode`.
 
 Semantics are `bfrun`'s: 30,000 starting cells, 8-bit wrapping, EOF leaving
 the cell untouched. Moving left of cell 0 prints `runtime error: pointer
@@ -576,14 +584,15 @@ not something this doc is deciding.
 ## Verification status
 
 Every target now runs for real. `.github/workflows/test.yml` builds all
-six on a native GitHub-hosted runner (same OS and architecture, no
-emulation) and runs `scripts/differential_test_all.py`: 33 programs (the
-27-program corpus, five regression programs for folded scans and multiply
-loops, plus `mandelbrot.b`) through `bfinterp`, `bfinterp --optimize`,
-`bfrun`, `bfnative`, `bfjit` and `bfwasm`, with stdout, stderr and exit
-status required to be byte-identical to `bfrun`. The corpus covers hello
-world, six-deep nesting, multiplication loops, tape growth to 200k cells,
-wraparound, EOF semantics, stdin echo, and every runtime-error path.
+six on native GitHub-hosted runners and runs `scripts/differential_test_all.py`.
+The 34-program corpus is compared with `bfrun` across the interpreter,
+native/JIT, C, WASI, and JavaScript backends. `bfjs` and `bfwasm` are also
+checked under Node.js 22, 24, and 26 on each target; Node 22 and 24 use
+`--only-node` to avoid rerunning the other backends. On Node 26, Playwright
+executes both outputs in Chromium, Firefox, and WebKit. Browser checks use
+empty stdin (EOF), and compare stdout, stderr, and exit status to `bfrun`.
+CI installs the required runtimes and uses `--require-all`, so a missing
+runtime or compiler fails instead of silently omitting its lane.
 
 The Rust workspace has verified 100% test coverage on all six targets:
 functions, lines, regions and branches, measured by `cargo-llvm-cov` in
@@ -596,10 +605,8 @@ their loop's zero check, and `bfwasm` hadn't put it back, so `[<]` on a
 zero cell stepped left anyway and `mandelbrot.b` died at the left edge.
 Separately, left-of-cell-0 was a bare trap with no message instead of
 `bfrun`'s error and exit status 1. Both are fixed and both have small
-regression programs in the corpus. The module runs under `wasmtime` through
-its Python package, which CI installs with pip. If that install fails on a
-runner, the lane is skipped with a warning rather than failing the build,
-so check the job's annotations before assuming wasm is covered there.
+regression programs in the corpus. The module is exercised by wasmtime,
+Node's built-in `node:wasi` API, and the browser preview1 shim.
 
 | Target | Status | Runner | Also checked statically |
 |---|---|---|---|
@@ -633,9 +640,8 @@ CI now runs `cargo test` on all six targets, alongside the differential
 harness, so the unit tests (PE and Mach-O header checks, instruction
 encoders) are no longer only checked locally.
 
-`bfwasm` is only ever run under `wasmtime`. The module should work on any
-WASI preview1 runtime, but CI doesn't try `wasmer`, Node or a browser shim,
-and runtimes differ on what a trap does (see Usage: bfwasm).
+`bfwasm` is exercised under wasmtime, Node's built-in `node:wasi` API,
+and Chromium, Firefox, and WebKit with a minimal WASI preview1 shim.
 
 Each target is exercised on one runner image (listed above). Other
 Windows and macOS releases, or older Linux distributions, aren't covered.

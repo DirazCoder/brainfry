@@ -430,8 +430,6 @@ mod tests {
         );
     }
 
-
-
     /// Runs parse_args over a synthetic argv (program name first).
     fn parsed(args: &[&str]) -> Result<String, String> {
         parse_args(args.iter().map(|s| s.to_string()).collect())
