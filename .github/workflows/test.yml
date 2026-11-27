@@ -52,7 +52,7 @@ jobs:
       - name: build
         shell: bash
         run: |
-          cargo build --release --target ${{ matrix.target }} -p bfc -p bfrun -p bfnative -p bfinterp -p bfwasm -p bfjit -p bfjs -p bf2c -p bfdbg
+          cargo build --release --target ${{ matrix.target }} -p bfc -p bfrun -p bfnative -p bfinterp -p bfwasm -p bfjit -p bfjs -p bf2c -p bfdbg -p brainfry
 
       - name: install cargo-llvm-cov
         if: always()
@@ -216,3 +216,33 @@ jobs:
           path: coverage-${{ matrix.archive_name }}/
           if-no-files-found: warn
           retention-days: 30
+
+  wasm-cli:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: stable
+          targets: wasm32-wasip1
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.x"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "26"
+
+      - name: install WASI test runtime
+        run: python3 -m pip install wasmtime
+
+      - name: build native reference tools
+        run: cargo build --release -p bfc -p bfrun
+
+      - name: build unified WASI CLI
+        run: cargo build --release --target wasm32-wasip1 -p brainfry
+
+      - name: test WASI CLI and backend workflows
+        run: python3 scripts/differential_test_all.py . --only-wasm-cli --require-all

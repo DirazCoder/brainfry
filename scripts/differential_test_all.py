@@ -16,6 +16,8 @@ by one shared parser/optimizer front end:
 Optional runtimes can be skipped during local development; `--require-all`
 makes missing runtimes and compilers fatal for CI. `--only-node` runs only
 the bfjs and bfwasm Node.js lanes, without executing the other backends.
+`--only-wasm-cli` tests the combined `brainfry.wasm` command dispatcher under
+Wasmtime, including its file-based compiler-to-runner workflows.
 
 stdout, stderr, and exit status must match bfrun byte-for-byte (with CRLF
 normalized to LF on Windows). Browser lanes without configured browser hooks
@@ -438,32 +440,46 @@ def run_wasm(bfwasm: Path, source: str, stdin: str) -> tuple[int, bytes, bytes]:
     with temporary_directory() as td:
         src = td / "p.bf"
         wasm_path = td / "p.wasm"
-        stdin_path = td / "stdin"
-        stdout_path = td / "stdout"
-        stderr_path = td / "stderr"
         src.write_text(source, encoding="utf-8")
         c = subprocess.run([str(bfwasm), str(src), "-o", str(wasm_path)], capture_output=True, check=False)
         if c.returncode != 0:
             return c.returncode, c.stdout, c.stderr
 
-        stdin_path.write_bytes(stdin.encode("utf-8"))
-
         engine = wasmtime.Engine()
         module = wasmtime.Module.from_file(engine, str(wasm_path))
+        return run_wasm_module(engine, module, stdin.encode("utf-8"))
+
+
+def run_wasm_module(
+    engine,
+    module,
+    stdin: bytes,
+    argv: list[str] | None = None,
+    preopen_dir: Path | None = None,
+) -> tuple[int, bytes, bytes]:
+    """Run a preloaded WASI module with captured stdio and optional directory access."""
+    with temporary_directory() as td:
+        stdin_path = td / "stdin"
+        stdout_path = td / "stdout"
+        stderr_path = td / "stderr"
+        stdin_path.write_bytes(stdin)
+
         linker = wasmtime.Linker(engine)
         linker.define_wasi()
-
         wasi = wasmtime.WasiConfig()
+        if argv is not None:
+            wasi.argv = argv
         wasi.stdin_file = str(stdin_path)
         wasi.stdout_file = str(stdout_path)
         wasi.stderr_file = str(stderr_path)
+        if preopen_dir is not None:
+            wasi.preopen_dir(str(preopen_dir), "/work")
 
         store = wasmtime.Store(engine)
         store.set_wasi(wasi)
         instance = linker.instantiate(store, module)
-        start = instance.exports(store)["_start"]
         try:
-            start(store)
+            instance.exports(store)["_start"](store)
             exit_code = 0
         except wasmtime.ExitTrap as trap:
             exit_code = trap.code
@@ -709,6 +725,215 @@ def run_c(
         return run_cmd([str(exe)], stdin)
 
 
+def native_target_for_host() -> str | None:
+    os_name = {
+        "Linux": "linux",
+        "Darwin": "macos",
+        "Windows": "windows",
+    }.get(platform.system())
+    arch = {
+        "x86_64": "x86_64",
+        "amd64": "x86_64",
+        "aarch64": "aarch64",
+        "arm64": "aarch64",
+    }.get(platform.machine().lower())
+    return f"{os_name}-{arch}" if os_name and arch else None
+
+
+def run_wasm_cli_suite(root: Path, tools: dict[str, Path], require_all: bool) -> int:
+    """Test the combined WASI CLI and its file-based backend workflows."""
+    wasm_cli = root / "target" / "wasm32-wasip1" / "release" / "brainfry.wasm"
+    missing = [tools[name] for name in ("bfc", "bfrun") if not tools[name].is_file()]
+    if missing:
+        print(f"missing {missing[0]} — build host bfc and bfrun first", file=sys.stderr)
+        return 1
+    if not wasm_cli.is_file():
+        print(f"missing {wasm_cli} — build brainfry for wasm32-wasip1 first", file=sys.stderr)
+        return 1
+    if not HAVE_WASMTIME:
+        print("the --only-wasm-cli lane requires the wasmtime Python package", file=sys.stderr)
+        return 1
+
+    node_bin, _ = find_host_node()
+    cc_info = find_host_cc()
+    native_target = native_target_for_host()
+    unavailable = []
+    if node_bin is None:
+        unavailable.append("node")
+    if cc_info is None:
+        unavailable.append("C compiler (cc, gcc, clang, or cl.exe)")
+    if native_target is None:
+        unavailable.append("a supported bfnative host target")
+    if unavailable and require_all:
+        print("required WASI CLI test dependencies missing: " + ", ".join(unavailable), file=sys.stderr)
+        return 1
+
+    engine = wasmtime.Engine()
+    module = wasmtime.Module.from_file(engine, str(wasm_cli))
+
+    def invoke(workdir: Path, args: list[str], stdin: str = "") -> tuple[int, bytes, bytes]:
+        return run_wasm_module(
+            engine,
+            module,
+            stdin.encode("utf-8"),
+            ["brainfry", *args],
+            workdir,
+        )
+
+    corpus = CORPUS + load_mandelbrot(root / "tests" / "mandelbrot.b")
+    failures = 0
+    comparisons = 0
+
+    for name, source, stdin in corpus:
+        expected = run_ref(tools, source, stdin)
+        ok = True
+        with temporary_directory() as td:
+            src = td / "p.bf"
+            src.write_text(source, encoding="utf-8")
+            guest_src = "/work/p.bf"
+
+            for label, args in (
+                ("bfinterp", ["bfinterp", guest_src]),
+                ("bfinterp --optimize", ["bfinterp", "--optimize", guest_src]),
+            ):
+                actual = invoke(td, args, stdin)
+                comparisons += 1
+                if normalize_result(actual) != normalize_result(expected):
+                    ok = False
+                    print(
+                        f"       {label:20s}: exit={actual[0]} "
+                        f"stdout={actual[1]!r} stderr={actual[2]!r}"
+                    )
+
+            compile_result = invoke(td, ["bfc", guest_src, "/work/p.bfry"])
+            if compile_result[0] != 0 or not (td / "p.bfry").is_file():
+                ok = False
+                print(
+                    f"       bfc                 : exit={compile_result[0]} "
+                    f"stdout={compile_result[1]!r} stderr={compile_result[2]!r}"
+                )
+            else:
+                actual = invoke(td, ["bfrun", "/work/p.bfry"], stdin)
+                comparisons += 1
+                if normalize_result(actual) != normalize_result(expected):
+                    ok = False
+                    print(
+                        f"       bfrun               : exit={actual[0]} "
+                        f"stdout={actual[1]!r} stderr={actual[2]!r}"
+                    )
+
+        print(f"[{'ok ' if ok else 'FAIL'}] WASI CLI {name}")
+        if not ok:
+            failures += 1
+
+    smoke_source = "+++."
+    expected_smoke = (0, b"\x03", b"")
+    with temporary_directory() as td:
+        src = td / "smoke.bf"
+        src.write_text(smoke_source, encoding="utf-8")
+        guest_src = "/work/smoke.bf"
+
+        wasm_output = td / "smoke.wasm"
+        result = invoke(td, ["bfwasm", guest_src, "-o", "/work/smoke.wasm"])
+        if result[0] != 0 or not wasm_output.is_file():
+            failures += 1
+            print(f"[FAIL] WASI CLI bfwasm compile: exit={result[0]} stderr={result[2]!r}")
+        else:
+            generated_module = wasmtime.Module.from_file(engine, str(wasm_output))
+            actual = run_wasm_module(engine, generated_module, b"")
+            comparisons += 1
+            if normalize_result(actual) != expected_smoke:
+                failures += 1
+                print(f"[FAIL] WASI CLI bfwasm output: {actual!r}")
+
+        browser_output = td / "smoke-browser.js"
+        result = invoke(
+            td,
+            ["bfwasm", guest_src, "--target", "browser", "-o", "/work/smoke-browser.js"],
+        )
+        if result[0] != 0 or not browser_output.is_file():
+            failures += 1
+            print(f"[FAIL] WASI CLI bfwasm browser compile: exit={result[0]} stderr={result[2]!r}")
+        elif b"__bfwasm" not in browser_output.read_bytes():
+            failures += 1
+            print("[FAIL] WASI CLI bfwasm browser output is missing its I/O shim")
+
+        js_output = td / "smoke.js"
+        result = invoke(td, ["bfjs", guest_src, "-o", "/work/smoke.js"])
+        if result[0] != 0 or not js_output.is_file():
+            failures += 1
+            print(f"[FAIL] WASI CLI bfjs compile: exit={result[0]} stderr={result[2]!r}")
+        elif node_bin is not None:
+            actual = run_cmd([node_bin, str(js_output)], "")
+            comparisons += 1
+            if normalize_result(actual) != expected_smoke:
+                failures += 1
+                print(f"[FAIL] WASI CLI bfjs output: {actual!r}")
+
+        c_output = td / "smoke.c"
+        result = invoke(td, ["bf2c", guest_src, "-o", "/work/smoke.c"])
+        if result[0] != 0 or not c_output.is_file():
+            failures += 1
+            print(f"[FAIL] WASI CLI bf2c compile: exit={result[0]} stderr={result[2]!r}")
+        elif cc_info is not None:
+            executable = td / f"smoke{EXE}"
+            object_file = td / "smoke.obj"
+            if cc_info[0] == "msvc":
+                compiler = cc_info[1]
+                if compiler[0] == "direct":
+                    command = [compiler[1], "/nologo", "/O2", f"/Fo{object_file}", f"/Fe{executable}", str(c_output)]
+                else:
+                    compile_line = f'cl /nologo /O2 /Fo"{object_file}" /Fe"{executable}" "{c_output}"'
+                    command = _msvc_batch_command(
+                        Path(compiler[1]), compiler[2], compile_line, td / "compile-msvc.cmd"
+                    )
+            else:
+                command = [cc_info[1][0], "-O2", "-o", str(executable), str(c_output)]
+            compiled = subprocess.run(command, capture_output=True, timeout=600, check=False)
+            if compiled.returncode != 0:
+                failures += 1
+                print(f"[FAIL] WASI CLI bf2c native compile: {compiled.stderr!r}")
+            else:
+                ensure_executable(executable)
+                actual = run_cmd([str(executable)], "")
+                comparisons += 1
+                if normalize_result(actual) != expected_smoke:
+                    failures += 1
+                    print(f"[FAIL] WASI CLI bf2c output: {actual!r}")
+
+        if native_target is not None:
+            no_target = invoke(td, ["bfnative", guest_src, "-o", "/work/no-target"])
+            if no_target[0] == 0 or b"requires --target" not in no_target[2]:
+                failures += 1
+                print(f"[FAIL] WASI CLI bfnative accepted an implicit target: {no_target!r}")
+            native_output = td / f"smoke-native{EXE}"
+            result = invoke(
+                td,
+                ["bfnative", "--target", native_target, guest_src, "-o", f"/work/smoke-native{EXE}"],
+            )
+            if result[0] != 0 or not native_output.is_file():
+                failures += 1
+                print(f"[FAIL] WASI CLI bfnative compile: exit={result[0]} stderr={result[2]!r}")
+            else:
+                ensure_executable(native_output)
+                actual = run_cmd([str(native_output)], "")
+                comparisons += 1
+                if normalize_result(actual) != expected_smoke:
+                    failures += 1
+                    print(f"[FAIL] WASI CLI bfnative output: {actual!r}")
+
+        debugger = invoke(td, ["bfdbg", guest_src], "run\nquit\n")
+        if debugger[0] != 0 or debugger[1] != b"\x03":
+            failures += 1
+            print(f"[FAIL] WASI CLI bfdbg scripted session: {debugger!r}")
+
+    print(
+        f"\nWASI CLI: {len(corpus)} corpus programs; "
+        f"{comparisons} output comparisons; {failures} failures"
+    )
+    return 1 if failures else 0
+
+
 def run_emulated(binary: str, emulator: str, source: str, stdin: str) -> tuple[int, bytes, bytes]:
     """An aarch64 tool binary under qemu-aarch64-static."""
     with temporary_directory() as td:
@@ -747,10 +972,16 @@ def run_emulated_bfrun(
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("repo_root", nargs="?", default=str(DEFAULT_ROOT))
-    parser.add_argument(
+    focused_lanes = parser.add_mutually_exclusive_group()
+    focused_lanes.add_argument(
         "--only-node",
         action="store_true",
         help="run only bfjs and bfwasm via Node.js",
+    )
+    focused_lanes.add_argument(
+        "--only-wasm-cli",
+        action="store_true",
+        help="test the combined brainfry.wasm CLI under Wasmtime",
     )
     parser.add_argument(
         "--require-all",
@@ -766,6 +997,9 @@ def main(argv: list[str] | None = None) -> int:
         for name in ("bfc", "bfrun", "bfnative", "bfinterp", "bfjit", "bfwasm", "bfjs", "bf2c")
     }
     mandelbrot_path = root / "tests" / "mandelbrot.b"
+
+    if args.only_wasm_cli:
+        return run_wasm_cli_suite(root, tools, args.require_all)
 
     required_tools = ["bfc", "bfrun", "bfwasm", "bfjs"]
     if not args.only_node:

@@ -16,6 +16,7 @@ The workspace has a compiler, a bytecode format with its own VM, a JIT, a native
 | `bfjs` | You want standalone JavaScript with no WASI shim. |
 | `bf2c` | You want C source you can compile with your own toolchain. |
 | `bfdbg` | You want to inspect and change program state while it runs. `printf` debugging, with dignity. |
+| `brainfry.wasm` | You want the command-line tools together in one WASI module. `bfjit` stays native. |
 
 ## Build
 
@@ -26,6 +27,41 @@ cargo build --release
 ```
 
 Binaries land in `target/release`. Cargo and your host linker are all the build needs. A C compiler, Node.js, or a WASI runtime only matters if you choose the generated C, JavaScript, or WASI output. If the build passes on the first try, that's fine. Just be a little suspicious.
+
+## One WASI build of the toolset
+
+The combined build puts the CLI tools and their shared code in one module:
+
+```sh
+rustup target add wasm32-wasip1
+cargo build --release --target wasm32-wasip1 -p brainfry
+```
+
+You still need a WASI Preview 1 runtime such as Wasmtime to execute it. The
+runtime also controls filesystem access, so preopen the directory containing
+your source and output files:
+
+```sh
+wasmtime run --dir . target/wasm32-wasip1/release/brainfry.wasm bfc program.bf
+wasmtime run --dir . target/wasm32-wasip1/release/brainfry.wasm bfrun program.bfry
+```
+
+Each command is a subcommand of the same module. `bfc` writes a `.bfry`
+file, then `bfrun` reads it from the preopened directory; neither command
+loads another `.wasm` file or starts a subprocess. The module also exposes
+`bfnative`, `bfinterp`, `bfwasm`, `bfjs`, `bf2c`, and `bfdbg`. `bfjit` is
+not included: it executes native machine code through OS memory APIs.
+
+The WASI version of `bfnative` requires an explicit native target because
+WASI itself isn't one of the targets it can emit:
+
+```sh
+wasmtime run --dir . target/wasm32-wasip1/release/brainfry.wasm bfnative --target linux-x86_64 program.bf
+```
+
+That flag selects the executable `bfnative` writes; it doesn't change the
+architecture of `brainfry.wasm`. The generated executable still needs a
+matching native OS and CPU to run.
 
 ## Run a program
 
@@ -219,7 +255,7 @@ The test workflow builds and tests the workspace on six native runners:
 
 Each job runs formatting and Clippy checks, `cargo +nightly llvm-cov`, and the differential harness. Coverage has to hit 100% for functions, lines, regions, and branches on every target. We know what coverage is worth as a metric. We did it anyway.
 
-The harness runs the Brainfuck corpus through each backend and compares stdout, stderr, and exit status against `bfrun`. That covers the native compiler, JIT, interpreter, C output, WASI, and JavaScript. Node lanes run on versions 22, 24, and 26. The 22 and 24 jobs run only those lanes. The Node 26 job also tests browser output in Chromium, Firefox, and WebKit, split Wasm loader included. If a runtime or compiler is missing, the job fails. A silently skipped lane is just a green checkmark that lies by omission.
+The harness runs the Brainfuck corpus through each backend and compares stdout, stderr, and exit status against `bfrun`. That covers the native compiler, JIT, interpreter, C output, WASI, and JavaScript. Node lanes run on versions 22, 24, and 26. The 22 and 24 jobs run only those lanes. The Node 26 job also tests browser output in Chromium, Firefox, and WebKit, split Wasm loader included. A separate Wasmtime job builds and exercises the combined `brainfry.wasm` commands, including file handoff between `bfc` and `bfrun`. The WASI artifact is behavior-tested; the 100% Rust coverage gate is measured by `cargo llvm-cov` on the six native targets. If a runtime or compiler is missing, the job fails. A silently skipped lane is just a green checkmark that lies by omission.
 
 ## Limits
 

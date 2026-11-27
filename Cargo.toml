@@ -11,6 +11,7 @@ members = [
     "bfjs",
     "bf2c",
     "bfdbg",
+    "brainfry",
 ]
 
 [profile.release]

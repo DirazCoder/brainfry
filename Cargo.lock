@@ -76,3 +76,17 @@ dependencies = [
  "bfc",
  "bfformat",
 ]
+
+[[package]]
+name = "brainfry"
+version = "0.1.0"
+dependencies = [
+ "bf2c",
+ "bfc",
+ "bfdbg",
+ "bfinterp",
+ "bfjs",
+ "bfnative",
+ "bfrun",
+ "bfwasm",
+]

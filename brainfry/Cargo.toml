@@ -1,0 +1,14 @@
+[package]
+name = "brainfry"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bfc = { path = "../bfc" }
+bfrun = { path = "../bfrun" }
+bfnative = { path = "../bfnative" }
+bfinterp = { path = "../bfinterp" }
+bfwasm = { path = "../bfwasm" }
+bfjs = { path = "../bfjs" }
+bf2c = { path = "../bf2c" }
+bfdbg = { path = "../bfdbg" }

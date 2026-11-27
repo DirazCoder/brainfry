@@ -3,5 +3,6 @@
 //! `bfnative` reuses them so the bytecode and native backends run the exact
 //! same front end instead of drifting apart.
 
+pub mod cli;
 pub mod optimize;
 pub mod parser;
