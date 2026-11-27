@@ -440,15 +440,17 @@ fn write_source(tag: &str, source: &str) -> PathBuf {
 /// (the `JitRegion::alloc` path) is surfaced as a clean CLI failure (exit 1)
 /// rather than a panic or silent misbehaviour.
 ///
-/// Strategy: run the real `bfjit` binary in a child shell with `ulimit -v`
-/// capping virtual memory to something far too small to hold any JIT region,
+/// Strategy: spawn the real `bfjit` binary in a child process whose virtual
+/// address space is capped to something far too small to hold any JIT region,
 /// then assert the child exits 1 and prints a human-readable error to stderr.
 ///
-/// Skipped automatically on platforms where `ulimit -v` has no effect
-/// (Windows, macOS with SIP).  Set `BFJIT_SKIP_OOM_TEST=1` to opt out on
-/// any platform.
+/// The cap is applied differently per platform:
+///   Unix (Linux + macOS): `setrlimit(RLIMIT_AS)` via inline FFI — no dep.
+///   Windows: a Job Object with a commit-limit via inline FFI — no dep.
+///
+/// Set `BFJIT_SKIP_OOM_TEST=1` to opt out on any platform (useful in
+/// environments that disallow process resource limits, e.g. some containers).
 #[test]
-#[cfg(target_os = "linux")]
 fn alloc_failure_in_prepare_image_is_reported_as_a_cli_failure() {
     if std::env::var("BFJIT_SKIP_OOM_TEST").is_ok() {
         eprintln!("skipping: BFJIT_SKIP_OOM_TEST is set");
@@ -464,24 +466,7 @@ fn alloc_failure_in_prepare_image_is_reported_as_a_cli_failure() {
 
     let bfjit = env!("CARGO_BIN_EXE_bfjit");
 
-    // ulimit -v is in KiB.  32 MiB is enough for the shell + loader but
-    // not nearly enough for a JIT mmap region (which asks for the full
-    // program image rounded up to page size, plus guard pages).
-    let ulimit_kb = 32 * 1024; // 32 MiB
-
-    let out = Command::new("sh")
-        .arg("-c")
-        .arg(format!(
-            "ulimit -v {ulimit_kb} && exec {bfjit} {path}",
-            ulimit_kb = ulimit_kb,
-            bfjit = bfjit,
-            path = source_path.display(),
-        ))
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .expect("spawning constrained bfjit subprocess");
+    let out = spawn_with_capped_vmem(bfjit, source_path.to_str().unwrap());
 
     assert_eq!(
         out.status.code(),
@@ -494,4 +479,169 @@ fn alloc_failure_in_prepare_image_is_reported_as_a_cli_failure() {
         !stderr.is_empty(),
         "expected a human-readable error on stderr, got silence"
     );
+}
+
+/// Spawns `bfjit <source>` in a subprocess whose virtual address space is
+/// capped to 64 MiB — large enough for the loader and runtime, far too small
+/// for the JIT mmap region.
+///
+/// Unix: sets `RLIMIT_AS` on the child via a pre-exec hook (inline libc FFI).
+/// Windows: wraps the child in a Job Object with a process-memory limit
+/// (inline winapi FFI).
+#[cfg(unix)]
+fn spawn_with_capped_vmem(bfjit: &str, source: &str) -> std::process::Output {
+    use std::os::unix::process::CommandExt;
+
+    // 64 MiB — enough for sh + loader, not for a JIT mmap region.
+    const CAP: u64 = 64 * 1024 * 1024;
+
+    // RLIMIT_AS is 9 on Linux/macOS (POSIX value).
+    #[cfg(target_os = "linux")]
+    const RLIMIT_AS: i32 = 9;
+    #[cfg(target_os = "macos")]
+    const RLIMIT_AS: i32 = 5; // RLIMIT_AS on Darwin
+
+    #[repr(C)]
+    struct Rlimit {
+        rlim_cur: u64,
+        rlim_max: u64,
+    }
+
+    extern "C" {
+        fn setrlimit(resource: i32, rlim: *const Rlimit) -> i32;
+    }
+
+    let mut cmd = Command::new(bfjit);
+    cmd.arg(source)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    // Safety: called between fork and exec; only async-signal-safe ops here.
+    // setrlimit is async-signal-safe on Linux and macOS.
+    unsafe {
+        cmd.pre_exec(move || {
+            let lim = Rlimit {
+                rlim_cur: CAP,
+                rlim_max: CAP,
+            };
+            if setrlimit(RLIMIT_AS, &lim) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+
+    cmd.output().expect("spawning memory-constrained bfjit")
+}
+
+#[cfg(windows)]
+fn spawn_with_capped_vmem(bfjit: &str, source: &str) -> std::process::Output {
+    use std::os::windows::io::AsRawHandle;
+
+    // 64 MiB process-memory commit limit via a Job Object.
+    const CAP: usize = 64 * 1024 * 1024;
+
+    // Minimal inline FFI — just what we need, nothing more.
+    #[allow(non_camel_case_types)]
+    type HANDLE = *mut std::ffi::c_void;
+    #[allow(non_camel_case_types)]
+    type BOOL = i32;
+    const FALSE: BOOL = 0;
+    const JOB_OBJECT_LIMIT_PROCESS_MEMORY: u32 = 0x0100;
+    const JobObjectExtendedLimitInformation: u32 = 9;
+
+    #[repr(C)]
+    struct IoCounters {
+        read_operation_count: u64,
+        write_operation_count: u64,
+        other_operation_count: u64,
+        read_transfer_count: u64,
+        write_transfer_count: u64,
+        other_transfer_count: u64,
+    }
+
+    #[repr(C)]
+    struct BasicLimitInformation {
+        per_process_user_time_limit: i64,
+        per_job_user_time_limit: i64,
+        limit_flags: u32,
+        minimum_working_set_size: usize,
+        maximum_working_set_size: usize,
+        active_process_limit: u32,
+        affinity: usize,
+        priority_class: u32,
+        scheduling_class: u32,
+    }
+
+    #[repr(C)]
+    struct ExtendedLimitInformation {
+        basic_limit_information: BasicLimitInformation,
+        io_info: IoCounters,
+        process_memory_limit: usize,
+        job_memory_limit: usize,
+        peak_process_memory_used: usize,
+        peak_job_memory_used: usize,
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CreateJobObjectW(attrs: *mut std::ffi::c_void, name: *const u16) -> HANDLE;
+        fn SetInformationJobObject(
+            job: HANDLE,
+            class: u32,
+            info: *mut std::ffi::c_void,
+            len: u32,
+        ) -> BOOL;
+        fn AssignProcessToJobObject(job: HANDLE, process: HANDLE) -> BOOL;
+        fn CloseHandle(handle: HANDLE) -> BOOL;
+    }
+
+    // Spawn suspended so we can attach the Job before the child runs.
+    use std::os::windows::process::CommandExt;
+    const CREATE_SUSPENDED: u32 = 0x0000_0004;
+
+    let mut child = Command::new(bfjit)
+        .arg(source)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .creation_flags(CREATE_SUSPENDED)
+        .spawn()
+        .expect("spawning suspended bfjit");
+
+    unsafe {
+        let job = CreateJobObjectW(std::ptr::null_mut(), std::ptr::null());
+        assert!(!job.is_null(), "CreateJobObjectW failed");
+
+        let mut info: ExtendedLimitInformation = std::mem::zeroed();
+        info.basic_limit_information.limit_flags = JOB_OBJECT_LIMIT_PROCESS_MEMORY;
+        info.process_memory_limit = CAP;
+
+        let ok = SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            &mut info as *mut _ as *mut _,
+            std::mem::size_of::<ExtendedLimitInformation>() as u32,
+        );
+        assert!(ok != FALSE, "SetInformationJobObject failed");
+
+        let ok = AssignProcessToJobObject(job, child.as_raw_handle() as HANDLE);
+        assert!(ok != FALSE, "AssignProcessToJobObject failed");
+
+        CloseHandle(job);
+
+        // Resume the child now that the Job limit is in place.
+        extern "system" {
+            fn ResumeThread(thread: HANDLE) -> u32;
+        }
+        // We can't get the main thread handle from std::process::Child, so
+        // we resume via NtResumeProcess (single-threaded child at this point).
+        extern "system" {
+            fn NtResumeProcess(process: HANDLE) -> i32;
+        }
+        NtResumeProcess(child.as_raw_handle() as HANDLE);
+    }
+
+    child.wait_with_output().expect("waiting for bfjit")
 }
