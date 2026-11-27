@@ -439,8 +439,9 @@ A debugger needs to stop between ops, so it has its own single-stepping
 engine (it can't reuse `bfinterp`'s run-to-completion loop) — with
 `bfinterp`'s exact semantics. It debugs the **raw parsed** op list, one op
 per source character, which is what makes every stop point at a real
-line/column in the `.bf` file; the optimizer's folded ops (`Zero`,
-`MulAdd`, `Scan`) correspond to no single character, so stepping them
+line/column in the `.bf` file; the optimizer's rewritten ops (`Zero`,
+`MulAdd`, `Scan`, and the fixed-offset `AddAt`, `ZeroAt`, `SetAt` and
+`BoundsCheck`) correspond to no single character, so stepping them
 against the source would be meaningless — which is why there's no
 `--optimize` flag here.
 
@@ -496,54 +497,85 @@ inside the run. Reproduce with `scripts/benchmark_all.py`.
 ## What the compiler actually does
 
 Parsing is a straight character-by-character pass that validates bracket
-matching and builds an unoptimized op list. Optimization runs as a separate
-pass on top, currently four rules, each running in sequence on the output
-of the last. Run folding turns `+++++` into one `Add(5)` instead of five
-separate `Add(1)`s (same idea for `-`, `>`, `<`), which cuts down how many
-times the bytecode runtime's dispatch loop spins on repetitive source and
-produces noticeably shorter assembly out of `bfnative` too. Zero-loop
-folding takes `[-]` and `[+]` — a loop that does nothing but drive the
-current cell to zero — and collapses it into a single `Zero` instruction
-instead of actually looping up to 255 times. It only fires when the
-per-iteration step is odd: an odd step reaches 0 from any starting value
-(it's a unit mod 256), while an even step from an odd cell never lands on
-0 at all — `[++]` with the cell holding 3 stays odd forever — so folding
-that would silently turn a diverging loop into a terminating one.
-Even-step loops stay real loops.
+matching and builds an unoptimized op list. The optimizer runs on top of
+that as seven passes in a fixed order, and the whole sequence repeats until
+a full round changes nothing. One pass often sets up another: a loop folded
+into a `Zero` can make a later store redundant, which can leave a following
+loop guarded by a cell that's now known to be zero. A single sweep misses
+that. Jump targets get recomputed twice per round, since most of the passes
+change instruction indices.
 
-Offset-add folding targets the `[->+<]` idiom and its relatives: a loop
-that decrements the current cell by 1 per iteration while adding to one or
-more other cells and returning to its starting position each time. Since a
-loop like that always runs exactly N times for a starting value of N, the
-result is fully determined before the first iteration — so it collapses
-into one `MulAdd` per target cell (or several, for patterns like
-`[->+>+<<]` that spread a value into more than one place) followed by a
-`Zero`, instead of actually iterating. This only fires when every
-condition holds: the loop returns to its start, the counting cell's net
-change is exactly `-1`, every other touched cell only gets added to,
-every cell the pointer lands on is one the body actually writes to, and
-the body has no `Output`, `Input`, or nested loop — any of those would
-mean collapsing the loop changes something other than speed, like how many
-times a side effect fires. The write-free condition covers the subtle one:
-a body like `[<>-]` touches down on cell -1 without writing it, and while
-that excursion has no effect on any cell's value, it still has to be
-bounds-checked when the real loop runs — a folded `MulAdd`/`Zero` body
-can't perform it, so the underflow the real loop raises would silently
-disappear. A loop that doesn't meet all five stays a real
-loop rather than risk folding something unsafe.
+Run folding turns `+++++` into one `Add(5)` instead of five separate
+`Add(1)`s (same idea for `-`, `>`, `<`). That cuts how many times the
+bytecode runtime's dispatch loop spins on repetitive source and produces
+noticeably shorter assembly out of `bfnative` too.
 
-Scan-loop folding handles the other common idiom, `[>]` / `[<]` and their
-multi-cell-stride variants — a loop whose entire body is a single move,
-used to walk the tape until landing on a zero cell. That collapses into a
-single `Scan` instruction carrying the stride and direction, which removes
-the per-cell jump-check-jump overhead without changing how many cells
-actually get inspected.
+Zero-loop folding takes `[-]`, `[+]` and any other single-step loop with an
+odd step, and collapses it into one `Zero` instead of looping up to 255
+times. It has to be odd: an odd step is a unit mod 256, so it reaches 0 from
+any starting value. An even step from an odd cell never lands on 0 (`[++]`
+with the cell holding 3 stays odd forever), and folding that would turn a
+diverging loop into a terminating one. Even-step loops stay real loops.
 
-All four are safe, semantics-preserving transformations: optimized output
-runs identically to unoptimized, just faster. Jump targets get recomputed
-once at the end, after every fold, since folding changes instruction
-indices. This applies to both backends, since `bfnative` reuses the same
-optimizer rather than reimplementing it.
+Linear-loop folding handles `[->+<]` and its relatives, and it's more
+general than the earlier version, which only accepted a counter that drops
+by exactly 1. Now the loop can change its counter cell by any odd amount per
+iteration, and each target cell can be added to or subtracted from. The
+iteration count is still fixed by the starting value, because an odd step
+has an inverse mod 256: for a counter step `s` and a target delta `d`, the
+target ends up with `c * (-d / s)` added to it, with the division done in
+mod-256 arithmetic. The loop becomes one `MulAdd` per target followed by a
+`ZeroAt` on the counter. The loop has to return to its starting cell, and
+the body can only contain adds, subtracts and moves. Any `Output`, `Input`
+or nested loop would change how many times a side effect fires, so those
+stay loops. Every cell the pointer lands on must also be written by the
+body. A body like `[<>-]` visits cell -1 without writing it, which has no
+effect on values but still raises the underflow error when the real loop
+runs. A folded `MulAdd` can't perform that visit, so the error would
+silently disappear.
+
+Scan-loop folding handles `[>]` / `[<]` and the multi-cell-stride variants,
+a loop whose whole body is one move, used to walk the tape to a zero cell.
+That becomes a single `Scan` carrying the stride and direction, which drops
+the per-cell jump-check-jump overhead without changing how many cells get
+inspected.
+
+Pointer windowing targets straight-line runs of `+`, `-`, `<`, `>` and
+`Zero`. Instead of moving the pointer back and forth between edits, the
+pass rewrites the run as `AddAt` / `ZeroAt` ops at fixed offsets from where
+the run started, followed by one final move. A `BoundsCheck` op comes first
+and carries the lowest and highest offsets the original moves reached. This
+matters because those moves would have raised the left-of-cell-0 error or
+grown the tape even if nothing was written at the extremes, and collapsing
+them into one move would hide that. It's only emitted when the pointer
+actually moved. Runs with no stores are left alone, and so are runs whose
+displacement doesn't fit the op operands.
+
+Store fusion merges adjacent stores to the same offset: `ZeroAt` then
+`AddAt` becomes a `SetAt` (store a constant), two `AddAt`s sum their deltas,
+and any store followed by `ZeroAt` or `SetAt` is overwritten by it. It only
+looks at neighbors and never reorders across other ops.
+
+Dead-code elimination is a forward known-value analysis. The tape starts
+all zero, and the pass tracks what it can prove about cell values through
+adds, zeroing, stores and `MulAdd`. With that it drops adds of 0, `Zero` on
+a cell that's already zero, `Scan` on a zero cell, a `MulAdd` whose source
+is zero, and any loop entered on a cell known to be zero, which deletes the
+whole loop. That last case is why a comment block written as a loop at the
+start of a program costs nothing. A `MulAdd` from a known value turns into
+a plain `SetAt` or `AddAt`. `Input` makes the cell unknown, and after a
+loop or a `Scan` the pass forgets everything except that the current cell is
+zero. It doesn't analyze loop bodies; they're copied through untouched, and
+the other six passes still work inside them. It also tracks how much tape
+has been allocated, so a zero-delta write past the end, which exists only to
+grow the tape, is kept, and it stops rewriting as soon as the pointer could
+leave the known range so the runtime's bounds behavior stays intact.
+
+All seven are meant to be semantics-preserving, so optimized output runs
+identically to unoptimized, including when a program walks off the left
+edge or grows the tape. They only make it faster. This applies to every
+backend, since `bfnative` and the rest reuse the same optimizer rather than
+reimplementing it.
 
 ## Runtime behavior
 
@@ -591,15 +623,12 @@ misparsing garbage further in. This only applies to `bfc`/`bfrun` — a
 `bfnative`-compiled binary is a normal executable for its platform, with
 no custom format of its own.
 
-The version check only guards one direction: it stops a `bfrun` build
-from accepting a `.bfry` file from a *newer* format than it understands,
-but nothing currently forces `FORMAT_VERSION` to bump when the op tag
-range grows. `MulAdd`/`Scan` (tags 9-10) are new as of the offset-add and
-scan-loop optimizer passes; a `.bfry` file compiled with them and read by
-a `bfrun` build old enough to only know tags 0-8 will misparse those
-bytes rather than fail cleanly. Whether that's worth a version bump now
-or only once it matters for a real compatibility case is an open call,
-not something this doc is deciding.
+`FORMAT_VERSION` is 2. It went up from 1 when the optimizer's fixed-offset
+ops (`AddAt`, `ZeroAt`, `SetAt`, `BoundsCheck`, tags 11-14) were added, so a
+current `bfrun` rejects a version-1 file with a clear message, and an older
+`bfrun` rejects a version-2 file the same way. The bump was done by hand,
+though. Nothing forces it when the tag range grows, so the next new op
+without a bump would be misparsed by older builds instead of rejected.
 
 ## Verification status
 
@@ -649,12 +678,14 @@ the one that counts.
 
 ## What's not here
 
-No general-purpose loop folding beyond the offset-add and scan patterns.
-A loop that touches a cell with anything other than a net `+1`/`-1`
-step, or that both adds to and subtracts from other cells, still runs as
-an actual loop — the two folding passes are conservative by design and
-fall back to a real loop rather than guess at a pattern they can't fully
-verify.
+Loop folding stops at linear loops and plain scans. A loop with I/O, a
+nested loop, a body that visits a cell it doesn't write, an even counter
+step, or a net pointer drift per iteration still runs as an actual loop.
+Dead-code elimination also doesn't look inside loop bodies. Folding more
+would need real loop analysis (induction variables, or tracking values
+across iterations), and the cost of a wrong fold is a program that silently
+computes something different, so these fall back to a real loop rather than
+guess at a pattern they can't fully verify.
 
 CI now runs `cargo test` on all six targets, alongside the differential
 harness, so the unit tests (PE and Mach-O header checks, instruction
