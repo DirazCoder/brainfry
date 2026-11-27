@@ -469,30 +469,28 @@ unbounded log would exhaust memory long before the program finished.
 
 ## Benchmarks (mandelbrot.b)
 
-Four execution strategies, one program, byte-identical output (6,240
-bytes) from every one of them — the differential harness checks that
-before anything gets timed.
+Seven execution backends, one program, and output matching the 6,240-byte
+reference (Windows CRLF output is normalized for comparison). Each timed run
+is checked against the reference. These measurements are from Windows 11 Pro
+x64 on an AMD Ryzen 7 4700U, with Node.js 26.13.1 and MSVC `cl /O2`; treat
+them as a comparison on this host, not a portable ranking. Each row is three
+runs after one warm-up; AOT compilation is excluded, while `bfinterp` and
+`bfjit` include their parse/compile work.
 
 | tool | min / median | vs bfinterp |
-|---|---|---|
-| `bfinterp` (naive reference) | 15.5 s / 15.6 s | 1.0x |
-| `bfrun` (bytecode VM) | 8.1 s / 8.1 s | 1.9x |
-| `bfjit` (in-memory JIT) | 1.27 s / 1.27 s | 12.2x |
-| `bfnative` (AOT ELF) | 1.25 s / 1.27 s | 12.4x |
+|---|---:|---:|
+| `bfinterp` (naive reference) | 18.334 s / 18.510 s | 1.0x |
+| `bfrun` (bytecode VM) | 8.415 s / 8.532 s | 2.2x |
+| `bfjit` (in-memory JIT) | 1.617 s / 1.659 s | 11.3x |
+| `bfnative` (AOT executable) | 1.655 s / 1.736 s | 11.1x |
+| `bfwasm` (Node WASI Preview1) | 4.971 s / 5.047 s | 3.7x |
+| `bfjs` (Node/V8) | 3.993 s / 4.011 s | 4.6x |
+| `bf2c` (MSVC `/O2` executable) | 1.449 s / 1.451 s | 12.7x |
 
-The two transpiler lanes join the same benchmark through the same harness
-when their host tools are on PATH: `bfjs` under node/V8 lands around 3x
-`bfinterp` — a JIT'd guarded-op loop is real speed, just not hand-emitted
-machine code — and `bf2c` compiled with `cc -O2` around 5x, behind
-`bfnative` because it pays for tape writes through a pointer like every
-portable C program does. Both produce byte-identical output, and
-`scripts/benchmark_all.py` reproduces the comparison.
-
-Pretty much the shape you'd predict: the naive interpreter is slowest, the
-bytecode VM's op-folding roughly doubles it, and the two machine-code
-strategies tie, because they're the same generated code — `bfjit`'s only
-overhead is the few milliseconds of parse/optimize/emit/patch it pays
-inside the run. Reproduce with `scripts/benchmark_all.py`.
+The script reports AOT compile times separately and includes the Node process
+startup in both JavaScript and WASI timings. Its optional C lane supports
+MSVC as well as `cc`/GCC/Clang, and skips that lane if no compiler is
+available. Run `scripts/benchmark_all.py` to reproduce the comparison.
 
 ## What the compiler actually does
 
